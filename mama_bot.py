@@ -1137,43 +1137,82 @@ async def rec_diastaz(call: CallbackQuery):
     await call.message.answer(answer, reply_markup=kb_recovery())
 
 
-async def post_to_channel():
-    topics = [
-        "научно обоснованный совет по развитию ребёнка от 0 до 3 лет",
-        "детская психология — объяснение поведения ребёнка с нейронаучной точки зрения",
-        "рекомендации ВОЗ по уходу за новорождённым — что важно знать каждой маме",
-        "питание и прикорм по стандартам ESPGHAN — практический совет",
-        "сон ребёнка — научные факты о детском сне от AAP",
-        "послеродовое восстановление мамы — что говорит наука",
-        "развивающие игры с научным обоснованием для малышей",
-        "беременность — важный совет основанный на исследованиях ACOG",
-        "теория привязанности Петрановской — как применить в жизни",
-        "мифы о воспитании детей которые опровергает наука",
-    ]
-    import random
-    topic = random.choice(topics)
+# ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
+
+CHANNEL_ID = "@yamama_ai"
+
+DAILY_THEMES = {
+    0: "беременность и подготовка к родам",
+    1: "новорождённый 0-3 месяца",
+    2: "малыш 3-12 месяцев",
+    3: "ребёнок 1-3 года",
+    4: "дошкольник 3-7 лет",
+    5: "здоровье и педиатрия",
+    6: "мама о себе — восстановление и психология",
+}
+
+RUBRICS = {
+    8:  ("🌅 Доброе утро, мама",
+         "Короткий заряд на день — мотивация, поддержка, маленький совет психолога. Тёплый тон. 100-150 слов."),
+    10: ("🔬 Научный факт дня",
+         "Интересный научный факт который удивляет и хочется переслать подруге. Ссылка на ВОЗ или AAP. 150-200 слов."),
+    13: ("💡 Совет педиатра",
+         "Практический научно обоснованный совет — конкретный и применимый сегодня. По рекомендациям ВОЗ, AAP. 200-250 слов."),
+    16: ("🧠 Детская психология",
+         "Объяснение поведения ребёнка с нейронаучной точки зрения. Опирайся на Петрановскую, Сигела. 200-250 слов."),
+    20: ("❤️ Для мамы",
+         "О восстановлении, выгорании, отношениях, самой себе. Тепло и поддерживающе. 150-200 слов."),
+}
+
+async def post_rubric(hour: int):
+    from datetime import datetime
+    weekday = datetime.now().weekday()
+    daily_theme = DAILY_THEMES[weekday]
+    rubric_name, rubric_instruction = RUBRICS[hour]
     post = await ask_gpt(
         "Ты автор экспертного Telegram-канала 'Я МАМА' для современных мам. "
-        "Пишешь на основе научных исследований, рекомендаций ВОЗ, AAP и ведущих специалистов — "
-        "Петрановской, Карпа, Серза, Готтмана. "
+        "Пишешь на основе научных исследований, рекомендаций ВОЗ, AAP, ACOG и ведущих специалистов — "
+        "Петрановской, Карпа, Серза, Готтмана, Сигела. "
         "Стиль: тепло и по-человечески, но с научной точностью. "
         "Без воды, с конкретной пользой. Добавляй эмодзи уместно. "
-        "Пост 200-300 слов. В конце — один практический совет который мама может применить сегодня.",
-        f"Напиши экспертный пост для канала на тему: {topic}"
+        "ВАЖНО: каждый пост должен быть на уникальную подтему, не повторяй предыдущие посты. "
+        "В конце — один практический совет который мама может применить сегодня.",
+        f"Рубрика: {rubric_name}\n"
+        f"Тема дня: {daily_theme}\n"
+        f"Инструкция: {rubric_instruction}\n"
+        f"Начни пост с эмодзи рубрики и её названия."
     )
     try:
         await bot.send_message(CHANNEL_ID, post)
+        logging.info(f"Пост опубликован: {rubric_name} | {daily_theme}")
     except Exception as e:
         logging.error(f"Ошибка постинга: {e}")
+
+async def post_morning():   await post_rubric(8)
+async def post_10():        await post_rubric(10)
+async def post_afternoon(): await post_rubric(13)
+async def post_evening():   await post_rubric(16)
+async def post_night():     await post_rubric(20)
+
+async def post_today_all():
+    import asyncio as aio
+    logging.info("Публикуем первый день постов...")
+    for hour in [8, 10, 13, 16, 20]:
+        await post_rubric(hour)
+        await aio.sleep(15)
+    logging.info("Все посты первого дня опубликованы!")
 
 # ─── ЗАПУСК ──────────────────────────────────────────────────
 async def main():
     init_db()
-    scheduler.add_job(post_to_channel, "cron", hour=9, minute=0)
-    scheduler.add_job(post_to_channel, "cron", hour=13, minute=0)
-    scheduler.add_job(post_to_channel, "cron", hour=19, minute=0)
+    scheduler.add_job(post_morning,   "cron", hour=8,  minute=0)
+    scheduler.add_job(post_10,        "cron", hour=10, minute=0)
+    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0)
+    scheduler.add_job(post_evening,   "cron", hour=16, minute=0)
+    scheduler.add_job(post_night,     "cron", hour=20, minute=0)
     scheduler.start()
     logging.info("Мамин помощник запущен!")
+    asyncio.create_task(post_today_all())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
