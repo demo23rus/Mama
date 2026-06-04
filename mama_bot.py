@@ -30,7 +30,7 @@ _env = load_env()
 
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN  = "8769245157:AAH2EbEFpGj8MzuHUMiBKeLB7eJztyxfC1s"
-OPENAI_KEY = "sk-mfvVI3QN2uQvXPlhMkAeUUzmbjK5aQzj"
+OPENAI_KEY = "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"
 CHANNEL_ID = _env.get("CHANNEL_ID") or "@YaMamaChannel"
 
 logging.basicConfig(level=logging.INFO)
