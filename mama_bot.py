@@ -163,7 +163,7 @@ async def ask_gpt(system_prompt, user_prompt):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            max_tokens=800
+            max_tokens=2000
         )
         return clean_text(response.choices[0].message.content)
     except Exception as e:
@@ -190,6 +190,9 @@ def kb_pregnant_menu():
 
 def kb_mama_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
+        [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
+        [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
         [InlineKeyboardButton(text="📊 Развитие по возрасту", callback_data="mama_dev"),
          InlineKeyboardButton(text="🎮 Игры и занятия", callback_data="mama_games")],
         [InlineKeyboardButton(text="📚 Что читать", callback_data="mama_books"),
@@ -207,6 +210,39 @@ def kb_mama_menu():
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
+    ])
+
+def kb_firstdays():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👨‍⚕️ Первый осмотр педиатра", callback_data="fd_pediatr")],
+        [InlineKeyboardButton(text="🩺 Обходы врачей по месяцам", callback_data="fd_doctors")],
+        [InlineKeyboardButton(text="📄 Свидетельство о рождении", callback_data="fd_svid")],
+        [InlineKeyboardButton(text="🏫 Запись в садик", callback_data="fd_sadik")],
+        [InlineKeyboardButton(text="🤸 Массаж и гимнастика", callback_data="fd_massage")],
+        [InlineKeyboardButton(text="🏊 Плавание с малышом", callback_data="fd_swim")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+
+def kb_breastfeeding():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍼 Как наладить ГВ с первых дней", callback_data="bf_start")],
+        [InlineKeyboardButton(text="🥛 Молока мало — как расцедить", callback_data="bf_pump")],
+        [InlineKeyboardButton(text="🔴 Уплотнения и лактостаз", callback_data="bf_lactostaz")],
+        [InlineKeyboardButton(text="🥗 Питание мамы при ГВ", callback_data="bf_food")],
+        [InlineKeyboardButton(text="❌ Что нельзя при ГВ", callback_data="bf_nofood")],
+        [InlineKeyboardButton(text="🔄 Переход на смесь", callback_data="bf_formula")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+
+def kb_recovery():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌸 После естественных родов", callback_data="rec_natural")],
+        [InlineKeyboardButton(text="🏥 После кесарева сечения", callback_data="rec_caesar")],
+        [InlineKeyboardButton(text="💪 Физическая активность", callback_data="rec_sport")],
+        [InlineKeyboardButton(text="❤️ Интимная жизнь после родов", callback_data="rec_intimate")],
+        [InlineKeyboardButton(text="💇 Выпадение волос", callback_data="rec_hair")],
+        [InlineKeyboardButton(text="🏋️ Диастаз — восстановление пресса", callback_data="rec_diastaz")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
     ])
 
 def kb_back_to_menu(mode):
@@ -774,7 +810,333 @@ async def handle_question(message: Message, state: FSMContext):
     kb = kb_mama_menu() if user and user[0] == "mama" else kb_pregnant_menu() if user else kb_start()
     await message.answer(answer, reply_markup=kb)
 
-# ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
+# ─── ПЕРВЫЕ ДНИ С МАЛЫШОМ ───────────────────────────────────
+@dp.callback_query(F.data == "mama_firstdays")
+async def mama_firstdays(call: CallbackQuery):
+    await call.message.edit_text(
+        "📋 Первые дни с малышом\n\n"
+        "Всё что нужно знать и сделать после рождения малыша 👇",
+        reply_markup=kb_firstdays()
+    )
+
+@dp.callback_query(F.data == "fd_pediatr")
+async def fd_pediatr(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Расскажи подробно о первом осмотре педиатра после выписки из роддома. "
+        "1) Когда педиатр должен прийти по закону — сроки по российскому законодательству; "
+        "2) Как вызвать педиатра на дом — пошаговая инструкция (телефон, Госуслуги, сайт поликлиники); "
+        "3) Что педиатр проверяет при первом осмотре новорождённого — полный список; "
+        "4) Какие вопросы задать педиатру при первом визите; "
+        "5) Что приготовить к приходу врача. "
+        "Отвечай конкретно и практично."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+
+@dp.callback_query(F.data == "fd_doctors")
+async def fd_doctors(call: CallbackQuery):
+    await call.message.edit_text("⏳ Составляю расписание врачей...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Составь подробный календарь обходов врачей для ребёнка по месяцам — от рождения до 1 года. "
+        "По каждому визиту укажи: возраст, каких врачей пройти, какие анализы сдать, "
+        "какие прививки по национальному календарю РФ. "
+        "Также укажи какие специалисты нужны в 1 год. "
+        "Сделай в виде чёткого структурированного списка по месяцам."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+
+@dp.callback_query(F.data == "fd_svid")
+async def fd_svid(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию о документах...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай пошаговую инструкцию по оформлению документов на новорождённого в России. "
+        "1) Свидетельство о рождении — где получить (ЗАГС/МФЦ/Госуслуги), какие документы нужны, сроки; "
+        "2) Регистрация ребёнка по месту жительства — как и где; "
+        "3) Полис ОМС на ребёнка — как оформить, сроки; "
+        "4) СНИЛС — как получить; "
+        "5) Пособия и выплаты — какие положены, куда обращаться, сроки подачи; "
+        "6) Материнский капитал — как получить. "
+        "Всё пошагово, конкретно, с указанием сроков."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+
+@dp.callback_query(F.data == "fd_sadik")
+async def fd_sadik(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию о садике...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай подробную инструкцию по записи ребёнка в детский сад в России. "
+        "1) Когда вставать в очередь — оптимальный возраст ребёнка; "
+        "2) Как встать в очередь через Госуслуги — пошагово; "
+        "3) Какие документы нужны; "
+        "4) Как работает система льготных очередей — кто имеет право; "
+        "5) Что делать если отказали или долго ждать; "
+        "6) С какого возраста берут в садик по закону. "
+        "Конкретно и пошагово."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+
+@dp.callback_query(F.data == "fd_massage")
+async def fd_massage(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию о массаже...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай научно обоснованное руководство по массажу и гимнастике для младенцев. "
+        "1) С какого возраста можно начинать массаж — по рекомендациям педиатров; "
+        "2) Виды массажа для разных возрастов (0-3 мес, 3-6 мес, 6-12 мес); "
+        "3) Пошаговая техника общего укрепляющего массажа — как делать маме дома; "
+        "4) Массаж при коликах и газах — техника и движения; "
+        "5) Гимнастика по возрастам — конкретные упражнения; "
+        "6) Противопоказания к массажу; "
+        "7) Когда нужен профессиональный массажист а не домашний. "
+        "Описывай движения чётко чтобы мама могла повторить."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+
+@dp.callback_query(F.data == "fd_swim")
+async def fd_swim(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию о плавании...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай научно обоснованное руководство по плаванию с младенцем. "
+        "1) С какого возраста можно купать и плавать — научные данные; "
+        "2) Рефлекс плавания у новорождённых — что это и как использовать; "
+        "3) Раннее плавание — польза для физического и нервного развития по исследованиям; "
+        "4) Как организовать плавание дома в ванной — пошаговая инструкция; "
+        "5) Температура воды, продолжительность, позиции поддержки; "
+        "6) Бассейн с грудничком — с какого возраста, что выбрать; "
+        "7) Противопоказания к плаванию. "
+        "Конкретно и безопасно."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+
+# ─── ГРУДНОЕ ВСКАРМЛИВАНИЕ ───────────────────────────────────
+@dp.callback_query(F.data == "mama_breastfeeding")
+async def mama_breastfeeding(call: CallbackQuery):
+    await call.message.edit_text(
+        "🤱 Грудное вскармливание\n\n"
+        "Научная поддержка на каждом этапе 💕",
+        reply_markup=kb_breastfeeding()
+    )
+
+@dp.callback_query(F.data == "bf_start")
+async def bf_start(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай исчерпывающее руководство по налаживанию грудного вскармливания с первых дней "
+        "по рекомендациям ВОЗ и ЮНИСЕФ. "
+        "1) Первое прикладывание — когда и как, важность в первый час после родов; "
+        "2) Правильный захват груди — детальное описание, признаки правильного и неправильного захвата; "
+        "3) Позиции для кормления — колыбель, из-под руки, лёжа — как каждая выполняется; "
+        "4) Как понять что молока хватает ребёнку — конкретные признаки; "
+        "5) Частота кормлений по возрасту — по требованию vs по расписанию, позиция ВОЗ; "
+        "6) Молозиво — что это, почему оно важнее любой смеси; "
+        "7) Как приходит молоко — сроки, что нормально. "
+        "Поддерживающий и конкретный тон."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+
+@dp.callback_query(F.data == "bf_pump")
+async def bf_pump(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай научно обоснованное руководство по увеличению лактации и расцеживанию. "
+        "1) Почему молока может быть мало — физиологические причины; "
+        "2) Как стимулировать выработку молока — доказанные методы (частые прикладывания, сцеживание, контакт кожа-к-коже); "
+        "3) Техника ручного сцеживания — пошагово, движения, как правильно; "
+        "4) Молокоотсос — как выбрать, как пользоваться правильно; "
+        "5) Питание и питьевой режим мамы для лактации — что реально помогает по науке; "
+        "6) Лактогонные средства — что доказано, что миф; "
+        "7) Когда обратиться к консультанту по ГВ. "
+    )
+    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+
+@dp.callback_query(F.data == "bf_lactostaz")
+async def bf_lactostaz(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай исчерпывающее руководство по лактостазу и уплотнениям в груди. "
+        "1) Что такое лактостаз — причины, симптомы, как отличить от мастита; "
+        "2) Лактостаз vs мастит vs абсцесс — чёткие различия и алгоритм действий для каждого; "
+        "3) Первая помощь при лактостазе — конкретные действия в первые часы; "
+        "4) Техника массажа при уплотнениях — движения, направление, интенсивность; "
+        "5) Правильное расцеживание при лактостазе — пошагово; "
+        "6) Тепло или холод — что и когда применять по доказательной медицине; "
+        "7) Газоотводная трубка и другие народные методы — что говорит наука; "
+        "8) Красные флаги — когда срочно к врачу; "
+        "9) Профилактика лактостаза. "
+        "Это срочная тема — отвечай чётко и конкретно."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+
+@dp.callback_query(F.data == "bf_food")
+async def bf_food(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай научно обоснованные рекомендации по питанию кормящей мамы. "
+        "1) Принципы питания при ГВ по позиции ВОЗ — что реально важно; "
+        "2) Что обязательно включить в рацион — белки, жиры, углеводы, витамины, минералы; "
+        "3) Продукты которые улучшают качество молока — с научным обоснованием; "
+        "4) Витамины для кормящей мамы — какие нужны, дозировки по нормам; "
+        "5) Водный режим — сколько пить и что; "
+        "6) Развенчание мифов о диете при ГВ — что на самом деле не нужно исключать. "
+        "Конкретно и без излишних ограничений."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+
+@dp.callback_query(F.data == "bf_nofood")
+async def bf_nofood(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай научно обоснованный список того что нельзя или нужно ограничить при грудном вскармливании. "
+        "1) Алкоголь — как влияет на молоко, безопасный интервал по данным AAP; "
+        "2) Кофеин — допустимые дозы, в каких продуктах содержится; "
+        "3) Аллергены — нужно ли исключать заранее или только при реакции ребёнка; "
+        "4) Лекарства при ГВ — общий принцип, где проверять совместимость (LactMed); "
+        "5) Продукты которые влияют на вкус молока; "
+        "6) Что категорически запрещено. "
+        "Развенчай популярные мифы — многие мамы излишне ограничивают себя без причины."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+
+@dp.callback_query(F.data == "bf_formula")
+async def bf_formula(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай поддерживающее и научно обоснованное руководство по переходу на смесь. "
+        "1) Когда переход на смесь оправдан — медицинские показания; "
+        "2) Как правильно завершить ГВ — постепенно, без вреда для здоровья мамы; "
+        "3) Как выбрать смесь по возрасту — на что смотреть в составе; "
+        "4) Как правильно разводить смесь — температура, пропорции, стерильность; "
+        "5) Смешанное вскармливание — как совмещать ГВ и смесь; "
+        "6) Психологический аспект — мама не должна чувствовать вину. "
+        "Отвечай без осуждения, поддерживающе."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+
+# ─── ВОССТАНОВЛЕНИЕ МАМЫ ─────────────────────────────────────
+@dp.callback_query(F.data == "mama_recovery")
+async def mama_recovery(call: CallbackQuery):
+    await call.message.edit_text(
+        "🏥 Восстановление мамы после родов\n\n"
+        "Твоё здоровье так же важно как здоровье малыша 💕",
+        reply_markup=kb_recovery()
+    )
+
+@dp.callback_query(F.data == "rec_natural")
+async def rec_natural(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай подробное руководство по восстановлению после естественных родов. "
+        "1) Первые 24 часа — что нормально, что должно насторожить; "
+        "2) Послеродовые выделения (лохии) — норма по срокам и объёму, красные флаги; "
+        "3) Швы и разрывы — уход, когда заживут, когда снимают; "
+        "4) Восстановление матки — сроки, признаки нормального процесса; "
+        "5) Боль и дискомфорт — что облегчит, какие препараты безопасны при ГВ; "
+        "6) Поход в туалет после родов — как облегчить; "
+        "7) Геморрой после родов — как лечить безопасно; "
+        "8) Когда можно вставать, ходить, поднимать тяжести. "
+        "Конкретно и практично."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_recovery())
+
+@dp.callback_query(F.data == "rec_caesar")
+async def rec_caesar(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай исчерпывающее руководство по восстановлению после кесарева сечения. "
+        "1) Первые дни в больнице — что происходит, когда встают, обезболивание; "
+        "2) Шов после КС — виды швов, уход в домашних условиях, чем обрабатывать; "
+        "3) Когда снимают швы или рассасываются сами — по видам; "
+        "4) Ограничения после КС — что нельзя и сколько времени: поднятие тяжестей, секс, спорт; "
+        "5) Боль после КС — как справляться, какие препараты при ГВ; "
+        "6) Восстановление тканей — сроки заживления по слоям; "
+        "7) Рубец — уход, когда начинать массаж рубца, силиконовые пластыри; "
+        "8) Следующая беременность после КС — через сколько можно, риски; "
+        "9) Красные флаги — симптомы при которых срочно к врачу. "
+        "Максимально конкретно — мамы после КС часто не знают что нормально."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_recovery())
+
+@dp.callback_query(F.data == "rec_sport")
+async def rec_sport(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай научно обоснованный план возвращения к физической активности после родов. "
+        "1) После естественных родов — когда начинать, с чего начать; "
+        "2) После КС — другие сроки и ограничения; "
+        "3) Упражнения Кегеля — почему критически важны, как делать правильно; "
+        "4) Первые упражнения в роддоме — что безопасно сразу; "
+        "5) Диастаз — как проверить самостоятельно, какие упражнения запрещены при диастазе; "
+        "6) Постепенный план: 6 недель, 3 месяца, 6 месяцев после родов; "
+        "7) Бег, силовые тренировки — когда можно. "
+        "С научным обоснованием и без вреда для здоровья."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_recovery())
+
+@dp.callback_query(F.data == "rec_intimate")
+async def rec_intimate(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай деликатное и научно обоснованное руководство по интимной жизни после родов. "
+        "1) Когда физически можно возобновить — рекомендации ACOG после естественных родов и КС; "
+        "2) Почему может быть дискомфорт и боль — физиологические причины (сухость, швы, гормоны); "
+        "3) Как справиться с сухостью при ГВ — безопасные средства; "
+        "4) Психологический аспект — снижение либидо после родов это норма, почему; "
+        "5) Как разговаривать с партнёром об этом; "
+        "6) Контрацепция после родов — какие методы при ГВ безопасны. "
+        "Деликатно, без осуждения, с уважением к маме."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_recovery())
+
+@dp.callback_query(F.data == "rec_hair")
+async def rec_hair(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Объясни послеродовое выпадение волос научно и дай практические рекомендации. "
+        "1) Почему выпадают волосы после родов — физиология, роль эстрогена и телогеновой фазы; "
+        "2) Когда начинается и заканчивается — нормальные сроки; "
+        "3) Это норма или патология — как отличить; "
+        "4) Что реально помогает — витамины, питание, уход за волосами с доказательной базой; "
+        "5) Что не поможет — развенчание мифов о масках и народных средствах; "
+        "6) Когда обратиться к трихологу или эндокринологу. "
+        "Поддерживающий тон — многие мамы очень переживают из-за этого."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_recovery())
+
+@dp.callback_query(F.data == "rec_diastaz")
+async def rec_diastaz(call: CallbackQuery):
+    await call.message.edit_text("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай подробное научное руководство по диастазу после родов. "
+        "1) Что такое диастаз — анатомия, почему возникает при беременности; "
+        "2) Как самостоятельно проверить есть ли диастаз — пошаговый тест; "
+        "3) Степени диастаза — лёгкий, средний, тяжёлый; "
+        "4) Упражнения которые ЗАПРЕЩЕНЫ при диастазе — скручивания, планка, пресс; "
+        "5) Упражнения которые ПОМОГАЮТ — дыхательные, гипопрессивные, Кегеля; "
+        "6) Бандаж после родов — помогает ли, как носить правильно; "
+        "7) Когда нужна операция — показания; "
+        "8) Сроки восстановления при разных степенях. "
+        "Конкретно с описанием упражнений которые мама может делать дома."
+    )
+    await call.message.edit_text(answer, reply_markup=kb_recovery())
+
+
 async def post_to_channel():
     topics = [
         "научно обоснованный совет по развитию ребёнка от 0 до 3 лет",
