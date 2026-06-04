@@ -215,11 +215,11 @@ def kb_mama_menu():
 def kb_firstdays():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👨‍⚕️ Первый осмотр педиатра", callback_data="fd_pediatr")],
-        [InlineKeyboardButton(text="🩺 Обходы врачей по месяцам", callback_data="fd_doctors")],
         [InlineKeyboardButton(text="📄 Свидетельство о рождении", callback_data="fd_svid")],
-        [InlineKeyboardButton(text="🏫 Запись в садик", callback_data="fd_sadik")],
         [InlineKeyboardButton(text="🤸 Массаж и гимнастика", callback_data="fd_massage")],
         [InlineKeyboardButton(text="🏊 Плавание с малышом", callback_data="fd_swim")],
+        [InlineKeyboardButton(text="🩺 Обходы врачей по месяцам", callback_data="fd_doctors")],
+        [InlineKeyboardButton(text="🏫 Запись в садик", callback_data="fd_sadik")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
     ])
 
@@ -832,7 +832,7 @@ async def fd_pediatr(call: CallbackQuery):
         "5) Что приготовить к приходу врача. "
         "Отвечай конкретно и практично."
     )
-    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+    await call.message.answer(answer, reply_markup=kb_firstdays())
 
 @dp.callback_query(F.data == "fd_doctors")
 async def fd_doctors(call: CallbackQuery):
@@ -845,7 +845,7 @@ async def fd_doctors(call: CallbackQuery):
         "Также укажи какие специалисты нужны в 1 год. "
         "Сделай в виде чёткого структурированного списка по месяцам."
     )
-    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+    await call.message.answer(answer, reply_markup=kb_firstdays())
 
 @dp.callback_query(F.data == "fd_svid")
 async def fd_svid(call: CallbackQuery):
@@ -861,7 +861,7 @@ async def fd_svid(call: CallbackQuery):
         "6) Материнский капитал — как получить. "
         "Всё пошагово, конкретно, с указанием сроков."
     )
-    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+    await call.message.answer(answer, reply_markup=kb_firstdays())
 
 @dp.callback_query(F.data == "fd_sadik")
 async def fd_sadik(call: CallbackQuery):
@@ -877,7 +877,7 @@ async def fd_sadik(call: CallbackQuery):
         "6) С какого возраста берут в садик по закону. "
         "Конкретно и пошагово."
     )
-    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+    await call.message.answer(answer, reply_markup=kb_firstdays())
 
 @dp.callback_query(F.data == "fd_massage")
 async def fd_massage(call: CallbackQuery):
@@ -894,7 +894,7 @@ async def fd_massage(call: CallbackQuery):
         "7) Когда нужен профессиональный массажист а не домашний. "
         "Описывай движения чётко чтобы мама могла повторить."
     )
-    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+    await call.message.answer(answer, reply_markup=kb_firstdays())
 
 @dp.callback_query(F.data == "fd_swim")
 async def fd_swim(call: CallbackQuery):
@@ -911,7 +911,7 @@ async def fd_swim(call: CallbackQuery):
         "7) Противопоказания к плаванию. "
         "Конкретно и безопасно."
     )
-    await call.message.edit_text(answer, reply_markup=kb_firstdays())
+    await call.message.answer(answer, reply_markup=kb_firstdays())
 
 # ─── ГРУДНОЕ ВСКАРМЛИВАНИЕ ───────────────────────────────────
 @dp.callback_query(F.data == "mama_breastfeeding")
@@ -938,7 +938,7 @@ async def bf_start(call: CallbackQuery):
         "7) Как приходит молоко — сроки, что нормально. "
         "Поддерживающий и конкретный тон."
     )
-    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+    await call.message.answer(answer, reply_markup=kb_breastfeeding())
 
 @dp.callback_query(F.data == "bf_pump")
 async def bf_pump(call: CallbackQuery):
@@ -954,7 +954,7 @@ async def bf_pump(call: CallbackQuery):
         "6) Лактогонные средства — что доказано, что миф; "
         "7) Когда обратиться к консультанту по ГВ. "
     )
-    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+    await call.message.answer(answer, reply_markup=kb_breastfeeding())
 
 @dp.callback_query(F.data == "bf_lactostaz")
 async def bf_lactostaz(call: CallbackQuery):
@@ -973,7 +973,7 @@ async def bf_lactostaz(call: CallbackQuery):
         "9) Профилактика лактостаза. "
         "Это срочная тема — отвечай чётко и конкретно."
     )
-    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+    await call.message.answer(answer, reply_markup=kb_breastfeeding())
 
 @dp.callback_query(F.data == "bf_food")
 async def bf_food(call: CallbackQuery):
@@ -989,7 +989,7 @@ async def bf_food(call: CallbackQuery):
         "6) Развенчание мифов о диете при ГВ — что на самом деле не нужно исключать. "
         "Конкретно и без излишних ограничений."
     )
-    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+    await call.message.answer(answer, reply_markup=kb_breastfeeding())
 
 @dp.callback_query(F.data == "bf_nofood")
 async def bf_nofood(call: CallbackQuery):
@@ -1005,7 +1005,7 @@ async def bf_nofood(call: CallbackQuery):
         "6) Что категорически запрещено. "
         "Развенчай популярные мифы — многие мамы излишне ограничивают себя без причины."
     )
-    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+    await call.message.answer(answer, reply_markup=kb_breastfeeding())
 
 @dp.callback_query(F.data == "bf_formula")
 async def bf_formula(call: CallbackQuery):
@@ -1021,7 +1021,7 @@ async def bf_formula(call: CallbackQuery):
         "6) Психологический аспект — мама не должна чувствовать вину. "
         "Отвечай без осуждения, поддерживающе."
     )
-    await call.message.edit_text(answer, reply_markup=kb_breastfeeding())
+    await call.message.answer(answer, reply_markup=kb_breastfeeding())
 
 # ─── ВОССТАНОВЛЕНИЕ МАМЫ ─────────────────────────────────────
 @dp.callback_query(F.data == "mama_recovery")
@@ -1048,7 +1048,7 @@ async def rec_natural(call: CallbackQuery):
         "8) Когда можно вставать, ходить, поднимать тяжести. "
         "Конкретно и практично."
     )
-    await call.message.edit_text(answer, reply_markup=kb_recovery())
+    await call.message.answer(answer, reply_markup=kb_recovery())
 
 @dp.callback_query(F.data == "rec_caesar")
 async def rec_caesar(call: CallbackQuery):
@@ -1067,7 +1067,7 @@ async def rec_caesar(call: CallbackQuery):
         "9) Красные флаги — симптомы при которых срочно к врачу. "
         "Максимально конкретно — мамы после КС часто не знают что нормально."
     )
-    await call.message.edit_text(answer, reply_markup=kb_recovery())
+    await call.message.answer(answer, reply_markup=kb_recovery())
 
 @dp.callback_query(F.data == "rec_sport")
 async def rec_sport(call: CallbackQuery):
@@ -1084,7 +1084,7 @@ async def rec_sport(call: CallbackQuery):
         "7) Бег, силовые тренировки — когда можно. "
         "С научным обоснованием и без вреда для здоровья."
     )
-    await call.message.edit_text(answer, reply_markup=kb_recovery())
+    await call.message.answer(answer, reply_markup=kb_recovery())
 
 @dp.callback_query(F.data == "rec_intimate")
 async def rec_intimate(call: CallbackQuery):
@@ -1100,7 +1100,7 @@ async def rec_intimate(call: CallbackQuery):
         "6) Контрацепция после родов — какие методы при ГВ безопасны. "
         "Деликатно, без осуждения, с уважением к маме."
     )
-    await call.message.edit_text(answer, reply_markup=kb_recovery())
+    await call.message.answer(answer, reply_markup=kb_recovery())
 
 @dp.callback_query(F.data == "rec_hair")
 async def rec_hair(call: CallbackQuery):
@@ -1116,7 +1116,7 @@ async def rec_hair(call: CallbackQuery):
         "6) Когда обратиться к трихологу или эндокринологу. "
         "Поддерживающий тон — многие мамы очень переживают из-за этого."
     )
-    await call.message.edit_text(answer, reply_markup=kb_recovery())
+    await call.message.answer(answer, reply_markup=kb_recovery())
 
 @dp.callback_query(F.data == "rec_diastaz")
 async def rec_diastaz(call: CallbackQuery):
@@ -1134,7 +1134,7 @@ async def rec_diastaz(call: CallbackQuery):
         "8) Сроки восстановления при разных степенях. "
         "Конкретно с описанием упражнений которые мама может делать дома."
     )
-    await call.message.edit_text(answer, reply_markup=kb_recovery())
+    await call.message.answer(answer, reply_markup=kb_recovery())
 
 
 async def post_to_channel():
