@@ -149,6 +149,12 @@ def age_label(months):
             return f"{years} г."
         return f"{years} г. {m} мес."
 
+def clean_text(text):
+    """Убираем markdown символы чтобы Telegram не ругался"""
+    text = text.replace("**", "").replace("__", "").replace("~~", "")
+    text = text.replace("`", "").replace("###", "").replace("##", "").replace("#", "")
+    return text.strip()
+
 async def ask_gpt(system_prompt, user_prompt):
     try:
         response = await client.chat.completions.create(
@@ -159,7 +165,7 @@ async def ask_gpt(system_prompt, user_prompt):
             ],
             max_tokens=800
         )
-        return response.choices[0].message.content
+        return clean_text(response.choices[0].message.content)
     except Exception as e:
         return f"Ошибка GPT: {e}"
 
@@ -226,7 +232,7 @@ async def cmd_start(message: Message, state: FSMContext):
                     f"👋 С возвращением, {saved_name or name}!\n\n"
                     f"🤰 Ты на *{weeks} неделе* беременности ({days} дн.)\n\n"
                     f"Чем могу помочь?",
-                    parse_mode="Markdown",
+                    
                     reply_markup=kb_pregnant_menu()
                 )
             else:
@@ -238,7 +244,7 @@ async def cmd_start(message: Message, state: FSMContext):
                     f"👋 С возвращением, {saved_name or name}!\n\n"
                     f"👶 Малышу *{age_label(months)}*\n\n"
                     f"Чем могу помочь?",
-                    parse_mode="Markdown",
+                    
                     reply_markup=kb_mama_menu()
                 )
             else:
@@ -254,7 +260,7 @@ async def show_start(message: Message, name: str, state: FSMContext):
         f"Я буду давать советы, отвечать на вопросы и помогать — "
         f"всё строго под твою ситуацию.\n\n"
         f"Расскажи мне о себе 👇",
-        parse_mode="Markdown",
+        
         reply_markup=kb_start()
     )
 
@@ -266,7 +272,7 @@ async def choose_pregnant(call: CallbackQuery, state: FSMContext):
         "🤰 Отлично! Введи предполагаемую дату родов (ПДР).\n\n"
         "Её можно узнать у врача или в обменной карте.\n\n"
         "📅 Формат: *ДД.ММ.ГГГГ*\nНапример: *15.09.2025*",
-        parse_mode="Markdown"
+        
     )
 
 @dp.callback_query(F.data == "mode_mama")
@@ -275,7 +281,7 @@ async def choose_mama(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "👶 Отлично! Введи дату рождения малыша.\n\n"
         "📅 Формат: *ДД.ММ.ГГГГ*\nНапример: *10.03.2024*",
-        parse_mode="Markdown"
+        
     )
 
 # ─── ВВОД ПДР ────────────────────────────────────────────────
@@ -284,7 +290,7 @@ async def enter_pdr(message: Message, state: FSMContext):
     text = message.text.strip()
     weeks, days = calc_pregnancy_weeks(text)
     if not weeks:
-        await message.answer("❌ Неверный формат. Введи дату так: *15.09.2025*", parse_mode="Markdown")
+        await message.answer("❌ Неверный формат. Введи дату так: *15.09.2025*", )
         return
     if weeks < 0 or weeks > 42:
         await message.answer("❌ Дата выглядит неверно. Проверь и введи снова.")
@@ -297,7 +303,7 @@ async def enter_pdr(message: Message, state: FSMContext):
         f"✅ Сохранила!\n\n"
         f"🤰 Ты на *{weeks} неделе* беременности ({days} дн.)\n\n"
         f"Я буду давать советы и отвечать на вопросы именно для этого срока 💕",
-        parse_mode="Markdown",
+        
         reply_markup=kb_pregnant_menu()
     )
 
@@ -307,7 +313,7 @@ async def enter_birthdate(message: Message, state: FSMContext):
     text = message.text.strip()
     months, days = calc_child_age(text)
     if months is None:
-        await message.answer("❌ Неверный формат. Введи дату так: *10.03.2024*", parse_mode="Markdown")
+        await message.answer("❌ Неверный формат. Введи дату так: *10.03.2024*", )
         return
     if months < 0 or months > 216:
         await message.answer("❌ Дата выглядит неверно. Проверь и введи снова.")
@@ -320,7 +326,7 @@ async def enter_birthdate(message: Message, state: FSMContext):
         f"✅ Сохранила!\n\n"
         f"👶 Малышу *{age_label(months)}*\n\n"
         f"Буду давать советы именно для этого возраста 💕",
-        parse_mode="Markdown",
+        
         reply_markup=kb_mama_menu()
     )
 
@@ -335,14 +341,14 @@ async def main_menu(call: CallbackQuery, state: FSMContext):
             weeks, days = calc_pregnancy_weeks(date_value)
             await call.message.edit_text(
                 f"🤰 Ты на *{weeks} неделе* беременности\n\nЧем могу помочь?",
-                parse_mode="Markdown",
+                
                 reply_markup=kb_pregnant_menu()
             )
         else:
             months, _ = calc_child_age(date_value)
             await call.message.edit_text(
                 f"👶 Малышу *{age_label(months)}*\n\nЧем могу помочь?",
-                parse_mode="Markdown",
+                
                 reply_markup=kb_mama_menu()
             )
     else:
@@ -359,7 +365,7 @@ async def menu_pregnant(call: CallbackQuery):
         weeks, days = calc_pregnancy_weeks(date_value)
         await call.message.edit_text(
             f"🤰 Ты на *{weeks} неделе* беременности\n\nЧем могу помочь?",
-            parse_mode="Markdown",
+            
             reply_markup=kb_pregnant_menu()
         )
 
@@ -371,7 +377,7 @@ async def menu_mama(call: CallbackQuery):
         months, _ = calc_child_age(date_value)
         await call.message.edit_text(
             f"👶 Малышу *{age_label(months)}*\n\nЧем могу помочь?",
-            parse_mode="Markdown",
+            
             reply_markup=kb_mama_menu()
         )
 
@@ -396,7 +402,7 @@ async def preg_week(call: CallbackQuery):
         f"📅 *Твой срок*\n\n"
         f"🤰 *{weeks} недель* и *{days} дней*\n\n"
         f"Это {'1-й триместр 🌱' if weeks <= 13 else '2-й триместр 🌸' if weeks <= 26 else '3-й триместр 🌺'}",
-        parse_mode="Markdown",
+        
         reply_markup=kb_back_to_menu("pregnant")
     )
 
@@ -416,7 +422,7 @@ async def preg_baby(call: CallbackQuery):
     )
     await call.message.edit_text(
         f"👶 *Малыш на {weeks} неделе*\n\n{answer}",
-        parse_mode="Markdown",
+        
         reply_markup=kb_back_to_menu("pregnant")
     )
 
@@ -436,7 +442,7 @@ async def preg_checklist(call: CallbackQuery):
     )
     await call.message.edit_text(
         f"✅ *Чек-лист на {weeks} неделю*\n\n{answer}",
-        parse_mode="Markdown",
+        
         reply_markup=kb_back_to_menu("pregnant")
     )
 
@@ -456,7 +462,7 @@ async def preg_shop(call: CallbackQuery):
     )
     await call.message.edit_text(
         f"🛍 *Список покупок*\n\n{answer}",
-        parse_mode="Markdown",
+        
         reply_markup=kb_back_to_menu("pregnant")
     )
 
@@ -472,7 +478,6 @@ async def mama_gpt_handler(call: CallbackQuery, system: str, prompt_fn):
     answer = await ask_gpt(system, prompt_fn(months))
     await call.message.edit_text(
         answer,
-        parse_mode="Markdown",
         reply_markup=kb_back_to_menu("mama")
     )
 
@@ -606,7 +611,7 @@ async def mama_emotions(call: CallbackQuery):
     )
     await call.message.edit_text(
         f"🧠 *Эмоции мамы*\n\n{answer}",
-        parse_mode="Markdown",
+        
         reply_markup=kb_back_to_menu("mama")
     )
 
@@ -625,7 +630,7 @@ async def mama_diary(call: CallbackQuery, state: FSMContext):
             text += f"📅 *{dt}*\n{entry}\n\n"
     else:
         text = "📓 *Дневник малыша*\n\nЗаписей пока нет. Начни фиксировать важные моменты! 💕"
-    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    await call.message.edit_text(text,  reply_markup=kb)
 
 @dp.callback_query(F.data == "diary_add")
 async def diary_add(call: CallbackQuery, state: FSMContext):
@@ -654,7 +659,7 @@ async def ask_question(call: CallbackQuery, state: FSMContext):
         "О беременности, ребёнке, здоровье, воспитании, психологии — "
         "я отвечу с учётом твоей ситуации 💕\n\n"
         "Напиши свой вопрос:",
-        parse_mode="Markdown"
+        
     )
 
 @dp.message(QuestionStates.waiting_question)
