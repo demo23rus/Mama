@@ -1451,7 +1451,6 @@ async def main():
     scheduler.add_job(post_night,     "cron", hour=20, minute=0)
     scheduler.start()
     logging.info("Мамин помощник запущен!")
-    asyncio.create_task(post_today_all())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
