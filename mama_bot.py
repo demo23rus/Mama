@@ -177,7 +177,7 @@ def kb_start():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤰 Я беременна", callback_data="mode_pregnant")],
         [InlineKeyboardButton(text="👩 Я уже мама", callback_data="mode_mama")],
-        [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/YaMamaChannel")]
+        [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/yamama_ai")]
     ])
 
 def kb_pregnant_menu():
