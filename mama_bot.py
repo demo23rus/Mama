@@ -54,6 +54,9 @@ class QuestionStates(StatesGroup):
 class DiaryStates(StatesGroup):
     waiting_entry = State()
 
+class PhotoStates(StatesGroup):
+    waiting_photo = State()
+
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect("/root/mama.db")
@@ -183,6 +186,7 @@ def kb_pregnant_menu():
         [InlineKeyboardButton(text="👶 Развитие малыша", callback_data="preg_baby")],
         [InlineKeyboardButton(text="✅ Чек-лист", callback_data="preg_checklist")],
         [InlineKeyboardButton(text="🛍 Список покупок", callback_data="preg_shop")],
+        [InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
@@ -207,6 +211,7 @@ def kb_mama_menu():
          InlineKeyboardButton(text="👨‍👩‍👧 Отношения в семье", callback_data="mama_family")],
         [InlineKeyboardButton(text="🧠 Эмоции мамы", callback_data="mama_emotions"),
          InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
+        [InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
@@ -1135,6 +1140,240 @@ async def rec_diastaz(call: CallbackQuery):
         "Конкретно с описанием упражнений которые мама может делать дома."
     )
     await call.message.answer(answer, reply_markup=kb_recovery())
+
+
+# ─── АНАЛИЗ ФОТО ─────────────────────────────────────────────
+def kb_photo_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔴 Сыпь и кожа малыша", callback_data="photo_skin")],
+        [InlineKeyboardButton(text="💩 Стул малыша", callback_data="photo_stool")],
+        [InlineKeyboardButton(text="🍽 Еда — подходит ли малышу", callback_data="photo_food")],
+        [InlineKeyboardButton(text="💊 Упаковка смеси/лекарства", callback_data="photo_package")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+
+@dp.callback_query(F.data == "photo_menu")
+async def photo_menu(call: CallbackQuery):
+    await call.message.answer(
+        "📸 Анализ фото\n\n"
+        "Отправь фото и я помогу разобраться.\n"
+        "Выбери что хочешь проанализировать 👇",
+        reply_markup=kb_photo_menu()
+    )
+
+@dp.callback_query(F.data == "photo_skin")
+async def photo_skin(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="skin")
+    await call.message.answer(
+        "📸 Отправь фото кожи или сыпи малыша\n\n"
+        "Я опишу что вижу и подскажу на что это похоже.\n"
+        "⚠️ Это не замена осмотру педиатра — только ориентир."
+    )
+
+@dp.callback_query(F.data == "photo_stool")
+async def photo_stool(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="stool")
+    await call.message.answer(
+        "📸 Отправь фото стула малыша\n\n"
+        "Я оценю цвет и консистенцию — это важный показатель здоровья.\n"
+        "⚠️ При любых сомнениях — к педиатру."
+    )
+
+@dp.callback_query(F.data == "photo_food")
+async def photo_food_photo(call: CallbackQuery, state: FSMContext):
+    user = get_user(call.from_user.id)
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="food", user=user)
+    age_info = ""
+    if user and user[0] == "mama":
+        months, _ = calc_child_age(user[1])
+        age_info = f" (малышу {age_label(months)})"
+    await call.message.answer(
+        f"📸 Отправь фото еды или блюда{age_info}\n\n"
+        "Я скажу подходит ли это по возрасту малыша."
+    )
+
+@dp.callback_query(F.data == "photo_package")
+async def photo_package(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="package")
+    await call.message.answer(
+        "📸 Отправь фото упаковки смеси или лекарства\n\n"
+        "Я расшифрую состав и скажу на что обратить внимание."
+    )
+
+@dp.message(PhotoStates.waiting_photo, F.photo)
+async def handle_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photo_type = data.get("photo_type", "skin")
+    user = get_user(message.from_user.id)
+    await state.clear()
+
+    # Получаем фото
+    photo = message.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+    import aiohttp
+    await message.answer("⏳ Анализирую фото...")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url) as resp:
+                photo_bytes = await resp.read()
+
+        import base64
+        photo_b64 = base64.b64encode(photo_bytes).decode()
+
+        # Сначала фильтр — проверяем что на фото нужное
+        if photo_type == "skin":
+            filter_prompt = "Посмотри на это изображение. На нём кожа человека или ребёнка с возможными высыпаниями, покраснениями или другими кожными проявлениями? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                "Ты опытный педиатр. Опиши что видишь на коже ребёнка: "
+                "1) Характер высыпаний — цвет, форма, размер, локализация; "
+                "2) На какие известные состояния это визуально похоже — потница, атопический дерматит, аллергия, инфекция и т.д.; "
+                "3) Что можно сделать дома прямо сейчас; "
+                "4) Красные флаги — когда срочно к врачу. "
+                "В конце обязательно напомни что это описание а не диагноз."
+            )
+            wrong_msg = "📸 Я жду фото кожи или сыпи малыша 🤍 Отправь фотографию кожного покрова ребёнка."
+
+        elif photo_type == "stool":
+            filter_prompt = "На этом изображении подгузник или стул ребёнка? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                "Ты педиатр. Оцени стул ребёнка по фото: "
+                "1) Цвет — что он означает для здоровья малыша; "
+                "2) Консистенция — норма или нет; "
+                "3) Что это может говорить о пищеварении; "
+                "4) Когда нужен врач. "
+                "Напомни что точный диагноз ставит только педиатр."
+            )
+            wrong_msg = "📸 Я жду фото стула малыша 🤍 Отправь соответствующее фото."
+
+        elif photo_type == "food":
+            age_context = ""
+            if user and user[0] == "mama":
+                months, _ = calc_child_age(user[1])
+                age_context = f" Малышу {age_label(months)} ({months} месяцев)."
+            filter_prompt = "На этом изображении еда или блюдо? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                f"Ты диетолог-педиатр.{age_context} "
+                "Посмотри на это блюдо или продукт и скажи: "
+                "1) Что это за еда; "
+                "2) Подходит ли это ребёнку по возрасту — да/нет и почему; "
+                "3) Что в составе может быть проблематично; "
+                "4) Как правильно приготовить если нужна адаптация под возраст."
+            )
+            wrong_msg = "📸 Я жду фото еды или блюда 🤍 Отправь фотографию продукта или блюда."
+
+        else:  # package
+            filter_prompt = "На этом изображении упаковка товара, лекарства или смеси? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                "Ты педиатр-фармаколог. Изучи упаковку и скажи: "
+                "1) Что это за продукт; "
+                "2) Основные компоненты состава — что важно; "
+                "3) Для какого возраста подходит; "
+                "4) На что обратить особое внимание маме; "
+                "5) Есть ли спорные ингредиенты."
+            )
+            wrong_msg = "📸 Я жду фото упаковки смеси или лекарства 🤍 Отправь фотографию упаковки."
+
+        # Проверка фильтром
+        filter_response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                    {"type": "text", "text": filter_prompt}
+                ]
+            }],
+            max_tokens=10
+        )
+        filter_answer = filter_response.choices[0].message.content.strip().upper()
+
+        if "НЕТ" in filter_answer or "NO" in filter_answer:
+            await message.answer(wrong_msg, reply_markup=kb_photo_menu())
+            return
+
+        # Основной анализ
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                    {"type": "text", "text": analysis_prompt}
+                ]
+            }],
+            max_tokens=1000
+        )
+        answer = clean_text(response.choices[0].message.content)
+        await message.answer(answer, reply_markup=kb_photo_menu())
+
+    except Exception as e:
+        logging.error(f"Ошибка анализа фото: {e}")
+        await message.answer("Не удалось проанализировать фото. Попробуй ещё раз.", reply_markup=kb_photo_menu())
+
+@dp.message(PhotoStates.waiting_photo)
+async def photo_wrong_input(message: Message, state: FSMContext):
+    await message.answer("📸 Жду именно фото — отправь изображение 🤍")
+
+# ─── ГОЛОСОВЫЕ СООБЩЕНИЯ ─────────────────────────────────────
+@dp.message(F.voice)
+async def handle_voice(message: Message, state: FSMContext):
+    await state.clear()
+    user = get_user(message.from_user.id)
+    await message.answer("🎤 Слушаю тебя...")
+
+    try:
+        voice = message.voice
+        file = await bot.get_file(voice.file_id)
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+        import aiohttp, io
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url) as resp:
+                voice_bytes = await resp.read()
+
+        # Транскрибируем через Whisper
+        audio_file = io.BytesIO(voice_bytes)
+        audio_file.name = "voice.ogg"
+        transcript = await client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru"
+        )
+        text = transcript.text
+        logging.info(f"Голос распознан: {text}")
+
+        # Отвечаем через GPT с контекстом мамы
+        if user:
+            mode, date_value, name = user
+            if mode == "pregnant":
+                weeks, _ = calc_pregnancy_weeks(date_value)
+                context = f"Беременная женщина на {weeks} неделе."
+            else:
+                months, _ = calc_child_age(date_value)
+                context = f"Мама, ребёнку {age_label(months)} ({months} месяцев)."
+        else:
+            context = "Мама с вопросом о ребёнке или беременности."
+
+        answer = await ask_gpt(
+            f"Ты эксперт в педиатрии и детской психологии. {context} "
+            f"Опирайся на рекомендации ВОЗ, AAP и ведущих специалистов. "
+            f"Отвечай тепло и конкретно. При медицинских симптомах направляй к врачу.",
+            text
+        )
+
+        kb = kb_mama_menu() if user and user[0] == "mama" else kb_pregnant_menu() if user else kb_start()
+        await message.answer(f"🎤 Ты спросила: {text}\n\n{answer}", reply_markup=kb)
+
+    except Exception as e:
+        logging.error(f"Ошибка голоса: {e}")
+        await message.answer("Не удалось распознать голос. Попробуй ещё раз или напиши текстом 🤍")
 
 
 # ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
