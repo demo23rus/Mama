@@ -323,7 +323,7 @@ async def choose_mama(call: CallbackQuery, state: FSMContext):
     )
 
 # ─── ВВОД ПДР ────────────────────────────────────────────────
-@dp.message(RegStates.entering_pdr)
+@dp.message(RegStates.entering_pdr, F.text)
 async def enter_pdr(message: Message, state: FSMContext):
     text = message.text.strip()
     weeks, days = calc_pregnancy_weeks(text)
@@ -346,7 +346,7 @@ async def enter_pdr(message: Message, state: FSMContext):
     )
 
 # ─── ВВОД ДАТЫ РОЖДЕНИЯ ──────────────────────────────────────
-@dp.message(RegStates.entering_birthdate)
+@dp.message(RegStates.entering_birthdate, F.text)
 async def enter_birthdate(message: Message, state: FSMContext):
     text = message.text.strip()
     months, days = calc_child_age(text)
@@ -763,7 +763,7 @@ async def diary_add(call: CallbackQuery, state: FSMContext):
         "Например: первый зуб, первый шаг, первое слово, рост и вес, смешной момент 💕"
     )
 
-@dp.message(DiaryStates.waiting_entry)
+@dp.message(DiaryStates.waiting_entry, F.text)
 async def save_diary_entry(message: Message, state: FSMContext):
     save_diary(message.from_user.id, message.text)
     await state.clear()
@@ -785,7 +785,7 @@ async def ask_question(call: CallbackQuery, state: FSMContext):
         
     )
 
-@dp.message(QuestionStates.waiting_question)
+@dp.message(QuestionStates.waiting_question, F.text)
 async def handle_question(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     await state.clear()
@@ -1321,30 +1321,31 @@ async def photo_wrong_input(message: Message, state: FSMContext):
 # ─── ГОЛОСОВЫЕ СООБЩЕНИЯ ─────────────────────────────────────
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
+    # Сбрасываем любое текущее состояние — голос имеет приоритет
     await state.clear()
     user = get_user(message.from_user.id)
     await message.answer("🎤 Слушаю тебя...")
 
     try:
+        import io
         voice = message.voice
         file = await bot.get_file(voice.file_id)
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-
-        import aiohttp, io
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file_url) as resp:
-                voice_bytes = await resp.read()
+        file_path = f"/tmp/mama_voice_{message.from_user.id}.ogg"
+        await bot.download_file(file.file_path, file_path)
 
         # Транскрибируем через Whisper
-        audio_file = io.BytesIO(voice_bytes)
-        audio_file.name = "voice.ogg"
-        transcript = await client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            language="ru"
-        )
-        text = transcript.text
+        with open(file_path, "rb") as f:
+            transcript = await client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="ru"
+            )
+        text = transcript.text.strip()
         logging.info(f"Голос распознан: {text}")
+
+        if not text:
+            await message.answer("Не удалось распознать речь. Говори чуть громче и попробуй ещё раз 🎤")
+            return
 
         # Отвечаем через GPT с контекстом мамы
         if user:
