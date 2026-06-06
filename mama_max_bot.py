@@ -30,7 +30,7 @@ Configuration.secret_key  = YOOKASSA_SECRET
 SPREADSHEET_ID   = "1PE7CaFuWOe_eygQqIoMAmUdJBtATbIaNfZR4cvarPCA"
 CREDENTIALS_FILE = "/root/google_credentials.json"
 
-MAX_API          = "https://botapi.max.ru"
+MAX_API          = "https://platform-api.max.ru"
 DB_PATH          = "/root/mama_max.db"
 FREE_REQUESTS    = 10
 CHANNEL_ID       = -75619101439475
@@ -283,27 +283,16 @@ async def send_message(chat_id, text, buttons=None):
 
 async def send_to_channel(text):
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    payload = {
-        "recipient": {"chat_id": CHANNEL_ID},
-        "type": "bot_action",
-        "action": "send_message",
-        "body": {"type": "text", "text": text[:4000]}
-    }
-    async with httpx.AsyncClient() as c:
+    payload = {"text": text[:4000]}
+    async with httpx.AsyncClient(timeout=30) as c:
         try:
-            r = await c.post(f"{MAX_API}/messages", headers=headers, json=payload, timeout=15)
+            r = await c.post(f"{MAX_API}/messages?chat_id={CHANNEL_ID}", json=payload, headers=headers)
             logging.info(f"Channel post: {r.status_code}")
         except Exception as e:
             logging.error(f"Channel post error: {e}")
 
 async def answer_callback(callback_id):
-    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as c:
-        try:
-            await c.post(f"{MAX_API}/answers/{callback_id}", headers=headers,
-                        json={"type": "callback"}, timeout=10)
-        except Exception as e:
-            logging.error(f"answer_callback error: {e}")
+    pass  # MAX не требует подтверждения callback
 
 async def register_webhook():
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
@@ -922,6 +911,7 @@ async def post_rubric_max(hour: int):
 @app.on_event("startup")
 async def startup():
     init_db()
+    await register_webhook()
     asyncio.create_task(check_payments_loop())
     scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(8)),  "cron", hour=8,  minute=0)
     scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(10)), "cron", hour=10, minute=0)
@@ -929,7 +919,6 @@ async def startup():
     scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(16)), "cron", hour=16, minute=0)
     scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(20)), "cron", hour=20, minute=0)
     scheduler_max.start()
-    await register_webhook()
     logging.info("Мамин Помощник MAX запущен!")
 
 @app.post("/webhook")
@@ -950,6 +939,7 @@ async def webhook(request: Request):
             get_user(chat_id, username, name)
             set_step(chat_id, "idle")
             threading.Thread(target=sheets_log_visit, args=(chat_id, name, username)).start()
+            user_id = chat_id
             await send_message(chat_id,
                 f"Привет, {name}! 🤍\n\n"
                 f"Я Мамин Помощник — твой личный ИИ-помощник.\n\n"
@@ -963,7 +953,8 @@ async def webhook(request: Request):
         elif update_type == "message_created":
             msg = data.get("message", {})
             sender = msg.get("sender", {})
-            chat_id = sender.get("user_id") or msg.get("recipient", {}).get("chat_id")
+            chat_id = msg.get("recipient", {}).get("chat_id")
+            user_id = sender.get("user_id")
             username = sender.get("username", "")
             name = sender.get("name", "")
             body = msg.get("body", {})
@@ -987,17 +978,23 @@ async def webhook(request: Request):
                 get_user(chat_id, username, name)
                 await handle_message(chat_id, text, username, name)
 
-        elif update_type == "bot_action":
-            cb = data.get("callback", {})
-            payload = cb.get("payload", "")
-            user = cb.get("user", {})
-            chat_id = user.get("user_id")
+        elif update_type == "message_callback":
+            callback = data.get("callback", {})
+            user = callback.get("user", {})
+            message = data.get("message", {})
+            chat_id = (
+                message.get("recipient", {}).get("chat_id") or
+                callback.get("chat_id") or
+                message.get("sender", {}).get("chat_id")
+            )
+            user_id = user.get("user_id")
             username = user.get("username", "")
             name = user.get("name", "")
-            callback_id = cb.get("callback_id", "")
-            get_user(chat_id, username, name)
-            await answer_callback(callback_id)
-            await handle_callback(chat_id, payload, username, name)
+            payload_cb = callback.get("payload", "")
+            logging.info(f"CALLBACK: chat_id={chat_id} user_id={user_id} payload={payload_cb}")
+            if chat_id and payload_cb:
+                get_user(chat_id, username, name)
+                await handle_callback(chat_id, payload_cb, username, name)
 
     except Exception as e:
         logging.error(f"Webhook error: {e}")
