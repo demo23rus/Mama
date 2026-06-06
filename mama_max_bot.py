@@ -1218,6 +1218,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         buttons = [
             [{"type": "callback", "text": "😴 Уснул", "payload": "sleep_start"},
              {"type": "callback", "text": "🌅 Проснулся", "payload": "sleep_end"}],
+            [{"type": "callback", "text": "📊 Анализ сна", "payload": "sleep_analyze"}],
             [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
         ]
         text = "🌙 Дневник сна\n\n"
@@ -1230,6 +1231,25 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         else:
             text += "Записей нет. Нажимай когда малыш засыпает и просыпается!"
         await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "sleep_analyze":
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? AND entry LIKE 'СОН:%' ORDER BY created_at DESC LIMIT 20",
+            (user_id,)).fetchall()
+        conn.close()
+        if len(entries) < 4:
+            await send_message(chat_id, "Нужно больше записей для анализа. Фиксируй сон несколько дней!", back_button())
+            return
+        await send_message(chat_id, "⏳ Анализирую сон...")
+        data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {entry.replace('СОН:','')}" for entry, dt in entries])
+        answer = await generate_text(EXPERT_BASE,
+            f"Ребёнку {m_label}. Дневник сна:\n{data_str}\n\n"
+            f"Проанализируй паттерн сна по нормам AAP для этого возраста: "
+            f"сколько часов спит суммарно, правильные ли интервалы бодрствования, "
+            f"есть ли проблемы и как их решить. Конкретные рекомендации.")
+        await send_message(chat_id, answer, back_button())
         return
 
     if payload == "sleep_start":
