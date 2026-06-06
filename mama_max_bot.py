@@ -708,7 +708,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         conn.execute("UPDATE users SET birth_date=?, step='idle' WHERE user_id=?", (f"pdr:{text}", user_id))
         conn.commit()
         conn.close()
-        await send_message(chat_id, f"✅ Ты на {w} неделе беременности\n\nЧем могу помочь? 💕", main_menu_buttons())
+        await send_message(chat_id, f"✅ Ты на {w} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
         return
 
     # Ввод роста
@@ -831,7 +831,8 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "back_menu":
         set_step(user_id, "idle")
         if birth_date and birth_date.startswith("pdr:"):
-            await send_message(chat_id, f"🤰 {m_label}\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
+            weeks_cur = calc_pregnancy_weeks(birth_date.replace("pdr:", ""))
+            await send_message(chat_id, f"🤰 Ты на {weeks_cur} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
         elif birth_date:
             await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons())
         else:
@@ -848,7 +849,11 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "change_data":
-        set_step(user_id, "idle")
+        # Reset birth_date so user can choose again
+        conn = sqlite3.connect(DB)
+        conn.execute("UPDATE users SET birth_date='', step='idle' WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
         await send_message(chat_id, "Выбери свой статус 👇",
             [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
               {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
@@ -1658,7 +1663,8 @@ async def send_to_channel(text):
         logging.info(f"Channel post: {r.status_code}")
 
 async def channel_posting_loop():
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler as _APScheduler
+    scheduler = _APScheduler(timezone="Europe/Moscow")
     for hour, (rubric_name, rubric_instruction) in RUBRICS.items():
         async def post_job(h=hour, rn=rubric_name, ri=rubric_instruction):
             weekday = datetime.now().weekday()
