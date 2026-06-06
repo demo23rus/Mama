@@ -8,19 +8,24 @@ import threading
 from datetime import datetime, timedelta
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from yookassa import Configuration, Payment
+from fastapi.responses import JSONResponse, HTMLResponse
+import uvicorn
 import gspread
 from google.oauth2.service_account import Credentials
+from yookassa import Configuration, Payment
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 
-# ─── НАСТРОЙКИ ───────────────────────────────────────────────
+# ─── КОНФИГ ──────────────────────────────────────────────────
 MAX_TOKEN        = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
+MAX_API          = "https://platform-api.max.ru"
 OPENAI_KEY       = "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"
 WEBHOOK_URL      = "https://maminpomoshnik.ru/webhook"
 SUPPORT_URL      = "https://t.me/demo23rus"
-BOT_NAME         = "Мамин Помощник MAX"
+CHANNEL_ID       = -75619101439475
+FREE_REQUESTS    = 10
+DB_PATH          = "/root/mama_max.db"
 
 YOOKASSA_SHOP_ID = "1363324"
 YOOKASSA_SECRET  = "live_-RKE9nsi8wZiM-5f00z78E84OYSi3M0Dj9w_-pE0Mvw"
@@ -30,42 +35,29 @@ Configuration.secret_key  = YOOKASSA_SECRET
 SPREADSHEET_ID   = "1PE7CaFuWOe_eygQqIoMAmUdJBtATbIaNfZR4cvarPCA"
 CREDENTIALS_FILE = "/root/google_credentials.json"
 
-MAX_API          = "https://platform-api.max.ru"
-DB_PATH          = "/root/mama_max.db"
-FREE_REQUESTS    = 10
-CHANNEL_ID       = -75619101439475
-
 client = AsyncOpenAI(api_key=OPENAI_KEY)
 app = FastAPI()
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT, name TEXT,
-        mode TEXT DEFAULT '',
-        date_value TEXT DEFAULT '',
-        created_at TEXT
+        user_id INTEGER PRIMARY KEY, username TEXT, name TEXT,
+        mode TEXT DEFAULT '', date_value TEXT DEFAULT '', created_at TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
-        user_id INTEGER PRIMARY KEY,
-        plan TEXT DEFAULT '',
-        sub_end TEXT
+        user_id INTEGER PRIMARY KEY, plan TEXT DEFAULT '', sub_end TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS pending_payments (
-        payment_id TEXT PRIMARY KEY,
-        user_id INTEGER, plan TEXT, created_at TEXT
+        payment_id TEXT PRIMARY KEY, user_id INTEGER, plan TEXT, created_at TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS requests_count (
-        user_id INTEGER PRIMARY KEY,
-        count INTEGER DEFAULT 0
+        user_id INTEGER PRIMARY KEY, count INTEGER DEFAULT 0
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS steps (
-        user_id INTEGER PRIMARY KEY,
-        step TEXT DEFAULT 'idle',
-        data TEXT DEFAULT ''
+        user_id INTEGER PRIMARY KEY, step TEXT DEFAULT 'idle', data TEXT DEFAULT ''
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS psycho_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,8 +199,7 @@ def save_growth(user_id, height, weight):
 def get_growth(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 5",
-              (user_id,))
+    c.execute("SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 5", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -223,8 +214,7 @@ def save_symptom(user_id, symptom):
 def get_symptoms(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
-              (user_id,))
+    c.execute("SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user_id,))
     rows = c.fetchall()
     conn.close()
     return rows
@@ -234,12 +224,12 @@ def sheets_log_visit(user_id, name, username, plan=""):
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client_gs = gspread.authorize(creds)
-        spreadsheet = client_gs.open_by_key(SPREADSHEET_ID)
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
         try:
             sheet = spreadsheet.worksheet("МамаБот MAX")
         except:
-            sheet = spreadsheet.add_worksheet(title="МамаБот MAX", rows=1000, cols=8)
+            sheet = spreadsheet.add_worksheet(title="МамаБот MAX", rows=1000, cols=6)
             sheet.append_row(["ID", "Username", "Имя", "Подписка", "Дата"])
         data = sheet.get_all_values()
         ids = [row[0] for row in data[1:]]
@@ -253,33 +243,29 @@ def sheets_add_review(user_id, username, text):
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client_gs = gspread.authorize(creds)
-        spreadsheet = client_gs.open_by_key(SPREADSHEET_ID)
+        gc = gspread.authorize(creds)
+        spreadsheet = gc.open_by_key(SPREADSHEET_ID)
         try:
             sheet = spreadsheet.worksheet("Отзывы МамаБот MAX")
         except:
             sheet = spreadsheet.add_worksheet(title="Отзывы МамаБот MAX", rows=1000, cols=4)
             sheet.append_row(["ID", "Username", "Текст", "Дата"])
-        sheet.append_row([str(user_id), username or "", text,
-                         datetime.now().strftime("%d.%m.%Y %H:%M")])
+        sheet.append_row([str(user_id), username or "", text, datetime.now().strftime("%d.%m.%Y %H:%M")])
     except Exception as e:
         logging.error(f"Sheets review error: {e}")
 
 # ─── MAX API ─────────────────────────────────────────────────
 async def send_message(chat_id, text, buttons=None):
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    payload = {"recipient": {"chat_id": chat_id}, "type": "bot_action",
-               "action": "send_message",
-               "body": {"type": "text", "text": text[:4000]}}
+    payload = {"text": text[:4000]}
     if buttons:
         payload["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
-    async with httpx.AsyncClient() as c:
+    async with httpx.AsyncClient(timeout=30) as c:
         try:
-            r = await c.post(f"{MAX_API}/messages", headers=headers, json=payload, timeout=15)
+            r = await c.post(f"{MAX_API}/messages?chat_id={chat_id}", json=payload, headers=headers)
             logging.info(f"send_message {chat_id}: {r.status_code}")
         except Exception as e:
             logging.error(f"send_message error: {e}")
-
 
 async def send_to_channel(text):
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
@@ -290,21 +276,6 @@ async def send_to_channel(text):
             logging.info(f"Channel post: {r.status_code}")
         except Exception as e:
             logging.error(f"Channel post error: {e}")
-
-async def answer_callback(callback_id):
-    pass  # MAX не требует подтверждения callback
-
-async def register_webhook():
-    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    payload = {"url": WEBHOOK_URL, "update_types": [
-        "bot_started", "message_created", "bot_action"
-    ]}
-    async with httpx.AsyncClient() as c:
-        try:
-            r = await c.post(f"{MAX_API}/subscriptions", headers=headers, json=payload, timeout=15)
-            logging.info(f"Webhook registered: {r.status_code} {r.text}")
-        except Exception as e:
-            logging.error(f"Webhook error: {e}")
 
 # ─── КНОПКИ ──────────────────────────────────────────────────
 def main_menu_buttons():
@@ -371,20 +342,17 @@ async def ask_gpt(system, prompt, max_tokens=1500):
             max_tokens=max_tokens
         )
         text = response.choices[0].message.content
-        text = text.replace("**", "").replace("__", "").replace("`", "")
-        text = text.replace("###", "").replace("##", "").replace("# ", "")
-        return text.strip()
+        return text.replace("**", "").replace("__", "").replace("`", "").replace("###", "").replace("##", "").strip()
     except Exception as e:
         return f"Ошибка GPT: {e}"
 
-# ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ─────────────────────────────────
+# ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────
 def calc_child_age(birth_str):
     try:
         from datetime import date
         birth = datetime.strptime(birth_str, "%d.%m.%Y").date()
         today = date.today()
-        months = (today.year - birth.year) * 12 + (today.month - birth.month)
-        return months
+        return (today.year - birth.year) * 12 + (today.month - birth.month)
     except:
         return None
 
@@ -393,23 +361,17 @@ def calc_pregnancy_weeks(pdr_str):
         from datetime import date, timedelta
         pdr = datetime.strptime(pdr_str, "%d.%m.%Y").date()
         conception = pdr - timedelta(days=280)
-        today = date.today()
-        days = (today - conception).days
-        return days // 7
+        return (date.today() - conception).days // 7
     except:
         return None
 
 def age_label(months):
-    if months is None:
-        return "неизвестного возраста"
-    if months < 1:
-        return "новорождённый"
-    elif months < 12:
-        return f"{months} мес."
-    else:
-        years = months // 12
-        m = months % 12
-        return f"{years} г. {m} мес." if m else f"{years} г."
+    if months is None: return "неизвестного возраста"
+    if months < 1: return "новорождённый"
+    if months < 12: return f"{months} мес."
+    years = months // 12
+    m = months % 12
+    return f"{years} г. {m} мес." if m else f"{years} г."
 
 # ─── ЮКАССА ──────────────────────────────────────────────────
 async def create_payment(user_id):
@@ -426,7 +388,7 @@ async def create_payment(user_id):
                        "vat_code": 1, "payment_subject": "service",
                        "payment_mode": "full_payment"}]
         },
-        "metadata": {"user_id": user_id, "plan": "mama_premium"}
+        "metadata": {"user_id": user_id}
     }, str(uuid.uuid4()))
     return payment
 
@@ -434,132 +396,135 @@ async def check_payments_loop():
     while True:
         await asyncio.sleep(15)
         try:
-            pending = get_pending_payments()
-            for payment_id, user_id, plan in pending:
+            for payment_id, user_id, plan in get_pending_payments():
                 try:
                     payment = Payment.find_one(payment_id)
                     if payment.status == "succeeded":
-                        set_subscription(user_id, plan, 30)
+                        set_subscription(user_id, "mama_premium", 30)
                         delete_pending_payment(payment_id)
-                        threading.Thread(target=sheets_log_visit,
-                                        args=(user_id, "", "", "💎 Премиум")).start()
                         await send_message(user_id,
-                            "✅ Оплата прошла!\n\n"
-                            "💎 Премиум активирован на 30 дней.\n\n"
-                            "Все функции разблокированы — пользуйся на здоровье! 🤍",
+                            "✅ Оплата прошла!\n\n💎 Премиум активирован на 30 дней.\n\nВсе функции разблокированы 🤍",
                             main_menu_buttons()
                         )
                     elif payment.status == "canceled":
                         delete_pending_payment(payment_id)
                 except Exception as e:
-                    logging.error(f"Payment check error {payment_id}: {e}")
+                    logging.error(f"Payment check {payment_id}: {e}")
         except Exception as e:
-            logging.error(f"Payments loop error: {e}")
+            logging.error(f"Payments loop: {e}")
+
+# ─── АВТОПОСТИНГ ─────────────────────────────────────────────
+DAILY_THEMES = {
+    0: "беременность и подготовка к родам",
+    1: "новорождённый 0-3 месяца",
+    2: "малыш 3-12 месяцев",
+    3: "ребёнок 1-3 года",
+    4: "дошкольник 3-7 лет",
+    5: "здоровье и педиатрия",
+    6: "мама о себе — восстановление и психология",
+}
+
+RUBRICS = {
+    8:  ("🌅 Доброе утро, мама", "Короткий заряд на день — мотивация, поддержка. 100-150 слов."),
+    10: ("🔬 Научный факт дня", "Интересный научный факт о детях. Ссылка на ВОЗ или AAP. 150-200 слов."),
+    13: ("💡 Совет педиатра", "Практический совет по ВОЗ/AAP. 200-250 слов."),
+    16: ("🧠 Детская психология", "Объяснение поведения ребёнка по Петрановской/Сигелу. 200-250 слов."),
+    20: ("❤️ Для мамы", "О восстановлении, выгорании. Тепло. 150-200 слов."),
+}
+
+async def post_rubric(hour):
+    weekday = datetime.now().weekday()
+    daily_theme = DAILY_THEMES[weekday]
+    rubric_name, rubric_instruction = RUBRICS[hour]
+    post = await ask_gpt(
+        "Ты автор экспертного канала 'Я МАМА' в MAX. "
+        "Пишешь на основе ВОЗ, AAP, Петрановской, Карпа, Серза, Сигела. "
+        "Тепло и научно. Без воды. Добавляй эмодзи. "
+        "В конце — один практический совет на сегодня.",
+        f"Рубрика: {rubric_name}\nТема: {daily_theme}\nИнструкция: {rubric_instruction}\n"
+        f"Начни с эмодзи рубрики и её названия."
+    )
+    await send_to_channel(post)
 
 # ─── ОБРАБОТКА СООБЩЕНИЙ ─────────────────────────────────────
-async def handle_message(user_id, text, username="", name=""):
+async def process_command(chat_id, user_id, text, username="", name=""):
     step, step_data = get_step(user_id)
 
-    # Психолог — диалог
     if step == "psycho_session":
         if not is_premium(user_id):
             set_step(user_id, "idle")
-            await send_message(user_id, "🔒 Мамин психолог доступен в Премиум 💎", premium_button())
+            await send_message(chat_id, "🔒 Мамин психолог доступен в Премиум 💎", premium_button())
             return
         save_psycho(user_id, "user", text)
         history = get_psycho_history(user_id)
         user_row = get_user(user_id)
         context = ""
         if user_row and user_row[1] and user_row[2]:
-            mode, date_value = user_row[1], user_row[2]
-            if mode == "pregnant":
-                weeks = calc_pregnancy_weeks(date_value)
+            if user_row[1] == "pregnant":
+                weeks = calc_pregnancy_weeks(user_row[2])
                 context = f"Беременная на {weeks} неделе."
-            elif mode == "mama":
-                months = calc_child_age(date_value)
+            elif user_row[1] == "mama":
+                months = calc_child_age(user_row[2])
                 context = f"Мама, ребёнку {age_label(months)}."
         messages = [{"role": "system", "content": PSYCHO_SYSTEM + (f" {context}" if context else "")}]
         for role, content in history[:-1]:
             messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": text})
-        await send_message(user_id, "🧠 Думаю...")
+        await send_message(chat_id, "🧠 Думаю...")
         try:
-            response = await client.chat.completions.create(
-                model="gpt-4o", messages=messages, max_tokens=800)
-            answer = response.choices[0].message.content.replace("**", "").strip()
+            resp = await client.chat.completions.create(model="gpt-4o", messages=messages, max_tokens=800)
+            answer = resp.choices[0].message.content.replace("**", "").strip()
             save_psycho(user_id, "assistant", answer)
-            await send_message(user_id, answer, psycho_buttons())
+            await send_message(chat_id, answer, psycho_buttons())
         except Exception as e:
-            await send_message(user_id, "Что-то пошло не так. Попробуй ещё раз 💕")
+            await send_message(chat_id, "Что-то пошло не так. Попробуй ещё раз 💕")
         return
 
-    # Вопрос к GPT
     if step == "ask_question":
         set_step(user_id, "idle")
-        if not is_premium(user_id):
-            count = get_request_count(user_id)
-            if count >= FREE_REQUESTS:
-                await send_message(user_id,
-                    f"❓ Ты использовала {FREE_REQUESTS} бесплатных вопросов\n\n"
-                    "Для продолжения оформи Премиум — 299 руб/месяц",
-                    premium_button()
-                )
-                return
-            increment_requests(user_id)
+        if not is_premium(user_id) and get_request_count(user_id) >= FREE_REQUESTS:
+            await send_message(chat_id, f"❓ Ты использовала {FREE_REQUESTS} бесплатных вопросов\n\nОформи Премиум — 299 руб/мес", premium_button())
+            return
+        increment_requests(user_id)
         user_row = get_user(user_id)
         context = ""
         if user_row and user_row[1] and user_row[2]:
-            mode, date_value = user_row[1], user_row[2]
-            if mode == "pregnant":
-                weeks = calc_pregnancy_weeks(date_value)
-                context = f"Беременная на {weeks} неделе."
-            elif mode == "mama":
-                months = calc_child_age(date_value)
-                context = f"Мама, ребёнку {age_label(months)}."
-        await send_message(user_id, "⏳ Думаю над ответом...")
-        answer = await ask_gpt(
-            f"{EXPERT_BASE} {context}",
-            text
-        )
-        await send_message(user_id, answer, back_button())
+            if user_row[1] == "pregnant":
+                context = f"Беременная на {calc_pregnancy_weeks(user_row[2])} неделе."
+            elif user_row[1] == "mama":
+                context = f"Мама, ребёнку {age_label(calc_child_age(user_row[2]))}."
+        await send_message(chat_id, "⏳ Думаю...")
+        answer = await ask_gpt(f"{EXPERT_BASE} {context}", text)
+        await send_message(chat_id, answer, back_button())
         return
 
-    # Ввод даты рождения малыша
     if step == "enter_birthdate":
         months = calc_child_age(text)
         if months is None or months < 0 or months > 216:
-            await send_message(user_id, "❌ Неверный формат. Введи дату: ДД.ММ.ГГГГ\nНапример: 10.03.2024")
+            await send_message(chat_id, "❌ Неверный формат. Введи: ДД.ММ.ГГГГ\nНапример: 10.03.2024")
             return
         save_user_mode(user_id, "mama", text)
         set_step(user_id, "idle")
-        await send_message(user_id,
-            f"✅ Сохранила!\n\nМалышу {age_label(months)}\n\nЧем могу помочь? 💕",
-            main_menu_buttons()
-        )
+        await send_message(chat_id, f"✅ Малышу {age_label(months)}\n\nЧем могу помочь? 💕", main_menu_buttons())
         return
 
-    # Ввод ПДР
     if step == "enter_pdr":
         weeks = calc_pregnancy_weeks(text)
         if weeks is None or weeks < 0 or weeks > 42:
-            await send_message(user_id, "❌ Неверный формат. Введи дату: ДД.ММ.ГГГГ\nНапример: 15.09.2025")
+            await send_message(chat_id, "❌ Неверный формат. Введи: ДД.ММ.ГГГГ\nНапример: 15.09.2025")
             return
         save_user_mode(user_id, "pregnant", text)
         set_step(user_id, "idle")
-        await send_message(user_id,
-            f"✅ Сохранила!\n\nТы на {weeks} неделе беременности\n\nЧем могу помочь? 💕",
-            main_menu_buttons()
-        )
+        await send_message(chat_id, f"✅ Ты на {weeks} неделе беременности\n\nЧем могу помочь? 💕", main_menu_buttons())
         return
 
-    # Ввод роста
     if step == "enter_height":
         try:
             h = float(text.replace(",", "."))
             set_step(user_id, "enter_weight", str(h))
-            await send_message(user_id, "⚖️ Теперь введи вес в килограммах\nНапример: 7.2")
+            await send_message(chat_id, "⚖️ Введи вес в килограммах\nНапример: 7.2")
         except:
-            await send_message(user_id, "❌ Введи число, например: 67.5")
+            await send_message(chat_id, "❌ Введи число, например: 67.5")
         return
 
     if step == "enter_weight":
@@ -568,135 +533,118 @@ async def handle_message(user_id, text, username="", name=""):
             h = float(step_data)
             save_growth(user_id, h, w)
             user_row = get_user(user_id)
-            months = None
-            if user_row and user_row[2]:
-                months = calc_child_age(user_row[2])
+            months = calc_child_age(user_row[2]) if user_row and user_row[2] else None
             set_step(user_id, "idle")
-            await send_message(user_id, "⏳ Анализирую...")
-            answer = await ask_gpt(
-                EXPERT_BASE,
-                f"Ребёнку {age_label(months)}. Рост {h} см, вес {w} кг. "
-                f"Оцени по нормам ВОЗ — в каком перцентиле, норма или нет."
-            )
-            await send_message(user_id, f"📏 Рост и вес\n\n{answer}", back_button())
+            await send_message(chat_id, "⏳ Анализирую...")
+            answer = await ask_gpt(EXPERT_BASE, f"Ребёнку {age_label(months)}. Рост {h} см, вес {w} кг. Оцени по нормам ВОЗ.")
+            await send_message(chat_id, f"📏 Рост и вес\n\n{answer}", back_button())
         except:
-            await send_message(user_id, "❌ Введи число, например: 7.2")
+            await send_message(chat_id, "❌ Введи число, например: 7.2")
         return
 
-    # Ввод симптома
     if step == "enter_symptom":
         save_symptom(user_id, text)
         set_step(user_id, "idle")
-        await send_message(user_id, "✅ Симптом записан!", back_button())
+        await send_message(chat_id, "✅ Симптом записан!", back_button())
         return
 
-    # Ввод отзыва
     if step == "enter_review":
-        threading.Thread(target=sheets_add_review, args=(user_id, username, text)).start()
+        threading.Thread(target=sheets_add_review, args=(user_id, "", text)).start()
         set_step(user_id, "idle")
-        await send_message(user_id, "⭐ Спасибо за отзыв! 💕", main_menu_buttons())
+        await send_message(chat_id, "⭐ Спасибо за отзыв! 💕", main_menu_buttons())
         return
 
-    # По умолчанию
-    await send_message(user_id, "Выбери действие из меню 👇", main_menu_buttons())
+    await send_message(chat_id, "Выбери действие из меню 👇", main_menu_buttons())
 
 # ─── ОБРАБОТКА КНОПОК ────────────────────────────────────────
-async def handle_callback(user_id, payload, username="", name=""):
+async def process_callback(chat_id, user_id, payload, name=""):
     user_row = get_user(user_id)
     mode = user_row[1] if user_row else ""
     date_value = user_row[2] if user_row else ""
-
     months = calc_child_age(date_value) if mode == "mama" and date_value else None
     weeks = calc_pregnancy_weeks(date_value) if mode == "pregnant" and date_value else None
 
-    # Меню
     if payload == "back_menu":
         set_step(user_id, "idle")
         if mode == "mama" and months is not None:
-            await send_message(user_id, f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?", main_menu_buttons())
+            await send_message(chat_id, f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?", main_menu_buttons())
         elif mode == "pregnant" and weeks:
-            await send_message(user_id, f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?", main_menu_buttons())
+            await send_message(chat_id, f"🤰 Ты на {weeks} неделе\n\nЧем могу помочь?", main_menu_buttons())
         else:
-            await send_message(user_id, "Чем могу помочь? 💕", main_menu_buttons())
+            await send_message(chat_id, "Чем могу помочь? 💕", main_menu_buttons())
         return
 
-    # Настройка профиля
     if payload == "set_mama":
         set_step(user_id, "enter_birthdate")
-        await send_message(user_id, "👶 Введи дату рождения малыша\n\nФормат: ДД.ММ.ГГГГ\nНапример: 10.03.2024")
+        await send_message(chat_id, "👶 Введи дату рождения малыша\n\nФормат: ДД.ММ.ГГГГ\nНапример: 10.03.2024")
         return
 
     if payload == "set_pregnant":
         set_step(user_id, "enter_pdr")
-        await send_message(user_id, "🤰 Введи предполагаемую дату родов (ПДР)\n\nФормат: ДД.ММ.ГГГГ\nНапример: 15.09.2025")
+        await send_message(chat_id, "🤰 Введи предполагаемую дату родов (ПДР)\n\nФормат: ДД.ММ.ГГГГ\nНапример: 15.09.2025")
         return
 
     # Информационные разделы
-    info_sections = {
-        "firstdays": ("📋 Первые дни с малышом", "Расскажи о первых днях после рождения малыша: первый осмотр педиатра, оформление документов (свидетельство о рождении, ОМС, СНИЛС), массаж с 1 месяца, плавание. Подробно и практично."),
-        "breastfeeding": ("🤱 Грудное вскармливание", "Расскажи о грудном вскармливании: как наладить с первых дней по ВОЗ, правильный захват, позиции, как понять что молока хватает, лактостаз и как с ним справляться."),
-        "recovery": ("🏥 Восстановление мамы", "Расскажи о восстановлении после родов: естественные роды и КС — разница, швы, послеродовые выделения, упражнения Кегеля, диастаз, когда можно заниматься спортом."),
-        "development": ("📊 Развитие малыша", f"Расскажи о развитии ребёнка {age_label(months)} ({months} месяцев) по стандартам AAP и ВОЗ: физическое, речевое, когнитивное, социальное развитие. Нормы и на что обратить внимание." if months else "Сначала укажи возраст малыша в профиле."),
-        "health": ("🌡 Здоровье", f"Расскажи о типичных проблемах со здоровьем у ребёнка {age_label(months)} по стандартам AAP: температура, ОРВИ, колики. Когда срочно к врачу." if months else "Сначала укажи возраст малыша."),
-        "food": ("🍼 Питание и прикорм", f"Расскажи о питании ребёнка {age_label(months)} по протоколам ВОЗ и ESPGHAN: что вводить, что нельзя, размер порций." if months else "Сначала укажи возраст малыша."),
-        "routine": ("🌙 Режим дня", f"Составь научно обоснованный режим дня для ребёнка {age_label(months)} по хронобиологии и рекомендациям AAP." if months else "Сначала укажи возраст малыша."),
-        "sleep": ("😴 Проблемы со сном", f"Расскажи о сне ребёнка {age_label(months)} — нормы, методы улучшения, безопасная среда сна по AAP." if months else "Сначала укажи возраст малыша."),
-        "tantrums": ("😢 Истерики и капризы", f"Объясни поведение ребёнка {age_label(months)} с нейронаучной точки зрения по Петрановской и Сигелу. Как реагировать маме." if months else "Сначала укажи возраст малыша."),
-        "emotions": ("🧠 Эмоции мамы", "Расскажи о послеродовой депрессии, беби-блюзе, материнском выгорании по DSM-5 и ВОЗ. Как распознать и что делать. Тепло и без осуждения."),
+    info_map = {
+        "firstdays": ("📋 Первые дни с малышом", "Расскажи о первых днях после рождения: первый педиатр, оформление документов (свидетельство, ОМС, СНИЛС), массаж, плавание. Подробно и практично."),
+        "breastfeeding": ("🤱 Грудное вскармливание", "Расскажи о ГВ: налаживание по ВОЗ, правильный захват, позиции, признаки что молока хватает, лактостаз."),
+        "recovery": ("🏥 Восстановление мамы", "Восстановление после родов: естественные и КС, швы, послеродовые выделения, упражнения Кегеля, диастаз."),
+        "emotions": ("🧠 Эмоции мамы", "Послеродовая депрессия, беби-блюз, выгорание по DSM-5 и ВОЗ. Как распознать. Тепло и без осуждения."),
     }
 
-    if payload in info_sections:
-        title, prompt = info_sections[payload]
-        await send_message(user_id, "⏳ Подбираю информацию...")
+    age_info_map = {
+        "development": ("📊 Развитие малыша", f"Развитие ребёнка {age_label(months)} по AAP и ВОЗ: физическое, речевое, когнитивное, социальное. Нормы и тревожные признаки."),
+        "health": ("🌡 Здоровье", f"Типичные проблемы здоровья у ребёнка {age_label(months)} по AAP: температура, ОРВИ, колики. Когда к врачу."),
+        "food": ("🍼 Питание и прикорм", f"Питание ребёнка {age_label(months)} по ВОЗ и ESPGHAN: что вводить, что нельзя, размер порций."),
+        "routine": ("🌙 Режим дня", f"Режим дня для ребёнка {age_label(months)} по хронобиологии и AAP: нормы сна, расписание, окна бодрствования."),
+        "sleep": ("😴 Проблемы со сном", f"Сон ребёнка {age_label(months)}: нормы, методы улучшения, безопасная среда по AAP."),
+        "tantrums": ("😢 Истерики и капризы", f"Поведение ребёнка {age_label(months)} с нейронаучной точки зрения по Петрановской и Сигелу. Как реагировать."),
+    }
+
+    if payload in info_map:
+        title, prompt = info_map[payload]
+        await send_message(chat_id, "⏳ Подбираю информацию...")
         answer = await ask_gpt(EXPERT_BASE, prompt)
-        await send_message(user_id, f"{title}\n\n{answer}", back_button())
+        await send_message(chat_id, f"{title}\n\n{answer}", back_button())
         return
 
-    # Задать вопрос
+    if payload in age_info_map:
+        if not months and not weeks:
+            await send_message(chat_id, "Сначала укажи дату рождения малыша или ПДР 👇",
+                [[{"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"},
+                  {"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"}]])
+            return
+        title, prompt = age_info_map[payload]
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await ask_gpt(EXPERT_BASE, prompt)
+        await send_message(chat_id, f"{title}\n\n{answer}", back_button())
+        return
+
     if payload == "ask":
         if not is_premium(user_id) and get_request_count(user_id) >= FREE_REQUESTS:
-            await send_message(user_id,
-                f"❓ Ты использовала {FREE_REQUESTS} бесплатных вопросов\n\n"
-                "Оформи Премиум для безлимитных вопросов — 299 руб/мес",
-                premium_button()
-            )
+            await send_message(chat_id, f"❓ Ты использовала {FREE_REQUESTS} бесплатных вопросов\n\nОформи Премиум — 299 руб/мес", premium_button())
             return
         set_step(user_id, "ask_question")
-        await send_message(user_id, "❓ Напиши свой вопрос о малыше, беременности или воспитании 💕")
+        await send_message(chat_id, "❓ Напиши свой вопрос о малыше, беременности или воспитании 💕")
         return
 
-    # Премиум разделы
-    premium_sections = ["psycho", "photo_menu", "growth", "symptoms", "vaccines", "benefits"]
-    if payload in premium_sections and not is_premium(user_id):
-        names = {
-            "psycho": "Мамин психолог",
-            "photo_menu": "Анализ фото",
-            "growth": "Трекер роста и веса",
-            "symptoms": "Трекер симптомов",
-            "vaccines": "Прививочный календарь",
-            "benefits": "Пособия и выплаты"
-        }
-        await send_message(user_id,
-            f"🔒 {names.get(payload, 'Эта функция')} доступна в Премиум 💎\n\n"
-            "299 руб/месяц — все функции без ограничений",
-            premium_button()
-        )
+    # Премиум проверка
+    premium_names = {"psycho": "Мамин психолог", "photo_menu": "Анализ фото",
+                     "growth": "Трекер роста и веса", "symptoms": "Трекер симптомов",
+                     "vaccines": "Прививочный календарь", "benefits": "Пособия и выплаты"}
+    if payload in premium_names and not is_premium(user_id):
+        await send_message(chat_id, f"🔒 {premium_names[payload]} доступна в Премиум 💎\n\n299 руб/месяц", premium_button())
         return
 
-    # Психолог
     if payload == "psycho":
         history = get_psycho_history(user_id)
         set_step(user_id, "psycho_session")
         if history:
-            await send_message(user_id,
-                "🧠 С возвращением! Я помню наш разговор.\n\nКак ты сейчас? 💕",
-                psycho_buttons()
-            )
+            await send_message(chat_id, "🧠 С возвращением! Я помню наш разговор.\n\nКак ты сейчас? 💕", psycho_buttons())
         else:
-            await send_message(user_id,
+            await send_message(chat_id,
                 "🧠 Привет! Я твой личный психолог 💕\n\n"
-                "Здесь можно говорить обо всём — усталость, тревога, отношения, "
-                "чувство вины. Я слушаю.\n\nКак ты сейчас?",
+                "Говори обо всём — усталость, тревога, отношения, чувство вины.\n\nКак ты сейчас?",
                 psycho_buttons()
             )
         return
@@ -704,10 +652,9 @@ async def handle_callback(user_id, payload, username="", name=""):
     if payload == "psycho_clear":
         clear_psycho(user_id)
         set_step(user_id, "psycho_session")
-        await send_message(user_id, "🧠 Начинаем с чистого листа 💕\n\nКак ты сейчас?", psycho_buttons())
+        await send_message(chat_id, "🧠 Начинаем с чистого листа 💕\n\nКак ты сейчас?", psycho_buttons())
         return
 
-    # Фото меню
     if payload == "photo_menu":
         buttons = [
             [{"type": "callback", "text": "🔴 Сыпь и кожа", "payload": "photo_skin"},
@@ -715,26 +662,20 @@ async def handle_callback(user_id, payload, username="", name=""):
             [{"type": "callback", "text": "💊 Упаковка смеси", "payload": "photo_package"}],
             [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
         ]
-        await send_message(user_id,
-            "📸 Анализ фото\n\nВыбери тип фото и отправь изображение 👇",
-            buttons
-        )
+        await send_message(chat_id, "📸 Выбери тип фото и отправь изображение 👇", buttons)
         return
 
-    if payload in ["photo_skin", "photo_food", "photo_package"]:
-        prompts = {
-            "photo_skin": "Жду фото кожи или сыпи малыша 📸",
-            "photo_food": "Жду фото еды или блюда 📸",
-            "photo_package": "Жду фото упаковки смеси или лекарства 📸"
-        }
-        set_step(user_id, f"waiting_photo_{payload}")
-        await send_message(user_id, prompts[payload] + "\n\n⚠️ Это ориентир, не диагноз.")
-        return
+    for pt in ["photo_skin", "photo_food", "photo_package"]:
+        if payload == pt:
+            prompts = {"photo_skin": "Жду фото кожи или сыпи малыша 📸\n\n⚠️ Это ориентир, не диагноз.",
+                       "photo_food": "Жду фото еды или блюда 📸",
+                       "photo_package": "Жду фото упаковки смеси или лекарства 📸"}
+            set_step(user_id, f"waiting_photo_{pt}")
+            await send_message(chat_id, prompts[pt])
+            return
 
-    # Рост и вес
     if payload == "growth":
         entries = get_growth(user_id)
-        set_step(user_id, "enter_height")
         text = "📏 Рост и вес малыша\n\n"
         if entries:
             for h, w, dt in entries[:3]:
@@ -742,10 +683,10 @@ async def handle_callback(user_id, payload, username="", name=""):
                 text += f"📅 {d} — {h} см, {w} кг\n"
             text += "\n"
         text += "Введи рост малыша в сантиметрах\nНапример: 67.5"
-        await send_message(user_id, text)
+        set_step(user_id, "enter_height")
+        await send_message(chat_id, text)
         return
 
-    # Трекер симптомов
     if payload == "symptoms":
         entries = get_symptoms(user_id)
         buttons = [
@@ -759,43 +700,32 @@ async def handle_callback(user_id, payload, username="", name=""):
                 d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
                 text += f"📅 {d} — {s}\n"
         else:
-            text += "Записей нет. Фиксируй симптомы чтобы отслеживать динамику."
-        await send_message(user_id, text, buttons)
+            text += "Записей нет."
+        await send_message(chat_id, text, buttons)
         return
 
     if payload == "symptom_add":
         set_step(user_id, "enter_symptom")
-        await send_message(user_id, "🌡 Опиши симптом малыша\n\nНапример: температура 38.2, кашель, сыпь на щеках")
+        await send_message(chat_id, "🌡 Опиши симптом\n\nНапример: температура 38.2, кашель, сыпь")
         return
 
     if payload == "symptom_analyze":
         entries = get_symptoms(user_id)
         if not entries:
-            await send_message(user_id, "Нет симптомов для анализа.", back_button())
+            await send_message(chat_id, "Нет симптомов для анализа.", back_button())
             return
-        await send_message(user_id, "⏳ Анализирую симптомы...")
+        await send_message(chat_id, "⏳ Анализирую...")
         data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {s}" for s, dt in entries])
-        answer = await ask_gpt(
-            EXPERT_BASE,
-            f"Ребёнку {age_label(months)}. Симптомы за последние дни:\n{data_str}\n\n"
-            f"Проанализируй: что это может быть, динамика лучше или хуже, стоит ли к врачу."
-        )
-        await send_message(user_id, answer, back_button())
+        answer = await ask_gpt(EXPERT_BASE, f"Ребёнку {age_label(months)}. Симптомы:\n{data_str}\n\nПроанализируй динамику, стоит ли к врачу.")
+        await send_message(chat_id, answer, back_button())
         return
 
-    # Прививки
     if payload == "vaccines":
-        await send_message(user_id, "⏳ Подбираю информацию о прививках...")
-        answer = await ask_gpt(
-            EXPERT_BASE,
-            "Расскажи о национальном календаре прививок в России для детей до 2 лет. "
-            "БЦЖ, Гепатит B, АКДС, Полиомиелит, Пневмококк, КПК, Ветрянка — "
-            "когда делают, зачем, как подготовить ребёнка, нормальные реакции."
-        )
-        await send_message(user_id, f"💉 Прививочный календарь\n\n{answer}", back_button())
+        await send_message(chat_id, "⏳ Подбираю...")
+        answer = await ask_gpt(EXPERT_BASE, "Расскажи о национальном календаре прививок РФ для детей до 2 лет: БЦЖ, Гепатит B, АКДС, Полиомиелит, Пневмококк, КПК, Ветрянка. Когда, зачем, как подготовить.")
+        await send_message(chat_id, f"💉 Прививочный календарь\n\n{answer}", back_button())
         return
 
-    # Пособия
     if payload == "benefits":
         buttons = [
             [{"type": "callback", "text": "👶 При рождении", "payload": "ben_birth"},
@@ -805,34 +735,26 @@ async def handle_callback(user_id, payload, username="", name=""):
             [{"type": "callback", "text": "❓ Что положено мне", "payload": "ben_personal"}],
             [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
         ]
-        await send_message(user_id, "💰 Пособия и выплаты\n\nВыбери раздел 👇", buttons)
+        await send_message(chat_id, "💰 Пособия и выплаты\n\nВыбери раздел 👇", buttons)
         return
 
-    ben_prompts = {
-        "ben_birth": "Расскажи о единовременном пособии при рождении ребёнка в России 2024-2025. Размер, документы, куда обращаться.",
-        "ben_15": "Расскажи о пособии по уходу до 1.5 лет в России 2024-2025. Размер для работающих и неработающих, как рассчитать.",
-        "ben_3": "Расскажи о выплатах на ребёнка от 1.5 до 3 лет в России 2024-2025. Путинские выплаты, условия.",
-        "ben_matcap": "Расскажи о материнском капитале в России 2024-2025. Размер, на что потратить, как оформить.",
+    ben_map = {
+        "ben_birth": "Единовременное пособие при рождении в России 2024-2025. Размер, документы, куда.",
+        "ben_15": "Пособие по уходу до 1.5 лет в России 2024-2025. Для работающих и неработающих.",
+        "ben_3": "Выплаты на ребёнка от 1.5 до 3 лет в России 2024-2025. Путинские выплаты.",
+        "ben_matcap": "Материнский капитал в России 2024-2025. Размер, на что потратить, как оформить.",
     }
-    if payload in ben_prompts:
-        await send_message(user_id, "⏳ Подбираю информацию...")
-        answer = await ask_gpt(
-            "Ты эксперт по социальным выплатам в России 2024-2025. Давай конкретную информацию.",
-            ben_prompts[payload]
-        )
-        await send_message(user_id, answer, back_button())
+    if payload in ben_map:
+        await send_message(chat_id, "⏳ Подбираю...")
+        answer = await ask_gpt("Ты эксперт по социальным выплатам в России 2024-2025.", ben_map[payload])
+        await send_message(chat_id, answer, back_button())
         return
 
     if payload == "ben_personal":
         set_step(user_id, "ask_question")
-        await send_message(user_id,
-            "❓ Расскажи о своей ситуации:\n\n"
-            "Работаешь или нет, какой по счёту ребёнок, замужем или нет, регион.\n\n"
-            "Например: работаю официально, второй ребёнок, замужем, Москва"
-        )
+        await send_message(chat_id, "❓ Расскажи о своей ситуации:\n\nРаботаешь или нет, какой по счёту ребёнок, замужем или нет, регион.\n\nНапример: работаю официально, второй ребёнок, Москва")
         return
 
-    # Премиум инфо
     if payload in ["premium_info", "pay_premium"]:
         try:
             payment = await create_payment(user_id)
@@ -841,84 +763,100 @@ async def handle_callback(user_id, payload, username="", name=""):
                 [{"type": "link", "text": "💳 Оплатить 299 руб", "url": payment.confirmation.confirmation_url}],
                 [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
             ]
-            await send_message(user_id,
+            await send_message(chat_id,
                 "💎 Премиум подписка — 299 руб/месяц\n\n"
                 "Что открывается:\n"
-                "🧠 Мамин психолог с историей диалогов\n"
-                "📸 Анализ фото (сыпь, еда, упаковка)\n"
+                "🧠 Мамин психолог с историей\n"
+                "📸 Анализ фото\n"
                 "📏 Трекер роста и веса\n"
                 "🌡 Трекер симптомов\n"
-                "💉 Прививочный календарь\n"
-                "💰 Подбор пособий\n"
-                "❓ Безлимитные вопросы GPT\n\n"
-                "После оплаты всё активируется автоматически!",
+                "💉 Прививки\n"
+                "💰 Пособия\n"
+                "❓ Безлимитные вопросы\n\n"
+                "После оплаты активируется автоматически!",
                 buttons
             )
         except Exception as e:
             logging.error(f"Payment error: {e}")
-            await send_message(user_id, f"Ошибка платежа. Напиши в поддержку: {SUPPORT_URL}", back_button())
+            await send_message(chat_id, f"Ошибка платежа. Напиши в поддержку: {SUPPORT_URL}", back_button())
         return
 
-    # Отзыв
     if payload == "review":
         set_step(user_id, "enter_review")
-        await send_message(user_id, "⭐ Напиши свой отзыв о боте 💕")
+        await send_message(chat_id, "⭐ Напиши свой отзыв о боте 💕")
         return
 
-    # По умолчанию
-    await send_message(user_id, "Выбери действие из меню 👇", main_menu_buttons())
+    await send_message(chat_id, "Выбери действие из меню 👇", main_menu_buttons())
 
+# ─── АНАЛИЗ ФОТО ─────────────────────────────────────────────
+async def process_photo(chat_id, user_id, photo_url):
+    step, _ = get_step(user_id)
+    if not is_premium(user_id):
+        await send_message(chat_id, "🔒 Анализ фото доступен в Премиум 💎", premium_button())
+        return
 
-# ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    photo_type = "skin"
+    if "food" in step: photo_type = "food"
+    elif "package" in step: photo_type = "package"
+    set_step(user_id, "idle")
 
-scheduler_max = AsyncIOScheduler(timezone="Europe/Moscow")
+    await send_message(chat_id, "⏳ Анализирую фото...")
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.get(photo_url)
+            photo_b64 = base64.b64encode(resp.content).decode()
 
-DAILY_THEMES = {
-    0: "беременность и подготовка к родам",
-    1: "новорождённый 0-3 месяца",
-    2: "малыш 3-12 месяцев",
-    3: "ребёнок 1-3 года",
-    4: "дошкольник 3-7 лет",
-    5: "здоровье и педиатрия",
-    6: "мама о себе — восстановление и психология",
-}
+        prompts = {
+            "skin": ("На фото кожа человека?", "Ты педиатр. Опиши кожу ребёнка: высыпания, цвет, форма. На что похоже, что делать, когда к врачу. Это описание, не диагноз."),
+            "food": ("На фото еда?", "Ты диетолог-педиатр. Что это за еда, подходит ли детям, с какого возраста."),
+            "package": ("На фото упаковка товара?", "Ты педиатр. Изучи упаковку: что это, состав, возраст, на что обратить внимание."),
+        }
+        filter_q, analysis_q = prompts.get(photo_type, prompts["skin"])
 
-RUBRICS = {
-    8:  ("🌅 Доброе утро, мама", "Короткий заряд на день — мотивация, поддержка. 100-150 слов."),
-    10: ("🔬 Научный факт дня", "Интересный научный факт о детях или беременности. 150-200 слов."),
-    13: ("💡 Совет педиатра", "Практический научно обоснованный совет по ВОЗ/AAP. 200-250 слов."),
-    16: ("🧠 Детская психология", "Объяснение поведения ребёнка по Петрановской/Сигелу. 200-250 слов."),
-    20: ("❤️ Для мамы", "О восстановлении, выгорании, себе. Тепло и поддерживающе. 150-200 слов."),
-}
+        filter_resp = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                {"type": "text", "text": filter_q + " Ответь только: ДА или НЕТ."}
+            ]}], max_tokens=10
+        )
+        if "НЕТ" in filter_resp.choices[0].message.content.upper():
+            await send_message(chat_id, "📸 Отправь нужное фото 🤍", back_button())
+            return
 
-async def post_rubric_max(hour: int):
-    weekday = datetime.now().weekday()
-    daily_theme = DAILY_THEMES[weekday]
-    rubric_name, rubric_instruction = RUBRICS[hour]
-    post = await ask_gpt(
-        "Ты автор экспертного канала 'Я МАМА' для мам в мессенджере MAX. "
-        "Пишешь на основе ВОЗ, AAP, Петрановской, Карпа, Серза, Сигела. "
-        "Тепло и научно. Без воды. Добавляй эмодзи. "
-        "В конце — один практический совет на сегодня.",
-        f"Рубрика: {rubric_name}\nТема: {daily_theme}\nИнструкция: {rubric_instruction}\n"
-        f"Начни с эмодзи рубрики и её названия."
-    )
-    await send_to_channel(post)
-    logging.info(f"MAX канал: пост опубликован — {rubric_name}")
+        resp2 = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                {"type": "text", "text": analysis_q}
+            ]}], max_tokens=800
+        )
+        answer = resp2.choices[0].message.content.replace("**", "").strip()
+        await send_message(chat_id, answer, back_button())
+    except Exception as e:
+        logging.error(f"Photo error: {e}")
+        await send_message(chat_id, "Не удалось проанализировать фото.", back_button())
 
-# ─── WEBHOOK ─────────────────────────────────────────────────
+# ─── FASTAPI WEBHOOK ─────────────────────────────────────────
+app = FastAPI()
+
 @app.on_event("startup")
 async def startup():
     init_db()
-    await register_webhook()
+    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{MAX_API}/subscriptions", json={"url": WEBHOOK_URL}, headers=headers)
+            logging.info(f"Webhook: {r.json()}")
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
     asyncio.create_task(check_payments_loop())
-    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(8)),  "cron", hour=8,  minute=0)
-    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(10)), "cron", hour=10, minute=0)
-    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(13)), "cron", hour=13, minute=0)
-    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(16)), "cron", hour=16, minute=0)
-    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(20)), "cron", hour=20, minute=0)
-    scheduler_max.start()
+    scheduler.add_job(lambda: asyncio.create_task(post_rubric(8)),  "cron", hour=8,  minute=0)
+    scheduler.add_job(lambda: asyncio.create_task(post_rubric(10)), "cron", hour=10, minute=0)
+    scheduler.add_job(lambda: asyncio.create_task(post_rubric(13)), "cron", hour=13, minute=0)
+    scheduler.add_job(lambda: asyncio.create_task(post_rubric(16)), "cron", hour=16, minute=0)
+    scheduler.add_job(lambda: asyncio.create_task(post_rubric(20)), "cron", hour=20, minute=0)
+    scheduler.start()
     logging.info("Мамин Помощник MAX запущен!")
 
 @app.post("/webhook")
@@ -926,7 +864,6 @@ async def webhook(request: Request):
     try:
         data = await request.json()
         logging.info(f"MAX webhook: {data}")
-
         update_type = data.get("update_type", "")
         message = data.get("message", {})
         callback = data.get("callback", {})
@@ -939,159 +876,75 @@ async def webhook(request: Request):
             get_user(chat_id, username, name)
             set_step(chat_id, "idle")
             threading.Thread(target=sheets_log_visit, args=(chat_id, name, username)).start()
-            user_id = chat_id
             await send_message(chat_id,
                 f"Привет, {name}! 🤍\n\n"
-                f"Я Мамин Помощник — твой личный ИИ-помощник.\n\n"
-                f"Даю советы основанные на рекомендациях ВОЗ и ведущих педиатров мира — "
-                f"именно для твоей ситуации.\n\n"
-                f"Сначала укажи кто ты 👇",
+                "Я Мамин Помощник — твой личный ИИ-помощник.\n\n"
+                "Советы на основе ВОЗ и ведущих педиатров — именно для твоей ситуации.\n\n"
+                "Укажи кто ты 👇",
                 [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
                   {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]]
             )
 
         elif update_type == "message_created":
-            msg = data.get("message", {})
-            sender = msg.get("sender", {})
-            chat_id = msg.get("recipient", {}).get("chat_id")
+            sender = message.get("sender", {})
+            chat_id = message.get("recipient", {}).get("chat_id")
             user_id = sender.get("user_id")
-            username = sender.get("username", "")
             name = sender.get("name", "")
-            body = msg.get("body", {})
+            username = sender.get("username", "")
+            body = message.get("body", {})
+            attachments = body.get("attachments", [])
 
-            # Фото
-            if body.get("type") == "image" or (body.get("attachments") and
-               any(a.get("type") == "image" for a in body.get("attachments", []))):
-                step, _ = get_step(chat_id)
-                if step.startswith("waiting_photo_"):
-                    photo_type = step.replace("waiting_photo_photo_", "")
-                    await handle_photo(chat_id, data, photo_type)
-                else:
-                    await send_message(chat_id,
-                        "📸 Выбери сначала тип анализа в меню Анализ фото",
-                        back_button()
-                    )
-                return JSONResponse({"ok": True})
+            if attachments:
+                for att in attachments:
+                    if att.get("type") == "image":
+                        payload_data = att.get("payload", {})
+                        photo_url = (payload_data.get("url") or
+                                    payload_data.get("photo_url") or
+                                    (payload_data.get("photos", [{}])[0].get("url") if payload_data.get("photos") else None))
+                        if photo_url:
+                            get_user(user_id, username, name)
+                            await process_photo(chat_id, user_id, photo_url)
+                            return JSONResponse({"ok": True})
 
             text = body.get("text", "").strip()
             if text:
-                get_user(chat_id, username, name)
-                await handle_message(chat_id, text, username, name)
+                get_user(user_id, username, name)
+                await process_command(chat_id, user_id, text, username, name)
 
         elif update_type == "message_callback":
-            callback = data.get("callback", {})
             user = callback.get("user", {})
-            message = data.get("message", {})
-            chat_id = (
-                message.get("recipient", {}).get("chat_id") or
-                callback.get("chat_id") or
-                message.get("sender", {}).get("chat_id")
-            )
+            recipient = message.get("recipient", {})
+            chat_id = (recipient.get("chat_id") or callback.get("chat_id") or
+                      message.get("sender", {}).get("chat_id"))
             user_id = user.get("user_id")
-            username = user.get("username", "")
             name = user.get("name", "")
-            payload_cb = callback.get("payload", "")
-            logging.info(f"CALLBACK: chat_id={chat_id} user_id={user_id} payload={payload_cb}")
-            if chat_id and payload_cb:
-                get_user(chat_id, username, name)
-                await handle_callback(chat_id, payload_cb, username, name)
+            username = user.get("username", "")
+            cb_payload = callback.get("payload", "")
+            logging.info(f"CALLBACK: chat_id={chat_id} user_id={user_id} payload={cb_payload}")
+            if chat_id and cb_payload:
+                get_user(user_id, username, name)
+                await process_callback(chat_id, user_id, cb_payload, name)
 
     except Exception as e:
         logging.error(f"Webhook error: {e}")
     return JSONResponse({"ok": True})
 
-async def handle_photo(chat_id, data, photo_type):
-    set_step(chat_id, "idle")
-    await send_message(chat_id, "⏳ Анализирую фото...")
-    try:
-        # Получаем URL фото из MAX
-        msg = data.get("message", {})
-        body = msg.get("body", {})
-        attachments = body.get("attachments", [])
-        photo_url = None
-        for att in attachments:
-            if att.get("type") == "image":
-                photo_url = att.get("payload", {}).get("url") or att.get("url")
-                break
-        if not photo_url:
-            await send_message(chat_id, "Не удалось получить фото. Попробуй ещё раз.", back_button())
-            return
-
-        async with httpx.AsyncClient() as c:
-            resp = await c.get(photo_url, timeout=15)
-            photo_b64 = base64.b64encode(resp.content).decode()
-
-        prompts = {
-            "photo_skin": (
-                "Ты педиатр. Опиши что видишь на коже ребёнка: характер высыпаний, цвет, форма. "
-                "На что похоже, что можно сделать дома, когда к врачу. Это описание, не диагноз.",
-                "На фото кожа человека или ребёнка?"
-            ),
-            "photo_food": (
-                "Ты диетолог-педиатр. Посмотри на блюдо: что это, подходит ли детям, с какого возраста.",
-                "На фото еда или блюдо?"
-            ),
-            "photo_package": (
-                "Ты педиатр-фармаколог. Изучи упаковку: что это, состав, для какого возраста, на что обратить внимание.",
-                "На фото упаковка товара или лекарства?"
-            ),
-        }
-
-        if photo_type not in prompts:
-            photo_type = "photo_skin"
-
-        analysis_prompt, filter_prompt = prompts[photo_type]
-
-        # Фильтр
-        filter_resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
-                {"type": "text", "text": filter_prompt + " Ответь только: ДА или НЕТ."}
-            ]}],
-            max_tokens=10
-        )
-        if "НЕТ" in filter_resp.choices[0].message.content.upper():
-            wrong = {
-                "photo_skin": "📸 Жду фото кожи малыша 🤍",
-                "photo_food": "📸 Жду фото еды 🤍",
-                "photo_package": "📸 Жду фото упаковки 🤍"
-            }
-            await send_message(chat_id, wrong.get(photo_type, "Отправь нужное фото"), back_button())
-            return
-
-        # Анализ
-        resp = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
-                {"type": "text", "text": analysis_prompt}
-            ]}],
-            max_tokens=800
-        )
-        answer = resp.choices[0].message.content.replace("**", "").strip()
-        await send_message(chat_id, answer, back_button())
-
-    except Exception as e:
-        logging.error(f"Photo analysis error: {e}")
-        await send_message(chat_id, "Не удалось проанализировать фото. Попробуй ещё раз.", back_button())
-
 @app.get("/payment/success")
 async def payment_success():
-    from fastapi.responses import HTMLResponse
     return HTMLResponse("""
     <html><body style="font-family:Arial;text-align:center;padding:50px;background:#fff0f5">
     <h1>💎 Оплата прошла!</h1>
-    <p>Премиум подписка активирована.<br>Вернись в Мамин Помощник и пользуйся всеми функциями!</p>
-    </body></html>
-    """)
+    <p>Премиум подписка активирована.<br>Вернись в Мамин Помощник!</p>
+    </body></html>""")
 
-# ─── ЗАПУСК ──────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 async def main():
     config = uvicorn.Config(app, host="0.0.0.0", port=8082, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
 
 if __name__ == "__main__":
-    import uvicorn
     asyncio.run(main())
