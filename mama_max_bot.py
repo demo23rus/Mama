@@ -1166,24 +1166,38 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         if plan != "mama_premium":
             await send_message(chat_id, "🔒 Анализ фото доступен в Премиум 💎", upgrade_buttons())
             return
-        buttons = [
-            [{"type": "callback", "text": "🔴 Сыпь и кожа", "payload": "photo_skin"},
-             {"type": "callback", "text": "🍽 Еда малыша", "payload": "photo_food"}],
-            [{"type": "callback", "text": "💩 Стул малыша", "payload": "photo_stool"},
-             {"type": "callback", "text": "💊 Упаковка смеси", "payload": "photo_package"}],
-            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
-        ]
-        await send_message(chat_id, "📸 Выбери тип фото и отправь изображение 👇", buttons)
+        # Разное меню для беременных и мам
+        if birth_date and birth_date.startswith("pdr:"):
+            buttons = [
+                [{"type": "callback", "text": "📋 Результаты анализов", "payload": "photo_analysis"}],
+                [{"type": "callback", "text": "🩺 Заключение УЗИ", "payload": "photo_uzi"}],
+                [{"type": "callback", "text": "💊 Лекарство при беременности", "payload": "photo_med_preg"}],
+                [{"type": "callback", "text": "🔴 Сыпь и кожа", "payload": "photo_skin"}],
+                [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+            ]
+            await send_message(chat_id, "📸 Выбери тип фото 👇", buttons)
+        else:
+            buttons = [
+                [{"type": "callback", "text": "🔴 Сыпь и кожа", "payload": "photo_skin"},
+                 {"type": "callback", "text": "🍽 Еда малыша", "payload": "photo_food"}],
+                [{"type": "callback", "text": "💩 Стул малыша", "payload": "photo_stool"},
+                 {"type": "callback", "text": "💊 Упаковка смеси", "payload": "photo_package"}],
+                [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+            ]
+            await send_message(chat_id, "📸 Выбери тип фото и отправь изображение 👇", buttons)
         return
 
-    for pt in ["photo_skin", "photo_food", "photo_package", "photo_stool"]:
+    for pt in ["photo_skin", "photo_food", "photo_package", "photo_stool", "photo_analysis", "photo_uzi", "photo_med_preg"]:
         if payload == pt:
             set_step(user_id, f"photo_{pt}")
             prompts = {
                 "photo_skin": "📸 Отправь фото кожи или сыпи малыша\n\n⚠️ Это ориентир, не диагноз.",
                 "photo_food": "📸 Отправь фото еды или блюда",
                 "photo_stool": "📸 Отправь фото стула малыша\n\n⚠️ Это ориентир, не диагноз.",
-                "photo_package": "📸 Отправь фото упаковки смеси или лекарства"
+                "photo_package": "📸 Отправь фото упаковки смеси или лекарства",
+                "photo_analysis": "📸 Отправь фото результатов анализов\n\nЯ расшифрую показатели.",
+                "photo_uzi": "📸 Отправь фото заключения УЗИ\n\nЯ объясню показатели понятным языком.",
+                "photo_med_preg": "📸 Отправь фото упаковки лекарства\n\nЯ скажу можно ли его при беременности."
             }
             await send_message(chat_id, prompts[pt])
             return
@@ -1594,6 +1608,31 @@ async def process_photo(chat_id, user_id, photo_url):
                 "3) Что это может говорить о пищеварении; "
                 "4) Когда нужен врач. "
                 "Напомни что точный диагноз ставит только педиатр.")
+        elif photo_type == "analysis":
+            filter_q = "На этом изображении медицинский документ, бланк анализов или результаты лабораторного исследования? Ответь только: ДА или НЕТ."
+            analysis_q = ("Ты опытный акушер-гинеколог и лабораторный диагност. Расшифруй результаты анализов для беременной женщины: "
+                "1) Какие показатели в норме; "
+                "2) Какие отклонения от нормы для беременных; "
+                "3) На что обратить внимание; "
+                "4) С какими результатами нужно срочно к врачу. "
+                "Напомни что интерпретацию результатов должен делать врач.")
+        elif photo_type == "uzi":
+            filter_q = "На этом изображении медицинский документ или заключение УЗИ? Ответь только: ДА или НЕТ."
+            analysis_q = ("Ты опытный акушер-гинеколог. Объясни заключение УЗИ беременной понятным языком: "
+                "1) Что означают основные показатели (размеры плода, ИАЖ, плацента, кровоток); "
+                "2) Что в норме для данного срока; "
+                "3) Если есть отклонения — что они означают простыми словами; "
+                "4) Нужно ли беспокоиться и когда срочно к врачу. "
+                "Используй простые слова, избегай медицинского жаргона.")
+        elif photo_type == "med_preg":
+            filter_q = "На этом изображении упаковка лекарства или медицинского препарата? Ответь только: ДА или НЕТ."
+            analysis_q = ("Ты акушер-гинеколог и клинический фармаколог. Оцени лекарство для беременной: "
+                "1) Что это за препарат и для чего; "
+                "2) Можно ли при беременности — по категориям FDA/ACOG; "
+                "3) В каком триместре разрешён/запрещён; "
+                "4) Возможные риски для плода; "
+                "5) Обязательно: решение о приёме принимает только врач. "
+                "Будь конкретной и честной.")
         elif photo_type == "food":
             filter_q = "На этом изображении еда или блюдо? Ответь только: ДА или НЕТ."
             analysis_q = (f"Ты диетолог-педиатр. Малышу {m_label}. "

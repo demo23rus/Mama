@@ -1554,16 +1554,63 @@ def kb_photo_menu():
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
     ])
 
+def kb_photo_pregnant_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Результаты анализов", callback_data="photo_analysis")],
+        [InlineKeyboardButton(text="🩺 Заключение УЗИ", callback_data="photo_uzi")],
+        [InlineKeyboardButton(text="💊 Лекарство при беременности", callback_data="photo_med_preg")],
+        [InlineKeyboardButton(text="🔴 Сыпь и кожа", callback_data="photo_skin")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")]
+    ])
+
 @dp.callback_query(F.data == "photo_menu")
 async def photo_menu(call: CallbackQuery):
     if not is_premium(call.from_user.id):
         await call.message.answer("🔒 Анализ фото доступен в Премиум 💎", reply_markup=kb_premium())
         return
+    user = get_user(call.from_user.id)
+    if user and user[0] == "pregnant":
+        await call.message.answer(
+            "📸 Анализ фото для беременных\n\n"
+            "Выбери тип фото 👇",
+            reply_markup=kb_photo_pregnant_menu()
+        )
+    else:
+        await call.message.answer(
+            "📸 Анализ фото\n\n"
+            "Отправь фото и я помогу разобраться.\n"
+            "Выбери что хочешь проанализировать 👇",
+            reply_markup=kb_photo_menu()
+        )
+
+@dp.callback_query(F.data == "photo_analysis")
+async def photo_analysis(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="analysis")
     await call.message.answer(
-        "📸 Анализ фото\n\n"
-        "Отправь фото и я помогу разобраться.\n"
-        "Выбери что хочешь проанализировать 👇",
-        reply_markup=kb_photo_menu()
+        "📸 Отправь фото результатов анализов\n\n"
+        "Я расшифрую показатели понятным языком.\n"
+        "⚠️ Интерпретацию подтверждает только врач."
+    )
+
+@dp.callback_query(F.data == "photo_uzi")
+async def photo_uzi(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="uzi")
+    await call.message.answer(
+        "📸 Отправь фото заключения УЗИ\n\n"
+        "Я объясню показатели понятным языком.\n"
+        "⚠️ Интерпретацию подтверждает только врач."
+    )
+
+@dp.callback_query(F.data == "photo_med_preg")
+async def photo_med_preg(call: CallbackQuery, state: FSMContext):
+    await state.set_state(PhotoStates.waiting_photo)
+    await state.update_data(photo_type="med_preg")
+    await call.message.answer(
+        "📸 Отправь фото упаковки лекарства\n\n"
+        "Я скажу можно ли его принимать при беременности.\n"
+        "⚠️ Решение принимает только врач."
     )
 
 @dp.callback_query(F.data == "photo_skin")
@@ -1633,7 +1680,44 @@ async def handle_photo(message: Message, state: FSMContext):
         photo_b64 = base64.b64encode(photo_bytes).decode()
 
         # Сначала фильтр — проверяем что на фото нужное
-        if photo_type == "skin":
+        if photo_type == "analysis":
+            filter_prompt = "На этом изображении медицинский документ, бланк анализов или результаты лабораторного исследования? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                "Ты опытный акушер-гинеколог и лабораторный диагност. Расшифруй результаты анализов для беременной женщины: "
+                "1) Какие показатели в норме; "
+                "2) Какие отклонения от нормы для беременных; "
+                "3) На что обратить внимание; "
+                "4) С какими результатами нужно срочно к врачу. "
+                "Напомни что интерпретацию результатов должен делать врач."
+            )
+            wrong_msg = "📸 Я жду фото результатов анализов 🤍"
+
+        elif photo_type == "uzi":
+            filter_prompt = "На этом изображении медицинский документ или заключение УЗИ? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                "Ты опытный акушер-гинеколог. Объясни заключение УЗИ беременной понятным языком: "
+                "1) Что означают основные показатели (размеры плода, ИАЖ, плацента, кровоток); "
+                "2) Что в норме для данного срока; "
+                "3) Если есть отклонения — что они означают простыми словами; "
+                "4) Нужно ли беспокоиться и когда срочно к врачу. "
+                "Используй простые слова, избегай медицинского жаргона."
+            )
+            wrong_msg = "📸 Я жду фото заключения УЗИ 🤍"
+
+        elif photo_type == "med_preg":
+            filter_prompt = "На этом изображении упаковка лекарства или медицинского препарата? Ответь только: ДА или НЕТ."
+            analysis_prompt = (
+                "Ты акушер-гинеколог и клинический фармаколог. Оцени лекарство для беременной: "
+                "1) Что это за препарат и для чего; "
+                "2) Можно ли при беременности — по категориям FDA/ACOG; "
+                "3) В каком триместре разрешён/запрещён; "
+                "4) Возможные риски для плода; "
+                "5) Обязательно: решение о приёме принимает только врач. "
+                "Будь конкретной и честной."
+            )
+            wrong_msg = "📸 Я жду фото упаковки лекарства 🤍"
+
+        elif photo_type == "skin":
             filter_prompt = "Посмотри на это изображение. На нём кожа человека или ребёнка с возможными высыпаниями, покраснениями или другими кожными проявлениями? Ответь только: ДА или НЕТ."
             analysis_prompt = (
                 "Ты опытный педиатр. Опиши что видишь на коже ребёнка: "
@@ -1700,7 +1784,9 @@ async def handle_photo(message: Message, state: FSMContext):
         filter_answer = filter_response.choices[0].message.content.strip().upper()
 
         if "НЕТ" in filter_answer or "NO" in filter_answer:
-            await message.answer(wrong_msg, reply_markup=kb_photo_menu())
+            user = get_user(message.from_user.id)
+            kb = kb_photo_pregnant_menu() if user and user[0] == "pregnant" else kb_photo_menu()
+            await message.answer(wrong_msg, reply_markup=kb)
             return
 
         # Основной анализ
@@ -1716,11 +1802,15 @@ async def handle_photo(message: Message, state: FSMContext):
             max_tokens=1000
         )
         answer = clean_text(response.choices[0].message.content)
-        await message.answer(answer, reply_markup=kb_photo_menu())
+        user = get_user(message.from_user.id)
+        kb = kb_photo_pregnant_menu() if user and user[0] == "pregnant" else kb_photo_menu()
+        await message.answer(answer, reply_markup=kb)
 
     except Exception as e:
         logging.error(f"Ошибка анализа фото: {e}")
-        await message.answer("Не удалось проанализировать фото. Попробуй ещё раз.", reply_markup=kb_photo_menu())
+        user = get_user(message.from_user.id)
+        kb = kb_photo_pregnant_menu() if user and user[0] == "pregnant" else kb_photo_menu()
+        await message.answer("Не удалось проанализировать фото. Попробуй ещё раз.", reply_markup=kb)
 
 @dp.message(PhotoStates.waiting_photo, ~F.voice)
 async def photo_wrong_input(message: Message, state: FSMContext):
