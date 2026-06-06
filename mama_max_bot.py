@@ -33,6 +33,7 @@ CREDENTIALS_FILE = "/root/google_credentials.json"
 MAX_API          = "https://botapi.max.ru"
 DB_PATH          = "/root/mama_max.db"
 FREE_REQUESTS    = 10
+CHANNEL_ID       = -75619101439475
 
 client = AsyncOpenAI(api_key=OPENAI_KEY)
 app = FastAPI()
@@ -278,6 +279,22 @@ async def send_message(chat_id, text, buttons=None):
             logging.info(f"send_message {chat_id}: {r.status_code}")
         except Exception as e:
             logging.error(f"send_message error: {e}")
+
+
+async def send_to_channel(text):
+    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
+    payload = {
+        "recipient": {"chat_id": CHANNEL_ID},
+        "type": "bot_action",
+        "action": "send_message",
+        "body": {"type": "text", "text": text[:4000]}
+    }
+    async with httpx.AsyncClient() as c:
+        try:
+            r = await c.post(f"{MAX_API}/messages", headers=headers, json=payload, timeout=15)
+            logging.info(f"Channel post: {r.status_code}")
+        except Exception as e:
+            logging.error(f"Channel post error: {e}")
 
 async def answer_callback(callback_id):
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
@@ -862,11 +879,56 @@ async def handle_callback(user_id, payload, username="", name=""):
     # По умолчанию
     await send_message(user_id, "Выбери действие из меню 👇", main_menu_buttons())
 
+
+# ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+scheduler_max = AsyncIOScheduler(timezone="Europe/Moscow")
+
+DAILY_THEMES = {
+    0: "беременность и подготовка к родам",
+    1: "новорождённый 0-3 месяца",
+    2: "малыш 3-12 месяцев",
+    3: "ребёнок 1-3 года",
+    4: "дошкольник 3-7 лет",
+    5: "здоровье и педиатрия",
+    6: "мама о себе — восстановление и психология",
+}
+
+RUBRICS = {
+    8:  ("🌅 Доброе утро, мама", "Короткий заряд на день — мотивация, поддержка. 100-150 слов."),
+    10: ("🔬 Научный факт дня", "Интересный научный факт о детях или беременности. 150-200 слов."),
+    13: ("💡 Совет педиатра", "Практический научно обоснованный совет по ВОЗ/AAP. 200-250 слов."),
+    16: ("🧠 Детская психология", "Объяснение поведения ребёнка по Петрановской/Сигелу. 200-250 слов."),
+    20: ("❤️ Для мамы", "О восстановлении, выгорании, себе. Тепло и поддерживающе. 150-200 слов."),
+}
+
+async def post_rubric_max(hour: int):
+    weekday = datetime.now().weekday()
+    daily_theme = DAILY_THEMES[weekday]
+    rubric_name, rubric_instruction = RUBRICS[hour]
+    post = await ask_gpt(
+        "Ты автор экспертного канала 'Я МАМА' для мам в мессенджере MAX. "
+        "Пишешь на основе ВОЗ, AAP, Петрановской, Карпа, Серза, Сигела. "
+        "Тепло и научно. Без воды. Добавляй эмодзи. "
+        "В конце — один практический совет на сегодня.",
+        f"Рубрика: {rubric_name}\nТема: {daily_theme}\nИнструкция: {rubric_instruction}\n"
+        f"Начни с эмодзи рубрики и её названия."
+    )
+    await send_to_channel(post)
+    logging.info(f"MAX канал: пост опубликован — {rubric_name}")
+
 # ─── WEBHOOK ─────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
     init_db()
     asyncio.create_task(check_payments_loop())
+    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(8)),  "cron", hour=8,  minute=0)
+    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(10)), "cron", hour=10, minute=0)
+    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(13)), "cron", hour=13, minute=0)
+    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(16)), "cron", hour=16, minute=0)
+    scheduler_max.add_job(lambda: asyncio.create_task(post_rubric_max(20)), "cron", hour=20, minute=0)
+    scheduler_max.start()
     await register_webhook()
     logging.info("Мамин Помощник MAX запущен!")
 
