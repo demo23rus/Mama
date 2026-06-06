@@ -161,6 +161,20 @@ async def get_photo(photo_url):
         return None
 
 # ========== КНОПКИ ==========
+def pregnant_menu_buttons():
+    return [
+        [{"type": "callback", "text": "📊 Мой срок", "payload": "preg_week"}],
+        [{"type": "callback", "text": "👶 Развитие малыша", "payload": "preg_baby"}],
+        [{"type": "callback", "text": "✅ Чек-лист", "payload": "preg_checklist"}],
+        [{"type": "callback", "text": "🛍 Список покупок", "payload": "preg_shop"}],
+        [{"type": "callback", "text": "📸 Анализ фото 🔒", "payload": "photo_menu"}],
+        [{"type": "callback", "text": "❓ Задать вопрос", "payload": "ask"}],
+        [{"type": "callback", "text": "💎 Премиум", "payload": "pay_premium"},
+         {"type": "link", "text": "🆘 Поддержка", "url": SUPPORT_URL}],
+        [{"type": "callback", "text": "🔄 Изменить данные", "payload": "change_data"},
+         {"type": "callback", "text": "🏠 Главная", "payload": "main_menu"}],
+    ]
+
 def main_menu_buttons():
     return [
         [{"type": "callback", "text": "📋 Первые дни с малышом", "payload": "firstdays"}],
@@ -816,7 +830,9 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     if payload == "back_menu":
         set_step(user_id, "idle")
-        if birth_date:
+        if birth_date and birth_date.startswith("pdr:"):
+            await send_message(chat_id, f"🤰 {m_label}\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
+        elif birth_date:
             await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons())
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
@@ -846,6 +862,52 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "set_pregnant":
         set_step(user_id, "enter_pdr")
         await send_message(chat_id, "🤰 Введи предполагаемую дату родов (ПДР)\n\nФормат: ДД.ММ.ГГГГ\nНапример: 15.09.2025")
+        return
+
+    # ─── БЕРЕМЕННЫЙ РАЗДЕЛ ───────────────────────────────────
+    if payload == "preg_week":
+        if not birth_date or not birth_date.startswith("pdr:"):
+            await send_message(chat_id, "Сначала укажи дату родов!", back_button())
+            return
+        weeks = calc_pregnancy_weeks(birth_date.replace("pdr:", ""))
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Беременная на {weeks} неделе. Расскажи подробно что происходит с малышом и мамой "
+            f"на {weeks} неделе беременности: размер и развитие плода, ощущения мамы, "
+            f"что важно сделать и проверить на этом сроке по рекомендациям ACOG и ВОЗ.")
+        await send_message(chat_id, f"📊 {weeks} неделя беременности\n\n{answer}", back_button())
+        return
+
+    if payload == "preg_baby":
+        if not birth_date or not birth_date.startswith("pdr:"):
+            await send_message(chat_id, "Сначала укажи дату родов!", back_button())
+            return
+        weeks = calc_pregnancy_weeks(birth_date.replace("pdr:", ""))
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Беременная на {weeks} неделе. Расскажи подробно о развитии малыша: "
+            f"размер, вес, какие органы и системы формируются, что он умеет делать, "
+            f"когда начинает двигаться и слышать. Интересные факты о развитии плода на этом сроке.")
+        await send_message(chat_id, f"👶 Малыш на {weeks} неделе\n\n{answer}", back_button())
+        return
+
+    if payload == "preg_checklist":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        weeks = calc_pregnancy_weeks(birth_date.replace("pdr:", "")) if birth_date and birth_date.startswith("pdr:") else 0
+        answer = await generate_text(EXPERT_BASE,
+            f"Составь чек-лист для беременной{'на сроке ' + str(weeks) + ' недель' if weeks else ''}: "
+            f"что нужно сделать, купить, оформить, какие анализы сдать, "
+            f"как подготовиться к родам. Структурированно по категориям.")
+        await send_message(chat_id, f"✅ Чек-лист беременной\n\n{answer}", back_button())
+        return
+
+    if payload == "preg_shop":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            "Составь список покупок для беременной и новорождённого: "
+            "что нужно для роддома (список в роддом), для малыша первые месяцы, "
+            "для кормящей мамы. Что важно, что необязательно, на чём сэкономить.")
+        await send_message(chat_id, f"🛍 Список покупок\n\n{answer}", back_button())
         return
 
     if payload == "psycho_new":
@@ -1132,9 +1194,30 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
                 d = datetime.fromisoformat(dt).strftime("%d.%m.%Y")
                 text += f"📅 {d} — {h} см, {w} кг\n"
             text += "\n"
-        text += "Введи рост малыша в сантиметрах\nНапример: 67.5"
+        buttons = [
+            [{"type": "callback", "text": "➕ Добавить замер", "payload": "growth_add"}],
+            [{"type": "callback", "text": "📊 Анализ динамики", "payload": "growth_analyze"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "growth_add":
         set_step(user_id, "enter_height")
-        await send_message(chat_id, text)
+        await send_message(chat_id, "📏 Введи рост малыша в сантиметрах\nНапример: 67.5")
+        return
+
+    if payload == "growth_analyze":
+        entries = get_growth(user_id)
+        if not entries:
+            await send_message(chat_id, "Нет данных для анализа. Добавь хотя бы один замер!", back_button())
+            return
+        await send_message(chat_id, "⏳ Анализирую динамику...")
+        data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m.%Y')}: рост {h} см, вес {w} кг" for h, w, dt in entries])
+        answer = await generate_text(EXPERT_BASE,
+            f"Ребёнку {m_label}. Динамика роста и веса:\n{data_str}\n\n"
+            f"Проанализируй по нормам ВОЗ: прибавки в норме или нет, тренд хороший или нет, на что обратить внимание педиатру.")
+        await send_message(chat_id, answer, back_button())
         return
 
     if payload == "symptoms":
@@ -1187,6 +1270,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             [{"type": "callback", "text": "🤱 Левая грудь", "payload": "feed_left"},
              {"type": "callback", "text": "🤱 Правая грудь", "payload": "feed_right"}],
             [{"type": "callback", "text": "🍼 Смесь/бутылочка", "payload": "feed_bottle"}],
+            [{"type": "callback", "text": "📊 Статистика", "payload": "feed_stats"}],
             [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
         ]
         text = "🤱 Трекер кормлений\n\n"
@@ -1197,6 +1281,23 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         else:
             text += "Записей нет. Нажми кнопку после каждого кормления!"
         await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "feed_stats":
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? AND entry LIKE 'КОРМ:%' ORDER BY created_at DESC LIMIT 20",
+            (user_id,)).fetchall()
+        conn.close()
+        if not entries:
+            await send_message(chat_id, "Нет данных для анализа.", back_button())
+            return
+        await send_message(chat_id, "⏳ Анализирую кормления...")
+        data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {entry.replace('КОРМ:','')}" for entry, dt in entries])
+        answer = await generate_text(EXPERT_BASE,
+            f"Ребёнку {m_label}. Журнал кормлений:\n{data_str}\n\n"
+            f"Проанализируй: достаточно ли кормлений по нормам ВОЗ, правильные ли интервалы, достаточная ли продолжительность. Дай практические рекомендации.")
+        await send_message(chat_id, answer, back_button())
         return
 
     for feed_type in ["feed_left", "feed_right", "feed_bottle"]:
@@ -1419,7 +1520,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         await send_message(chat_id, "❓ Расскажи о своей ситуации:\n\nРаботаешь или нет, какой по счёту ребёнок, замужем или нет, регион.")
         return
 
-    if payload in ["premium_info", "pay_premium"]:
+    if payload == "pay_premium" or payload == "premium_info":
         try:
             payment = await create_payment(user_id, "mama_premium")
             pay_url = payment.get("confirmation", {}).get("confirmation_url", "")
