@@ -1583,42 +1583,6 @@ async def post_evening():   await post_rubric(16)
 async def post_night():     await post_rubric(20)
 
 
-async def check_vaccine_reminders():
-    conn = sqlite3.connect("/root/mama.db")
-    c = conn.cursor()
-    today = date.today()
-    reminder_date = (today + __import__('datetime').timedelta(days=3)).strftime("%d.%m.%Y")
-    c.execute("SELECT user_id, vaccine, scheduled_date FROM vaccinations WHERE scheduled_date=? AND done=0", (reminder_date,))
-    rows = c.fetchall()
-    conn.close()
-    for user_id, vaccine, sdate in rows:
-        try:
-            await bot.send_message(user_id,
-                f"💉 Напоминание о прививке!\n\n"
-                f"Через 3 дня ({sdate}) запланирована:\n"
-                f"🔹 {vaccine}\n\n"
-                f"Не забудь записаться к педиатру заранее!"
-            )
-        except Exception as e:
-            logging.error(f"Ошибка напоминания о прививке: {e}")
-
-# ─── ЗАПУСК ──────────────────────────────────────────────────
-async def main():
-    init_db()
-    # Напоминания о прививках — каждый день в 9:00
-    scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0)
-    scheduler.add_job(post_morning,   "cron", hour=8,  minute=0)
-    scheduler.add_job(post_10,        "cron", hour=10, minute=0)
-    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0)
-    scheduler.add_job(post_evening,   "cron", hour=16, minute=0)
-    scheduler.add_job(post_night,     "cron", hour=20, minute=0)
-    scheduler.start()
-    logging.info("Мамин помощник запущен!")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
 # ─── ТРЕКЕР РОСТА И ВЕСА ─────────────────────────────────────
 @dp.callback_query(F.data == "tracker_growth")
 async def tracker_growth(call: CallbackQuery):
@@ -2037,3 +2001,38 @@ async def ben_personal_answer(message: Message, state: FSMContext):
     )
     await message.answer(answer, reply_markup=kb_mama_menu())
 
+async def check_vaccine_reminders():
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    today = date.today()
+    reminder_date = (today + __import__('datetime').timedelta(days=3)).strftime("%d.%m.%Y")
+    c.execute("SELECT user_id, vaccine, scheduled_date FROM vaccinations WHERE scheduled_date=? AND done=0", (reminder_date,))
+    rows = c.fetchall()
+    conn.close()
+    for user_id, vaccine, sdate in rows:
+        try:
+            await bot.send_message(user_id,
+                f"💉 Напоминание о прививке!\n\n"
+                f"Через 3 дня ({sdate}) запланирована:\n"
+                f"🔹 {vaccine}\n\n"
+                f"Не забудь записаться к педиатру заранее!"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка напоминания о прививке: {e}")
+
+# ─── ЗАПУСК ──────────────────────────────────────────────────
+async def main():
+    init_db()
+    # Напоминания о прививках — каждый день в 9:00
+    scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0)
+    scheduler.add_job(post_morning,   "cron", hour=8,  minute=0)
+    scheduler.add_job(post_10,        "cron", hour=10, minute=0)
+    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0)
+    scheduler.add_job(post_evening,   "cron", hour=16, minute=0)
+    scheduler.add_job(post_night,     "cron", hour=20, minute=0)
+    scheduler.start()
+    logging.info("Мамин помощник запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
