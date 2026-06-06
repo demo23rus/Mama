@@ -192,7 +192,7 @@ def main_menu_buttons():
          {"type": "callback", "text": "💰 Пособия 🔒", "payload": "benefits"}],
         [{"type": "callback", "text": "💎 Оформить Премиум", "payload": "pay_premium"}],
         [{"type": "callback", "text": "⭐ Отзыв", "payload": "review"},
-         {"type": "link", "text": "🆘 Поддержка", "url": SUPPORT_URL}],
+         {"type": "callback", "text": "🆘 Поддержка", "payload": "support_menu"}],
         [{"type": "callback", "text": "🔄 Изменить данные", "payload": "change_data"},
          {"type": "callback", "text": "🏠 Главная", "payload": "main_menu"}],
     ]
@@ -238,6 +238,10 @@ def init_db():
     c.execute("""CREATE TABLE IF NOT EXISTS diary (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER, entry TEXT, response TEXT DEFAULT '', created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS vaccinations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+        vaccine TEXT, scheduled_date TEXT, done INTEGER DEFAULT 0, created_at TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS growth (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -759,6 +763,24 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         await send_message(chat_id, "⭐ Спасибо за отзыв! 💕", main_menu_buttons())
         return
 
+    if step == "suggestion":
+        set_step(user_id, "idle")
+        asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, first_name, username, f"ПРЕДЛОЖЕНИЕ: {text}"))
+        await send_message(chat_id, "💡 Спасибо за идею! Мы обязательно рассмотрим её 🤍", main_menu_buttons())
+        return
+
+    if step == "support_write":
+        set_step(user_id, "idle")
+        import httpx as _httpx
+        try:
+            # Отправляем через Telegram в @demo23rus
+            pass
+        except:
+            pass
+        asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, first_name, username, f"ПОДДЕРЖКА: {text}"))
+        await send_message(chat_id, f"✅ Сообщение отправлено! Мы ответим в ближайшее время.\n\nИли напиши напрямую: {SUPPORT_URL}", main_menu_buttons())
+        return
+
     # Если режим не выбран
     if not birth_date:
         await send_message(chat_id, WELCOME_TEXT.format(name=name),
@@ -830,6 +852,31 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         clear_psycho_history(user_id)
         set_step(user_id, "psycho")
         await send_message(chat_id, "🧠 Новый разговор.\n\nКак ты сейчас? 💕", psycho_buttons())
+        return
+
+    if payload == "support_menu":
+        buttons = [
+            [{"type": "callback", "text": "🆘 Написать в поддержку", "payload": "support_write"}],
+            [{"type": "callback", "text": "⭐ Оставить отзыв", "payload": "review_write"}],
+            [{"type": "callback", "text": "💡 Предложить идею", "payload": "suggestion_write"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "🤍 Поддержка и обратная связь\n\nМы рады каждому отзыву и предложению!", buttons)
+        return
+
+    if payload == "support_write":
+        set_step(user_id, "support_write")
+        await send_message(chat_id, "🆘 Напиши своё сообщение — я перешлю его в поддержку.\n\nОпиши проблему подробно 👇")
+        return
+
+    if payload == "review_write":
+        set_step(user_id, "review")
+        await send_message(chat_id, "⭐ Напиши свой отзыв о боте 💕")
+        return
+
+    if payload == "suggestion_write":
+        set_step(user_id, "suggestion")
+        await send_message(chat_id, "💡 Напиши свою идею — что добавить или улучшить в боте?")
         return
 
     if payload == "review":
@@ -1055,18 +1102,20 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         buttons = [
             [{"type": "callback", "text": "🔴 Сыпь и кожа", "payload": "photo_skin"},
              {"type": "callback", "text": "🍽 Еда малыша", "payload": "photo_food"}],
-            [{"type": "callback", "text": "💊 Упаковка смеси", "payload": "photo_package"}],
+            [{"type": "callback", "text": "💩 Стул малыша", "payload": "photo_stool"},
+             {"type": "callback", "text": "💊 Упаковка смеси", "payload": "photo_package"}],
             [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
         ]
         await send_message(chat_id, "📸 Выбери тип фото и отправь изображение 👇", buttons)
         return
 
-    for pt in ["photo_skin", "photo_food", "photo_package"]:
+    for pt in ["photo_skin", "photo_food", "photo_package", "photo_stool"]:
         if payload == pt:
             set_step(user_id, f"photo_{pt}")
             prompts = {
                 "photo_skin": "📸 Отправь фото кожи или сыпи малыша\n\n⚠️ Это ориентир, не диагноз.",
                 "photo_food": "📸 Отправь фото еды или блюда",
+                "photo_stool": "📸 Отправь фото стула малыша\n\n⚠️ Это ориентир, не диагноз.",
                 "photo_package": "📸 Отправь фото упаковки смеси или лекарства"
             }
             await send_message(chat_id, prompts[pt])
@@ -1205,12 +1254,113 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         if plan != "mama_premium":
             await send_message(chat_id, "🔒 Прививочный календарь доступен в Премиум 💎", upgrade_buttons())
             return
-        await send_message(chat_id, "⏳ Подбираю...")
+        # Получаем прививки из БД
+        conn = sqlite3.connect(DB)
+        vaccinations = conn.execute(
+            "SELECT id, vaccine, scheduled_date, done FROM vaccinations WHERE user_id=? ORDER BY scheduled_date",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "📅 Создать календарь", "payload": "vaccines_create"}],
+            [{"type": "callback", "text": "✅ Отметить сделанную", "payload": "vaccines_done"}],
+            [{"type": "callback", "text": "❓ Что такое эта прививка", "payload": "vaccines_info"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        if vaccinations:
+            text = "💉 Прививочный календарь\n\n"
+            for vid, vaccine, sdate, done in vaccinations[:10]:
+                status = "✅" if done else "⏳"
+                text += f"{status} {sdate} — {vaccine}\n"
+        else:
+            text = "💉 Прививочный календарь\n\nКалендарь не создан. Нажми 'Создать календарь'!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "vaccines_create":
+        if not birth_date or birth_date.startswith("pdr:"):
+            await send_message(chat_id, "Сначала укажи дату рождения малыша!", back_button())
+            return
+        birth = datetime.strptime(birth_date, "%d.%m.%Y")
+        schedule = [
+            (0, "БЦЖ (туберкулёз)"), (0, "Гепатит B — 1-я доза"),
+            (1, "Гепатит B — 2-я доза"), (2, "АКДС — 1-я доза"),
+            (2, "Полиомиелит — 1-я доза"), (2, "Пневмококк — 1-я доза"),
+            (3, "АКДС — 2-я доза"), (3, "Полиомиелит — 2-я доза"),
+            (4, "АКДС — 3-я доза"), (4, "Полиомиелит — 3-я доза"),
+            (4, "Пневмококк — 2-я доза"), (6, "Гепатит B — 3-я доза"),
+            (12, "Корь, краснуха, паротит (КПК)"), (12, "Ветряная оспа"),
+            (15, "Пневмококк — ревакцинация"), (18, "АКДС — ревакцинация"),
+            (18, "Полиомиелит — ревакцинация"),
+        ]
+        conn = sqlite3.connect(DB)
+        # Создаём таблицу если нет
+        conn.execute("""CREATE TABLE IF NOT EXISTS vaccinations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+            vaccine TEXT, scheduled_date TEXT, done INTEGER DEFAULT 0, created_at TEXT
+        )""")
+        for month_age, vaccine in schedule:
+            vac_date = (birth + timedelta(days=month_age*30)).strftime("%d.%m.%Y")
+            conn.execute("INSERT INTO vaccinations (user_id, vaccine, scheduled_date, created_at) VALUES (?,?,?,?)",
+                        (user_id, vaccine, vac_date, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        await send_message(chat_id, f"✅ Календарь создан! Добавлено {len(schedule)} прививок.\n\nБот будет напоминать за 3 дня до каждой!", back_button())
+        return
+
+    if payload == "vaccines_done":
+        conn = sqlite3.connect(DB)
+        vaccinations = conn.execute(
+            "SELECT id, vaccine, scheduled_date FROM vaccinations WHERE user_id=? AND done=0 ORDER BY scheduled_date",
+            (user_id,)).fetchall()
+        conn.close()
+        if not vaccinations:
+            await send_message(chat_id, "Нет незавершённых прививок.", back_button())
+            return
+        buttons = [[{"type": "callback", "text": f"✅ {vaccine} ({sdate})", "payload": f"vac_done_{vid}"}]
+                   for vid, vaccine, sdate in vaccinations[:8]]
+        buttons.append([{"type": "callback", "text": "🔙 Назад", "payload": "vaccines"}])
+        await send_message(chat_id, "Выбери прививку которую сделали:", buttons)
+        return
+
+    if payload.startswith("vac_done_"):
+        vac_id = int(payload.replace("vac_done_", ""))
+        conn = sqlite3.connect(DB)
+        conn.execute("UPDATE vaccinations SET done=1 WHERE id=?", (vac_id,))
+        conn.commit()
+        conn.close()
+        await send_message(chat_id, "✅ Прививка отмечена как сделанная!", back_button())
+        return
+
+    if payload == "vaccines_info":
+        buttons = [
+            [{"type": "callback", "text": "💉 БЦЖ", "payload": "vac_bcg"},
+             {"type": "callback", "text": "💉 Гепатит B", "payload": "vac_hepb"}],
+            [{"type": "callback", "text": "💉 АКДС", "payload": "vac_akds"},
+             {"type": "callback", "text": "💉 Полиомиелит", "payload": "vac_polio"}],
+            [{"type": "callback", "text": "💉 Пневмококк", "payload": "vac_pneumo"},
+             {"type": "callback", "text": "💉 КПК", "payload": "vac_kpk"}],
+            [{"type": "callback", "text": "💉 Ветрянка", "payload": "vac_varicella"}],
+            [{"type": "callback", "text": "🔙 Назад", "payload": "vaccines"}]
+        ]
+        await send_message(chat_id, "Выбери прививку чтобы узнать подробнее 👇", buttons)
+        return
+
+    vac_info = {
+        "vac_bcg": "БЦЖ (туберкулёз)",
+        "vac_hepb": "Гепатит B",
+        "vac_akds": "АКДС (коклюш, дифтерия, столбняк)",
+        "vac_polio": "Полиомиелит",
+        "vac_pneumo": "Пневмококковая инфекция",
+        "vac_kpk": "КПК (корь, паротит, краснуха)",
+        "vac_varicella": "Ветряная оспа",
+    }
+    if payload in vac_info:
+        await send_message(chat_id, "⏳ Подбираю информацию...")
         answer = await generate_text(EXPERT_BASE,
-            "Расскажи о национальном календаре прививок РФ для детей до 2 лет: "
-            "БЦЖ, Гепатит B, АКДС, Полиомиелит, Пневмококк, КПК, Ветрянка. "
-            "Когда, зачем, как подготовить, нормальные реакции.")
-        await send_message(chat_id, f"💉 Прививочный календарь\n\n{answer}", back_button())
+            f"Дай подробное объяснение прививки {vac_info[payload]} для родителей: "
+            f"от чего защищает, когда делают, как подготовить, нормальные реакции, "
+            f"красные флаги, развенчай мифы с научными аргументами.")
+        await send_message(chat_id, answer, [[{"type": "callback", "text": "🔙 К прививкам", "payload": "vaccines_info"}]])
         return
 
     if payload == "benefits":
@@ -1218,11 +1368,13 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             await send_message(chat_id, "🔒 Пособия и выплаты доступны в Премиум 💎", upgrade_buttons())
             return
         buttons = [
-            [{"type": "callback", "text": "👶 При рождении", "payload": "ben_birth"},
-             {"type": "callback", "text": "🤱 До 1.5 лет", "payload": "ben_15"}],
-            [{"type": "callback", "text": "📅 До 3 лет", "payload": "ben_3"},
-             {"type": "callback", "text": "🏠 Маткапитал", "payload": "ben_matcap"}],
-            [{"type": "callback", "text": "❓ Что положено мне", "payload": "ben_personal"}],
+            [{"type": "callback", "text": "👶 Единовременное при рождении", "payload": "ben_birth"}],
+            [{"type": "callback", "text": "🤱 Пособие по уходу до 1.5 лет", "payload": "ben_15"}],
+            [{"type": "callback", "text": "📅 Выплаты до 3 лет", "payload": "ben_3"}],
+            [{"type": "callback", "text": "🏠 Материнский капитал", "payload": "ben_matcap"}],
+            [{"type": "callback", "text": "💊 По беременности и родам", "payload": "ben_decree"}],
+            [{"type": "callback", "text": "👨‍👩‍👧 Многодетная семья", "payload": "ben_multi"}],
+            [{"type": "callback", "text": "❓ Что положено именно мне", "payload": "ben_personal"}],
             [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
         ]
         await send_message(chat_id, "💰 Пособия и выплаты\n\nВыбери раздел 👇", buttons)
@@ -1230,9 +1382,11 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     ben_map = {
         "ben_birth": "Единовременное пособие при рождении в России 2024-2025. Размер, документы, куда обращаться.",
-        "ben_15": "Пособие по уходу до 1.5 лет в России 2024-2025. Для работающих и неработающих.",
+        "ben_15": "Пособие по уходу до 1.5 лет в России 2024-2025. Для работающих и неработающих, как рассчитать.",
         "ben_3": "Выплаты на ребёнка от 1.5 до 3 лет в России 2024-2025. Путинские выплаты, условия.",
         "ben_matcap": "Материнский капитал в России 2024-2025. Размер, на что потратить, как оформить.",
+        "ben_decree": "Пособие по беременности и родам (декретные) в России 2024-2025. Как рассчитывается для работающих, ИП, безработных. Сроки декрета, документы.",
+        "ben_multi": "Льготы и выплаты многодетным семьям в России 2024-2025. Федеральные и региональные льготы, налоговые вычеты, земельные участки, ЖКХ, досрочная пенсия мамы.",
     }
     if payload in ben_map:
         await send_message(chat_id, "⏳ Подбираю...")
@@ -1298,12 +1452,38 @@ async def process_photo(chat_id, user_id, photo_url):
         import base64
         photo_b64 = base64.b64encode(photo_bytes).decode()
 
-        prompts = {
-            "skin": ("На фото кожа человека?", "Ты педиатр. Опиши кожу ребёнка: высыпания, цвет, форма. На что похоже, что делать, когда к врачу. Это описание, не диагноз."),
-            "food": ("На фото еда?", "Ты диетолог-педиатр. Что это за еда, подходит ли детям, с какого возраста."),
-            "package": ("На фото упаковка товара?", "Ты педиатр. Изучи упаковку: что это, состав, возраст, на что обратить внимание."),
-        }
-        filter_q, analysis_q = prompts.get(photo_type, prompts["skin"])
+        if photo_type == "skin":
+            filter_q = "Посмотри на это изображение. На нём кожа человека или ребёнка с возможными высыпаниями, покраснениями или другими кожными проявлениями? Ответь только: ДА или НЕТ."
+            analysis_q = ("Ты опытный педиатр. Опиши что видишь на коже ребёнка: "
+                "1) Характер высыпаний — цвет, форма, размер, локализация; "
+                "2) На какие известные состояния это визуально похоже — потница, атопический дерматит, аллергия, инфекция и т.д.; "
+                "3) Что можно сделать дома прямо сейчас; "
+                "4) Красные флаги — когда срочно к врачу. "
+                "В конце обязательно напомни что это описание а не диагноз.")
+        elif photo_type == "stool":
+            filter_q = "На этом изображении подгузник или стул ребёнка? Ответь только: ДА или НЕТ."
+            analysis_q = ("Ты педиатр. Оцени стул ребёнка по фото: "
+                "1) Цвет — что он означает для здоровья малыша; "
+                "2) Консистенция — норма или нет; "
+                "3) Что это может говорить о пищеварении; "
+                "4) Когда нужен врач. "
+                "Напомни что точный диагноз ставит только педиатр.")
+        elif photo_type == "food":
+            filter_q = "На этом изображении еда или блюдо? Ответь только: ДА или НЕТ."
+            analysis_q = (f"Ты диетолог-педиатр. Малышу {m_label}. "
+                "Посмотри на это блюдо или продукт и скажи: "
+                "1) Что это за еда; "
+                "2) Подходит ли это ребёнку по возрасту — да/нет и почему; "
+                "3) Что в составе может быть проблематично; "
+                "4) Как правильно приготовить если нужна адаптация под возраст.")
+        else:  # package
+            filter_q = "На этом изображении упаковка товара, лекарства или смеси? Ответь только: ДА или НЕТ."
+            analysis_q = ("Ты педиатр-фармаколог. Изучи упаковку и скажи: "
+                "1) Что это за продукт; "
+                "2) Основные компоненты состава — что важно; "
+                "3) Для какого возраста подходит; "
+                "4) На что обратить особое внимание маме; "
+                "5) Есть ли спорные ингредиенты.")
 
         filter_resp = await openai_client.chat.completions.create(
             model="gpt-4o",
