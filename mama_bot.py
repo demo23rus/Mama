@@ -5,7 +5,7 @@ import os
 from datetime import datetime, date
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -31,9 +31,6 @@ _env = load_env()
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN  = "8769245157:AAH2EbEFpGj8MzuHUMiBKeLB7eJztyxfC1s"
 OPENAI_KEY = "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"
-CHANNEL_ID = _env.get("CHANNEL_ID") or "@YaMamaChannel"
-
-logging.basicConfig(level=logging.INFO)
 
 # ─── ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
 bot = Bot(token=BOT_TOKEN)
@@ -271,7 +268,7 @@ async def cmd_start(message: Message, state: FSMContext):
             if weeks:
                 await message.answer(
                     f"👋 С возвращением, {saved_name or name}!\n\n"
-                    f"🤰 Ты на *{weeks} неделе* беременности ({days} дн.)\n\n"
+                    f"🤰 Ты на {weeks} неделе беременности ({days} дн.)\n\n"
                     f"Чем могу помочь?",
                     
                     reply_markup=kb_pregnant_menu()
@@ -283,7 +280,7 @@ async def cmd_start(message: Message, state: FSMContext):
             if months is not None:
                 await message.answer(
                     f"👋 С возвращением, {saved_name or name}!\n\n"
-                    f"👶 Малышу *{age_label(months)}*\n\n"
+                    f"👶 Малышу {age_label(months)}\n\n"
                     f"Чем могу помочь?",
                     
                     reply_markup=kb_mama_menu()
@@ -296,8 +293,8 @@ async def cmd_start(message: Message, state: FSMContext):
 async def show_start(message: Message, name: str, state: FSMContext):
     await state.set_state(RegStates.choosing_mode)
     await message.answer(
-        f"👋 Привет, *{name}*!\n\n"
-        f"Я *Мамин помощник* 🤱 — твой личный ИИ-помощник.\n\n"
+        f"👋 Привет, {name}!\n\n"
+        f"Я Мамин помощник 🤱 — твой личный ИИ-помощник.\n\n"
         f"Я буду давать советы, отвечать на вопросы и помогать — "
         f"всё строго под твою ситуацию.\n\n"
         f"Расскажи мне о себе 👇",
@@ -312,7 +309,7 @@ async def choose_pregnant(call: CallbackQuery, state: FSMContext):
     await call.message.edit_text(
         "🤰 Отлично! Введи предполагаемую дату родов (ПДР).\n\n"
         "Её можно узнать у врача или в обменной карте.\n\n"
-        "📅 Формат: *ДД.ММ.ГГГГ*\nНапример: *15.09.2025*",
+        "📅 Формат: ДД.ММ.ГГГГ\nНапример: 15.09.2025",
         
     )
 
@@ -321,7 +318,7 @@ async def choose_mama(call: CallbackQuery, state: FSMContext):
     await state.set_state(RegStates.entering_birthdate)
     await call.message.edit_text(
         "👶 Отлично! Введи дату рождения малыша.\n\n"
-        "📅 Формат: *ДД.ММ.ГГГГ*\nНапример: *10.03.2024*",
+        "📅 Формат: ДД.ММ.ГГГГ\nНапример: 10.03.2024",
         
     )
 
@@ -331,7 +328,7 @@ async def enter_pdr(message: Message, state: FSMContext):
     text = message.text.strip()
     weeks, days = calc_pregnancy_weeks(text)
     if not weeks:
-        await message.answer("❌ Неверный формат. Введи дату так: *15.09.2025*", )
+        await message.answer("❌ Неверный формат. Введи дату так: 15.09.2025", )
         return
     if weeks < 0 or weeks > 42:
         await message.answer("❌ Дата выглядит неверно. Проверь и введи снова.")
@@ -342,7 +339,7 @@ async def enter_pdr(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ Сохранила!\n\n"
-        f"🤰 Ты на *{weeks} неделе* беременности ({days} дн.)\n\n"
+        f"🤰 Ты на {weeks} неделе беременности ({days} дн.)\n\n"
         f"Я буду давать советы и отвечать на вопросы именно для этого срока 💕",
         
         reply_markup=kb_pregnant_menu()
@@ -354,7 +351,7 @@ async def enter_birthdate(message: Message, state: FSMContext):
     text = message.text.strip()
     months, days = calc_child_age(text)
     if months is None:
-        await message.answer("❌ Неверный формат. Введи дату так: *10.03.2024*", )
+        await message.answer("❌ Неверный формат. Введи дату так: 10.03.2024", )
         return
     if months < 0 or months > 216:
         await message.answer("❌ Дата выглядит неверно. Проверь и введи снова.")
@@ -365,7 +362,7 @@ async def enter_birthdate(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ Сохранила!\n\n"
-        f"👶 Малышу *{age_label(months)}*\n\n"
+        f"👶 Малышу {age_label(months)}\n\n"
         f"Буду давать советы именно для этого возраста 💕",
         
         reply_markup=kb_mama_menu()
@@ -381,14 +378,14 @@ async def main_menu(call: CallbackQuery, state: FSMContext):
         if mode == "pregnant":
             weeks, days = calc_pregnancy_weeks(date_value)
             await call.message.edit_text(
-                f"🤰 Ты на *{weeks} неделе* беременности\n\nЧем могу помочь?",
+                f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?",
                 
                 reply_markup=kb_pregnant_menu()
             )
         else:
             months, _ = calc_child_age(date_value)
             await call.message.edit_text(
-                f"👶 Малышу *{age_label(months)}*\n\nЧем могу помочь?",
+                f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?",
                 
                 reply_markup=kb_mama_menu()
             )
@@ -405,7 +402,7 @@ async def menu_pregnant(call: CallbackQuery):
         _, date_value, _ = user
         weeks, days = calc_pregnancy_weeks(date_value)
         await call.message.edit_text(
-            f"🤰 Ты на *{weeks} неделе* беременности\n\nЧем могу помочь?",
+            f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?",
             
             reply_markup=kb_pregnant_menu()
         )
@@ -417,7 +414,7 @@ async def menu_mama(call: CallbackQuery):
         _, date_value, _ = user
         months, _ = calc_child_age(date_value)
         await call.message.edit_text(
-            f"👶 Малышу *{age_label(months)}*\n\nЧем могу помочь?",
+            f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?",
             
             reply_markup=kb_mama_menu()
         )
@@ -750,12 +747,12 @@ async def mama_diary(call: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
     ])
     if entries:
-        text = "📓 *Дневник малыша*\n\n"
+        text = "📓 Дневник малыша\n\n"
         for entry, created_at in entries[:10]:
             dt = datetime.fromisoformat(created_at).strftime("%d.%m.%Y")
-            text += f"📅 *{dt}*\n{entry}\n\n"
+            text += f"📅 {dt}\n{entry}\n\n"
     else:
-        text = "📓 *Дневник малыша*\n\nЗаписей пока нет. Начни фиксировать важные моменты! 💕"
+        text = "📓 Дневник малыша\n\nЗаписей пока нет. Начни фиксировать важные моменты! 💕"
     await call.message.edit_text(text,  reply_markup=kb)
 
 @dp.callback_query(F.data == "diary_add")
@@ -781,7 +778,7 @@ async def save_diary_entry(message: Message, state: FSMContext):
 async def ask_question(call: CallbackQuery, state: FSMContext):
     await state.set_state(QuestionStates.waiting_question)
     await call.message.edit_text(
-        "❓ *Задай любой вопрос*\n\n"
+        "❓ Задай любой вопрос\n\n"
         "О беременности, ребёнке, здоровье, воспитании, психологии — "
         "я отвечу с учётом твоей ситуации 💕\n\n"
         "Напиши свой вопрос:",
@@ -1433,13 +1430,6 @@ async def post_afternoon(): await post_rubric(13)
 async def post_evening():   await post_rubric(16)
 async def post_night():     await post_rubric(20)
 
-async def post_today_all():
-    import asyncio as aio
-    logging.info("Публикуем первый день постов...")
-    for hour in [8, 10, 13, 16, 20]:
-        await post_rubric(hour)
-        await aio.sleep(15)
-    logging.info("Все посты первого дня опубликованы!")
 
 # ─── ЗАПУСК ──────────────────────────────────────────────────
 async def main():
