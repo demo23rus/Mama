@@ -11,6 +11,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import uuid
+import gspread
+from google.oauth2.service_account import Credentials
+from yookassa import Configuration, Payment
 
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
@@ -133,6 +137,27 @@ def init_db():
             created_at TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER PRIMARY KEY,
+            plan TEXT DEFAULT '',
+            sub_end TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pending_payments (
+            payment_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            plan TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS requests_count (
+            user_id INTEGER PRIMARY KEY,
+            count INTEGER DEFAULT 0
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -236,6 +261,68 @@ def get_sleep_log(user_id):
     conn.close()
     return rows
 
+def get_subscription(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT plan, sub_end FROM subscriptions WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return "", None
+    return row[0], row[1]
+
+def set_subscription(user_id, plan, days):
+    from datetime import timedelta
+    end = (datetime.now() + timedelta(days=days)).isoformat()
+    conn = sqlite3.connect("/root/mama.db")
+    conn.execute("INSERT OR REPLACE INTO subscriptions (user_id, plan, sub_end) VALUES (?,?,?)",
+                 (user_id, plan, end))
+    conn.commit()
+    conn.close()
+
+def is_premium(user_id):
+    plan, sub_end = get_subscription(user_id)
+    if plan == "mama_premium" and sub_end:
+        if datetime.fromisoformat(sub_end) > datetime.now():
+            return True
+    return False
+
+def get_request_count(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT count FROM requests_count WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def increment_request_count(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    conn.execute("INSERT OR REPLACE INTO requests_count (user_id, count) VALUES (?, COALESCE((SELECT count FROM requests_count WHERE user_id=?), 0) + 1)",
+                 (user_id, user_id))
+    conn.commit()
+    conn.close()
+
+def save_pending_payment(payment_id, user_id, plan):
+    conn = sqlite3.connect("/root/mama.db")
+    conn.execute("INSERT INTO pending_payments (payment_id, user_id, plan, created_at) VALUES (?,?,?,?)",
+                 (payment_id, user_id, plan, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_pending_payments():
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT payment_id, user_id, plan FROM pending_payments")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def delete_pending_payment(payment_id):
+    conn = sqlite3.connect("/root/mama.db")
+    conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+    conn.commit()
+    conn.close()
+
 def save_vaccination(user_id, vaccine, scheduled_date):
     conn = sqlite3.connect("/root/mama.db")
     c = conn.cursor()
@@ -300,6 +387,19 @@ def clean_text(text):
     text = text.replace("`", "").replace("###", "").replace("##", "").replace("#", "")
     return text.strip()
 
+async def send_long_message(chat_id, text, reply_markup=None):
+    """Разбиваем длинные сообщения на части по 4000 символов"""
+    max_len = 4000
+    if len(text) <= max_len:
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return
+    parts = [text[i:i+max_len] for i in range(0, len(text), max_len)]
+    for i, part in enumerate(parts):
+        if i == len(parts) - 1:
+            await bot.send_message(chat_id, part, reply_markup=reply_markup)
+        else:
+            await bot.send_message(chat_id, part)
+
 async def ask_gpt(system_prompt, user_prompt):
     try:
         response = await client.chat.completions.create(
@@ -319,7 +419,9 @@ def kb_start():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🤰 Я беременна", callback_data="mode_pregnant")],
         [InlineKeyboardButton(text="👩 Я уже мама", callback_data="mode_mama")],
-        [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/yamama_ai")]
+        [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/yamama_ai")],
+        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")]
     ])
 
 def kb_pregnant_menu():
@@ -328,8 +430,10 @@ def kb_pregnant_menu():
         [InlineKeyboardButton(text="👶 Развитие малыша", callback_data="preg_baby")],
         [InlineKeyboardButton(text="✅ Чек-лист", callback_data="preg_checklist")],
         [InlineKeyboardButton(text="🛍 Список покупок", callback_data="preg_shop")],
-        [InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="📸 Анализ фото 🔒", callback_data="show_premium")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
+        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
     ])
@@ -337,12 +441,12 @@ def kb_pregnant_menu():
 def kb_mama_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
-        [InlineKeyboardButton(text="💉 Прививки", callback_data="tracker_vaccines"),
-         InlineKeyboardButton(text="📏 Рост и вес", callback_data="tracker_growth")],
-        [InlineKeyboardButton(text="🌡 Трекер симптомов", callback_data="tracker_symptoms"),
-         InlineKeyboardButton(text="🤱 Трекер кормлений", callback_data="tracker_feeding")],
-        [InlineKeyboardButton(text="🌙 Дневник сна", callback_data="tracker_sleep"),
-         InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="benefits_menu")],
+        [InlineKeyboardButton(text="💉 Прививки 🔒", callback_data="check_premium_vaccines"),
+         InlineKeyboardButton(text="📏 Рост и вес 🔒", callback_data="check_premium_growth")],
+        [InlineKeyboardButton(text="🌡 Трекер симптомов 🔒", callback_data="check_premium_symptoms"),
+         InlineKeyboardButton(text="🤱 Трекер кормлений 🔒", callback_data="check_premium_feeding")],
+        [InlineKeyboardButton(text="🌙 Дневник сна 🔒", callback_data="check_premium_sleep"),
+         InlineKeyboardButton(text="💰 Пособия и выплаты 🔒", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
         [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
         [InlineKeyboardButton(text="📊 Развитие по возрасту", callback_data="mama_dev"),
@@ -361,6 +465,8 @@ def kb_mama_menu():
          InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
         [InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
+        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
     ])
@@ -442,6 +548,10 @@ async def cmd_start(message: Message, state: FSMContext):
         await show_start(message, name, state)
 
 async def show_start(message: Message, name: str, state: FSMContext):
+    import threading
+    threading.Thread(target=sheets_add_user, args=(
+        message.from_user.id, message.from_user.username, name
+    )).start()
     await state.set_state(RegStates.choosing_mode)
     await message.answer(
         f"👋 Привет, {name}!\n\n"
@@ -686,10 +796,7 @@ async def mama_gpt_handler(call: CallbackQuery, system: str, prompt_fn):
     months, _ = calc_child_age(date_value)
     await call.message.edit_text("⏳ Подбираю информацию...")
     answer = await ask_gpt(system, prompt_fn(months))
-    await call.message.edit_text(
-        answer,
-        reply_markup=kb_back_to_menu("mama")
-    )
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb_back_to_menu("mama"))
 
 EXPERT_BASE = (
     "Ты эксперт в детской педиатрии, психологии развития и нейронауке. "
@@ -720,27 +827,87 @@ async def mama_dev(call: CallbackQuery):
 
 @dp.callback_query(F.data == "mama_games")
 async def mama_games(call: CallbackQuery):
-    await mama_gpt_handler(
-        call,
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала введи данные!", show_alert=True)
+        return
+    _, date_value, _ = user
+    months, _ = calc_child_age(date_value)
+    await call.message.edit_text("⏳ Подбираю игры...")
+    answer = await ask_gpt(
         EXPERT_BASE,
-        lambda m: f"Предложи 8-10 научно обоснованных развивающих игр и занятий для ребёнка {age_label(m)} ({m} месяцев). "
-                  f"Опирайся на теорию зоны ближайшего развития Выготского и исследования нейропластичности. "
-                  f"Для каждой игры укажи: название, как играть (пошагово), "
-                  f"какие зоны мозга и навыки развивает, почему это важно именно сейчас. "
-                  f"Только простые игры без специальных игрушек — руки, голос, бытовые предметы."
+        f"Предложи 3-4 научно обоснованные развивающие игры для ребёнка {age_label(months)} ({months} месяцев). "
+        f"Опирайся на теорию Выготского и исследования нейропластичности. "
+        f"Для каждой: название, как играть пошагово, что развивает. "
+        f"Только простые игры без дорогих игрушек."
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё игры", callback_data="mama_games_more")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
+
+@dp.callback_query(F.data == "mama_games_more")
+async def mama_games_more(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала введи данные!", show_alert=True)
+        return
+    _, date_value, _ = user
+    months, _ = calc_child_age(date_value)
+    await call.message.answer("⏳ Подбираю ещё игры...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Предложи ещё 3-4 ДРУГИЕ развивающие игры для ребёнка {age_label(months)} ({months} месяцев). "
+        f"Не повторяй предыдущие игры. Другие виды активности — сенсорные, моторные, речевые или социальные. "
+        f"Для каждой: название, как играть, что развивает."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё игры", callback_data="mama_games_more")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
 
 @dp.callback_query(F.data == "mama_books")
 async def mama_books(call: CallbackQuery):
-    await mama_gpt_handler(
-        call,
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала введи данные!", show_alert=True)
+        return
+    _, date_value, _ = user
+    months, _ = calc_child_age(date_value)
+    await call.message.edit_text("⏳ Подбираю книги...")
+    answer = await ask_gpt(
         EXPERT_BASE,
-        lambda m: f"Порекомендуй 6-8 книг для чтения ребёнку {age_label(m)} ({m} месяцев) "
-                  f"с научным обоснованием выбора. "
-                  f"Объясни почему именно эти книги подходят для данного этапа развития мозга — "
-                  f"ритм, повторения, цвета, объём текста, когнитивная нагрузка. "
-                  f"Также порекомендуй 3-4 книги ДЛЯ МАМ от ведущих специалистов по этому возрасту."
+        f"Порекомендуй 3 книги для чтения ребёнку {age_label(months)} ({months} месяцев). "
+        f"Для каждой: название, автор, почему подходит для этого возраста. "
+        f"И 1 книгу ДЛЯ МАМЫ от ведущего специалиста по этому возрасту."
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё книги", callback_data="mama_books_more")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
+
+@dp.callback_query(F.data == "mama_books_more")
+async def mama_books_more(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала введи данные!", show_alert=True)
+        return
+    _, date_value, _ = user
+    months, _ = calc_child_age(date_value)
+    await call.message.answer("⏳ Подбираю ещё книги...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Порекомендуй ещё 3 ДРУГИЕ книги для ребёнка {age_label(months)} ({months} месяцев). "
+        f"Не повторяй предыдущие. Для каждой: название, автор, почему подходит."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё книги", callback_data="mama_books_more")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
 
 @dp.callback_query(F.data == "mama_health")
 async def mama_health(call: CallbackQuery):
@@ -800,16 +967,44 @@ async def mama_food(call: CallbackQuery):
 
 @dp.callback_query(F.data == "mama_recipes")
 async def mama_recipes(call: CallbackQuery):
-    await mama_gpt_handler(
-        call,
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала введи данные!", show_alert=True)
+        return
+    _, date_value, _ = user
+    months, _ = calc_child_age(date_value)
+    await call.message.edit_text("⏳ Подбираю рецепты...")
+    answer = await ask_gpt(
         EXPERT_BASE,
-        lambda m: f"Составь 4-5 nutritionally balanced рецептов для ребёнка {age_label(m)} ({m} месяцев) "
-                  f"по стандартам ВОЗ и ESPGHAN. "
-                  f"Для каждого рецепта укажи: ингредиенты, способ приготовления, "
-                  f"пищевую ценность (белки/жиры/углеводы), какие витамины и минералы содержит, "
-                  f"почему полезен именно в этом возрасте. "
-                  f"Учитывай только то что разрешено в данном возрасте по протоколам."
+        f"Дай 2 рецепта для ребёнка {age_label(months)} ({months} месяцев) по нормам ВОЗ и ESPGHAN. "
+        f"Для каждого: ингредиенты, способ приготовления, почему полезен в этом возрасте. "
+        f"Только разрешённые продукты для данного возраста."
     )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё рецепты", callback_data="mama_recipes_more")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
+
+@dp.callback_query(F.data == "mama_recipes_more")
+async def mama_recipes_more(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала введи данные!", show_alert=True)
+        return
+    _, date_value, _ = user
+    months, _ = calc_child_age(date_value)
+    await call.message.answer("⏳ Подбираю ещё рецепты...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Дай ещё 2 ДРУГИХ рецепта для ребёнка {age_label(months)} ({months} месяцев). "
+        f"Не повторяй предыдущие. Только разрешённые продукты для этого возраста."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё рецепты", callback_data="mama_recipes_more")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
 
 @dp.callback_query(F.data == "mama_routine")
 async def mama_routine(call: CallbackQuery):
@@ -940,6 +1135,18 @@ async def ask_question(call: CallbackQuery, state: FSMContext):
 async def handle_question(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     await state.clear()
+    # Проверка лимита запросов
+    if not is_premium(message.from_user.id):
+        count = get_request_count(message.from_user.id)
+        if count >= 10:
+            await message.answer(
+                "❓ Ты использовала 10 бесплатных вопросов\n\n"
+                "Для продолжения оформи Премиум — 299 руб/месяц\n"
+                "Безлимитные вопросы + все функции бота!",
+                reply_markup=kb_premium()
+            )
+            return
+        increment_request_count(message.from_user.id)
 
     if user:
         mode, date_value, name = user
@@ -1302,6 +1509,9 @@ def kb_photo_menu():
 
 @dp.callback_query(F.data == "photo_menu")
 async def photo_menu(call: CallbackQuery):
+    if not is_premium(call.from_user.id):
+        await call.message.answer("🔒 Анализ фото доступен в Премиум 💎", reply_markup=kb_premium())
+        return
     await call.message.answer(
         "📸 Анализ фото\n\n"
         "Отправь фото и я помогу разобраться.\n"
@@ -1474,6 +1684,9 @@ async def photo_wrong_input(message: Message, state: FSMContext):
 async def handle_voice(message: Message, state: FSMContext):
     # Сбрасываем любое текущее состояние — голос имеет приоритет
     await state.clear()
+    if not is_premium(message.from_user.id):
+        await message.answer("🔒 Голосовые сообщения доступны в Премиум 💎", reply_markup=kb_premium())
+        return
     user = get_user(message.from_user.id)
     await message.answer("🎤 Слушаю тебя...")
 
@@ -1524,6 +1737,280 @@ async def handle_voice(message: Message, state: FSMContext):
         logging.error(f"Ошибка голоса: {e}")
         await message.answer("Не удалось распознать голос. Попробуй ещё раз или напиши текстом 🤍")
 
+
+
+# ─── ПРЕМИУМ ПРОВЕРКИ ────────────────────────────────────────
+async def premium_gate(call: CallbackQuery, target_cb: str):
+    if is_premium(call.from_user.id):
+        # Разблокировано — вызываем нужный обработчик
+        await call.data.__class__
+        call.data = target_cb
+        await dp.process_update(call._bot if hasattr(call, "_bot") else call)
+    else:
+        await call.message.answer(
+            "🔒 Эта функция доступна в Премиум\n\n"
+            "💎 Премиум — 299 руб/месяц\n"
+            "Открывает все трекеры, анализ фото, голос и безлимитные вопросы.",
+            reply_markup=kb_premium()
+        )
+
+@dp.callback_query(F.data == "check_premium_vaccines")
+async def check_prem_vaccines(call: CallbackQuery):
+    if is_premium(call.from_user.id):
+        await tracker_vaccines(call)
+    else:
+        await call.message.answer("🔒 Прививочный календарь доступен в Премиум 💎", reply_markup=kb_premium())
+
+@dp.callback_query(F.data == "check_premium_growth")
+async def check_prem_growth(call: CallbackQuery):
+    if is_premium(call.from_user.id):
+        await tracker_growth(call)
+    else:
+        await call.message.answer("🔒 Трекер роста и веса доступен в Премиум 💎", reply_markup=kb_premium())
+
+@dp.callback_query(F.data == "check_premium_symptoms")
+async def check_prem_symptoms(call: CallbackQuery):
+    if is_premium(call.from_user.id):
+        await tracker_symptoms(call)
+    else:
+        await call.message.answer("🔒 Трекер симптомов доступен в Премиум 💎", reply_markup=kb_premium())
+
+@dp.callback_query(F.data == "check_premium_feeding")
+async def check_prem_feeding(call: CallbackQuery):
+    if is_premium(call.from_user.id):
+        await tracker_feeding(call)
+    else:
+        await call.message.answer("🔒 Трекер кормлений доступен в Премиум 💎", reply_markup=kb_premium())
+
+@dp.callback_query(F.data == "check_premium_sleep")
+async def check_prem_sleep(call: CallbackQuery):
+    if is_premium(call.from_user.id):
+        await tracker_sleep(call)
+    else:
+        await call.message.answer("🔒 Дневник сна доступен в Премиум 💎", reply_markup=kb_premium())
+
+@dp.callback_query(F.data == "check_premium_benefits")
+async def check_prem_benefits(call: CallbackQuery):
+    if is_premium(call.from_user.id):
+        await benefits_menu(call)
+    else:
+        await call.message.answer("🔒 Пособия и выплаты доступны в Премиум 💎", reply_markup=kb_premium())
+
+# ─── GOOGLE SHEETS ───────────────────────────────────────────
+def sheets_add_user(user_id, username, first_name, mode=""):
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        try:
+            sheet = spreadsheet.worksheet("МамаБот")
+        except:
+            sheet = spreadsheet.add_worksheet(title="МамаБот", rows=1000, cols=10)
+            sheet.append_row(["ID", "Username", "Имя", "Режим", "Подписка", "Дата регистрации"])
+        data = sheet.get_all_values()
+        ids = [row[0] for row in data[1:]]
+        if str(user_id) not in ids:
+            sheet.append_row([str(user_id), username or "", first_name or "", mode, "Бесплатно", datetime.now().strftime("%d.%m.%Y %H:%M")])
+    except Exception as e:
+        logging.error(f"Sheets add_user error: {e}")
+
+def sheets_add_review(user_id, username, text, sheet_name="Отзывы МамаБот"):
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        try:
+            sheet = spreadsheet.worksheet(sheet_name)
+        except:
+            sheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=5)
+            sheet.append_row(["ID", "Username", "Текст", "Дата"])
+        sheet.append_row([str(user_id), username or "", text, datetime.now().strftime("%d.%m.%Y %H:%M")])
+    except Exception as e:
+        logging.error(f"Sheets add_review error: {e}")
+
+def sheets_update_subscription(user_id, plan):
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        sheet = spreadsheet.worksheet("МамаБот")
+        data = sheet.get_all_values()
+        for i, row in enumerate(data):
+            if row[0] == str(user_id):
+                sheet.update_cell(i + 1, 5, "💎 Премиум")
+                break
+    except Exception as e:
+        logging.error(f"Sheets update_sub error: {e}")
+
+# ─── ЮКАССА ПЛАТЕЖИ ──────────────────────────────────────────
+def kb_premium():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Оформить Премиум — 299 руб/мес", callback_data="pay_premium")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
+    ])
+
+async def create_payment_mama(user_id):
+    payment = Payment.create({
+        "amount": {"value": "299.00", "currency": "RUB"},
+        "confirmation": {"type": "redirect", "return_url": "https://t.me/MaminPomoshnikAI_bot"},
+        "capture": True,
+        "description": f"Мамин помощник Премиум 30 дней — {user_id}",
+        "receipt": {
+            "customer": {"email": "client@maminpomoshnik.ru"},
+            "items": [{
+                "description": "Мамин помощник Премиум 30 дней",
+                "quantity": "1.00",
+                "amount": {"value": "299.00", "currency": "RUB"},
+                "vat_code": 1,
+                "payment_subject": "service",
+                "payment_mode": "full_payment"
+            }]
+        },
+        "metadata": {"user_id": user_id, "plan": "mama_premium"}
+    }, str(uuid.uuid4()))
+    return payment
+
+async def check_payments_loop():
+    while True:
+        await asyncio.sleep(15)
+        try:
+            pending = get_pending_payments()
+            for payment_id, user_id, plan in pending:
+                try:
+                    payment = Payment.find_one(payment_id)
+                    if payment.status == "succeeded":
+                        set_subscription(user_id, plan, 30)
+                        delete_pending_payment(payment_id)
+                        import asyncio as aio
+                        aio.create_task(aio.to_thread(sheets_update_subscription, user_id, plan))
+                        await bot.send_message(
+                            user_id,
+                            "✅ Оплата прошла успешно!\n\n"
+                            "💎 Премиум активирован на 30 дней.\n\n"
+                            "Все функции разблокированы — пользуйся на здоровье! 🤍",
+                            reply_markup=kb_mama_menu() if get_user(user_id) and get_user(user_id)[0] == "mama" else kb_pregnant_menu()
+                        )
+                    elif payment.status == "canceled":
+                        delete_pending_payment(payment_id)
+                except Exception as e:
+                    logging.error(f"Ошибка проверки платежа {payment_id}: {e}")
+        except Exception as e:
+            logging.error(f"Ошибка check_payments_loop: {e}")
+
+@dp.callback_query(F.data == "pay_premium")
+async def pay_premium(call: CallbackQuery):
+    user_id = call.from_user.id
+    try:
+        payment = await create_payment_mama(user_id)
+        save_pending_payment(payment.id, user_id, "mama_premium")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить 299 руб", url=payment.confirmation.confirmation_url)],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")]
+        ])
+        await call.message.answer(
+            "💎 Премиум подписка — 299 руб/месяц\n\n"
+            "Что открывается:\n"
+            "🎤 Голосовые сообщения\n"
+            "📸 Анализ фото\n"
+            "📏 Все трекеры\n"
+            "💉 Прививочный календарь\n"
+            "💰 Подбор пособий\n"
+            "❓ Безлимитные вопросы GPT\n\n"
+            "После оплаты всё активируется автоматически!",
+            reply_markup=kb
+        )
+    except Exception as e:
+        logging.error(f"Ошибка создания платежа: {e}")
+        await call.message.answer("Ошибка при создании платежа. Напиши в поддержку " + SUPPORT_USERNAME)
+
+@dp.callback_query(F.data == "show_premium")
+async def show_premium(call: CallbackQuery):
+    await call.message.answer(
+        "🔒 Эта функция доступна в Премиум\n\n"
+        "💎 Премиум — 299 руб/месяц\n"
+        "Открывает все функции бота без ограничений.",
+        reply_markup=kb_premium()
+    )
+
+# ─── ПОДДЕРЖКА И ОТЗЫВЫ ──────────────────────────────────────
+class SupportStates(StatesGroup):
+    waiting_support = State()
+    waiting_review = State()
+    waiting_suggestion = State()
+
+@dp.callback_query(F.data == "support_menu")
+async def support_menu(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆘 Написать в поддержку", callback_data="support_write")],
+        [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data="review_write")],
+        [InlineKeyboardButton(text="💡 Предложить идею", callback_data="suggestion_write")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
+    ])
+    await call.message.answer(
+        "🤍 Поддержка и обратная связь\n\n"
+        "Мы рады каждому отзыву и предложению!",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "support_write")
+async def support_write(call: CallbackQuery, state: FSMContext):
+    await state.set_state(SupportStates.waiting_support)
+    await call.message.answer(
+        "🆘 Напиши своё сообщение — я перешлю его команде поддержки.\n\n"
+        "Опиши проблему подробно 👇"
+    )
+
+@dp.message(SupportStates.waiting_support, F.text)
+async def support_send(message: Message, state: FSMContext):
+    await state.clear()
+    username = message.from_user.username or "нет"
+    name = message.from_user.first_name or ""
+    try:
+        await bot.send_message(
+            SUPPORT_USERNAME,
+            f"🆘 Обращение в поддержку\n"
+            f"Бот: {BOT_NAME}\n"
+            f"От: {name} (@{username}, ID: {message.from_user.id})\n\n"
+            f"{message.text}"
+        )
+    except Exception as e:
+        logging.error(f"Support send error: {e}")
+    await message.answer(
+        "✅ Сообщение отправлено! Мы ответим в ближайшее время.\n\n"
+        f"Или напиши напрямую: {SUPPORT_USERNAME}",
+        reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start()
+    )
+
+@dp.callback_query(F.data == "review_write")
+async def review_write(call: CallbackQuery, state: FSMContext):
+    await state.set_state(SupportStates.waiting_review)
+    await call.message.answer("⭐ Напиши свой отзыв о боте 💕")
+
+@dp.message(SupportStates.waiting_review, F.text)
+async def review_send(message: Message, state: FSMContext):
+    await state.clear()
+    import threading
+    threading.Thread(target=sheets_add_review, args=(
+        message.from_user.id, message.from_user.username, message.text, "Отзывы МамаБот"
+    )).start()
+    await message.answer("⭐ Спасибо за отзыв! Это очень важно для нас 💕", reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start())
+
+@dp.callback_query(F.data == "suggestion_write")
+async def suggestion_write(call: CallbackQuery, state: FSMContext):
+    await state.set_state(SupportStates.waiting_suggestion)
+    await call.message.answer("💡 Напиши свою идею — что добавить или улучшить в боте?")
+
+@dp.message(SupportStates.waiting_suggestion, F.text)
+async def suggestion_send(message: Message, state: FSMContext):
+    await state.clear()
+    import threading
+    threading.Thread(target=sheets_add_review, args=(
+        message.from_user.id, message.from_user.username, message.text, "Предложения МамаБот"
+    )).start()
+    await message.answer("💡 Спасибо за идею! Мы обязательно рассмотрим её 🤍", reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start())
 
 # ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
 
@@ -1889,10 +2376,9 @@ async def vaccines_create(call: CallbackQuery):
 
     added = 0
     for month_age, vaccine in schedule:
-        if month_age >= months:
-            vac_date = (birth + __import__('datetime').timedelta(days=month_age*30)).strftime("%d.%m.%Y")
-            save_vaccination(call.from_user.id, vaccine, vac_date)
-            added += 1
+        vac_date = (birth + __import__('datetime').timedelta(days=month_age*30)).strftime("%d.%m.%Y")
+        save_vaccination(call.from_user.id, vaccine, vac_date)
+        added += 1
 
     await call.message.answer(
         f"✅ Календарь создан! Добавлено {added} прививок.\n\n"
@@ -1902,15 +2388,63 @@ async def vaccines_create(call: CallbackQuery):
 
 @dp.callback_query(F.data == "vaccines_info")
 async def vaccines_info(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💉 БЦЖ", callback_data="vac_bcg"),
+         InlineKeyboardButton(text="💉 Гепатит B", callback_data="vac_hepb")],
+        [InlineKeyboardButton(text="💉 АКДС", callback_data="vac_akds"),
+         InlineKeyboardButton(text="💉 Полиомиелит", callback_data="vac_polio")],
+        [InlineKeyboardButton(text="💉 Пневмококк", callback_data="vac_pneumo"),
+         InlineKeyboardButton(text="💉 КПК", callback_data="vac_kpk")],
+        [InlineKeyboardButton(text="💉 Ветрянка", callback_data="vac_varicella")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="tracker_vaccines")]
+    ])
+    await call.message.answer("Выбери прививку чтобы узнать подробнее 👇", reply_markup=kb)
+
+async def vaccine_detail(call, vaccine_name, description):
     await call.message.answer("⏳ Подбираю информацию...")
     answer = await ask_gpt(
         EXPERT_BASE,
-        "Дай понятное объяснение основных прививок из национального календаря РФ для детей до 2 лет. "
-        "Для каждой прививки: название, от чего защищает, почему важна, возможные реакции и как с ними справляться. "
-        "БЦЖ, Гепатит B, АКДС, Полиомиелит, Пневмококк, КПК, Ветрянка. "
-        "Развенчай главные мифы о прививках с научными аргументами."
+        f"Дай подробное научное объяснение прививки {vaccine_name} для родителей. "
+        f"1) От чего защищает и насколько опасна болезнь без прививки; "
+        f"2) Как работает вакцина — механизм иммунитета; "
+        f"3) Когда делают и сколько доз нужно; "
+        f"4) Как подготовить ребёнка — за день до и в день прививки; "
+        f"5) Нормальные реакции — что ожидать в первые дни; "
+        f"6) Красные флаги — когда срочно к врачу; "
+        f"7) Развенчай главные мифы о этой прививке с научными аргументами."
     )
-    await call.message.answer(answer, reply_markup=kb_mama_menu())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К прививкам", callback_data="vaccines_info")]
+    ])
+    await send_long_message(call.message.chat.id, answer, reply_markup=kb)
+
+@dp.callback_query(F.data == "vac_bcg")
+async def vac_bcg(call: CallbackQuery):
+    await vaccine_detail(call, "БЦЖ (туберкулёз)", "")
+
+@dp.callback_query(F.data == "vac_hepb")
+async def vac_hepb(call: CallbackQuery):
+    await vaccine_detail(call, "Гепатит B", "")
+
+@dp.callback_query(F.data == "vac_akds")
+async def vac_akds(call: CallbackQuery):
+    await vaccine_detail(call, "АКДС (коклюш, дифтерия, столбняк)", "")
+
+@dp.callback_query(F.data == "vac_polio")
+async def vac_polio(call: CallbackQuery):
+    await vaccine_detail(call, "Полиомиелит", "")
+
+@dp.callback_query(F.data == "vac_pneumo")
+async def vac_pneumo(call: CallbackQuery):
+    await vaccine_detail(call, "Пневмококковая инфекция", "")
+
+@dp.callback_query(F.data == "vac_kpk")
+async def vac_kpk(call: CallbackQuery):
+    await vaccine_detail(call, "КПК (корь, паротит, краснуха)", "")
+
+@dp.callback_query(F.data == "vac_varicella")
+async def vac_varicella(call: CallbackQuery):
+    await vaccine_detail(call, "Ветряная оспа", "")
 
 # ─── ПОСОБИЯ И ВЫПЛАТЫ ───────────────────────────────────────
 @dp.callback_query(F.data == "benefits_menu")
@@ -2032,6 +2566,7 @@ async def main():
     scheduler.add_job(post_night,     "cron", hour=20, minute=0)
     scheduler.start()
     logging.info("Мамин помощник запущен!")
+    asyncio.create_task(check_payments_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
