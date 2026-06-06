@@ -98,27 +98,38 @@ async def send_to_channel(text):
 # ========== КНОПКИ ==========
 def main_menu_buttons():
     return [
-        [{"type": "callback", "text": "📋 Первые дни", "payload": "firstdays"},
-         {"type": "callback", "text": "🤱 Грудное ВС", "payload": "breastfeeding"}],
-        [{"type": "callback", "text": "🏥 Восстановление", "payload": "recovery"},
-         {"type": "callback", "text": "📊 Развитие", "payload": "development"}],
-        [{"type": "callback", "text": "🌡 Здоровье", "payload": "health"},
-         {"type": "callback", "text": "🍼 Питание", "payload": "food"}],
+        [{"type": "callback", "text": "📋 Первые дни с малышом", "payload": "firstdays"}],
+        [{"type": "callback", "text": "🤱 Грудное вскармливание", "payload": "breastfeeding"}],
+        [{"type": "callback", "text": "🏥 Восстановление мамы", "payload": "recovery"}],
+        [{"type": "callback", "text": "📊 Развитие по возрасту", "payload": "development"},
+         {"type": "callback", "text": "🎮 Игры и занятия", "payload": "games"}],
+        [{"type": "callback", "text": "📚 Что читать", "payload": "books"},
+         {"type": "callback", "text": "🌡 Здоровье", "payload": "health"}],
+        [{"type": "callback", "text": "💊 Лекарства", "payload": "meds"},
+         {"type": "callback", "text": "🦷 Зубки", "payload": "teeth"}],
+        [{"type": "callback", "text": "🍼 Питание и прикорм", "payload": "food"},
+         {"type": "callback", "text": "🥣 Рецепты", "payload": "recipes"}],
         [{"type": "callback", "text": "🌙 Режим дня", "payload": "routine"},
-         {"type": "callback", "text": "😴 Сон", "payload": "sleep"}],
-        [{"type": "callback", "text": "😢 Истерики", "payload": "tantrums"},
-         {"type": "callback", "text": "🧠 Эмоции мамы", "payload": "emotions"}],
+         {"type": "callback", "text": "😴 Проблемы со сном", "payload": "sleep"}],
+        [{"type": "callback", "text": "😢 Истерики и капризы", "payload": "tantrums"},
+         {"type": "callback", "text": "👨‍👩‍👧 Отношения в семье", "payload": "family"}],
+        [{"type": "callback", "text": "🧠 Эмоции мамы", "payload": "emotions"},
+         {"type": "callback", "text": "📓 Дневник малыша", "payload": "diary"}],
         [{"type": "callback", "text": "❓ Задать вопрос", "payload": "ask"}],
         [{"type": "callback", "text": "━━━ 💎 ПРЕМИУМ ━━━", "payload": "premium_info"}],
         [{"type": "callback", "text": "🧠 Мамин психолог 🔒", "payload": "psycho"},
          {"type": "callback", "text": "📸 Анализ фото 🔒", "payload": "photo_menu"}],
         [{"type": "callback", "text": "📏 Рост и вес 🔒", "payload": "growth"},
          {"type": "callback", "text": "🌡 Трекер симптомов 🔒", "payload": "symptoms"}],
+        [{"type": "callback", "text": "🤱 Трекер кормлений 🔒", "payload": "feeding"},
+         {"type": "callback", "text": "🌙 Дневник сна 🔒", "payload": "sleep_log"}],
         [{"type": "callback", "text": "💉 Прививки 🔒", "payload": "vaccines"},
          {"type": "callback", "text": "💰 Пособия 🔒", "payload": "benefits"}],
         [{"type": "callback", "text": "💎 Оформить Премиум", "payload": "pay_premium"}],
         [{"type": "callback", "text": "⭐ Отзыв", "payload": "review"},
          {"type": "link", "text": "🆘 Поддержка", "url": SUPPORT_URL}],
+        [{"type": "callback", "text": "🔄 Изменить данные", "payload": "change_data"},
+         {"type": "callback", "text": "🏠 Главная", "payload": "main_menu"}],
     ]
 
 def back_button():
@@ -554,6 +565,309 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         await send_message(chat_id, WELCOME_TEXT.format(name=name), status_buttons())
         return
 
+
+    # ─── ГЛАВНАЯ И ИЗМЕНИТЬ ДАННЫЕ ───────────────────────────
+    if payload == "main_menu":
+        set_step(user_id, "idle")
+        await send_message(chat_id, WELCOME_TEXT.format(name=first_name or "мама"),
+            [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
+              {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+        return
+
+    if payload == "change_data":
+        set_step(user_id, "idle")
+        await send_message(chat_id, "Выбери свой статус 👇",
+            [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
+              {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+        return
+
+    # ─── БЕСПЛАТНЫЕ РАЗДЕЛЫ ──────────────────────────────────
+    if payload == "games":
+        await send_message(chat_id, "⏳ Подбираю игры...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Предложи 3-4 развивающие игры для ребёнка {m_label} по теории Выготского. "
+            f"Для каждой: название, как играть, что развивает. Простые, без дорогих игрушек.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё игры", "payload": "games_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "games_more":
+        await send_message(chat_id, "⏳ Подбираю ещё игры...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Предложи ещё 3-4 ДРУГИЕ игры для ребёнка {m_label}. Не повторяй предыдущие.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё игры", "payload": "games_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "books":
+        await send_message(chat_id, "⏳ Подбираю книги...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Порекомендуй 3 книги для ребёнка {m_label} с обоснованием. И 1 книгу для мамы.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё книги", "payload": "books_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "books_more":
+        await send_message(chat_id, "⏳ Подбираю ещё книги...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Ещё 3 ДРУГИЕ книги для ребёнка {m_label}. Не повторяй предыдущие.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё книги", "payload": "books_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "meds":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Расскажи о лекарствах для ребёнка {m_label} по стандартам AAP: "
+            f"жаропонижающие, колики, зубы, простуда. Конкретные дозы — только у врача.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    if payload == "teeth":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Расскажи о зубах ребёнка {m_label}: хронология прорезывания по ВОЗ, "
+            f"симптомы, как помочь, уход. Что НЕ работает по позиции AAP.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    if payload == "recipes":
+        await send_message(chat_id, "⏳ Подбираю рецепты...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Дай 2 рецепта для ребёнка {m_label} по нормам ВОЗ и ESPGHAN. "
+            f"Ингредиенты, способ приготовления, почему полезно.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё рецепты", "payload": "recipes_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "recipes_more":
+        await send_message(chat_id, "⏳ Подбираю ещё рецепты...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Ещё 2 ДРУГИХ рецепта для ребёнка {m_label}. Не повторяй предыдущие.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё рецепты", "payload": "recipes_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "family":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Расскажи об отношениях в семье когда ребёнку {m_label}: "
+            f"роль папы, отношения с партнёром по Готтману, ревность старших, бабушки.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    if payload == "diary":
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "✏️ Добавить запись", "payload": "diary_add"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        if entries:
+            text = "📓 Дневник малыша\n\n"
+            for entry, dt in entries[:5]:
+                d = datetime.fromisoformat(dt).strftime("%d.%m.%Y")
+                text += f"📅 {d}\n{entry}\n\n"
+        else:
+            text = "📓 Дневник малыша\n\nЗаписей пока нет. Начни фиксировать важные моменты!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "diary_add":
+        set_step(user_id, "diary_add")
+        await send_message(chat_id, "📓 Напиши запись в дневник\n\nНапример: первый зуб, первый шаг, смешной момент 💕")
+        return
+
+    if payload == "emotions":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            "Расскажи о послеродовой депрессии, беби-блюзе, материнском выгорании по DSM-5 и ВОЗ. "
+            "Как распознать, что делать, когда к специалисту. Тепло и без осуждения.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    # ─── ПЕРВЫЕ ДНИ — ПОДМЕНЮ ────────────────────────────────
+    if payload == "firstdays":
+        buttons = [
+            [{"type": "callback", "text": "👨‍⚕️ Первый осмотр педиатра", "payload": "fd_pediatr"}],
+            [{"type": "callback", "text": "📄 Свидетельство о рождении", "payload": "fd_svid"}],
+            [{"type": "callback", "text": "🤸 Массаж и гимнастика", "payload": "fd_massage"}],
+            [{"type": "callback", "text": "🏊 Плавание с малышом", "payload": "fd_swim"}],
+            [{"type": "callback", "text": "🩺 Обходы врачей по месяцам", "payload": "fd_doctors"}],
+            [{"type": "callback", "text": "🏫 Запись в садик", "payload": "fd_sadik"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "📋 Первые дни с малышом\n\nЧто нужно знать и сделать после рождения 👇", buttons)
+        return
+
+    fd_map = {
+        "fd_pediatr": "Расскажи о первом осмотре педиатра после выписки: когда придёт по закону, как вызвать, что проверяет, какие вопросы задать.",
+        "fd_svid": "Расскажи как оформить документы на новорождённого в России: свидетельство о рождении (ЗАГС/МФЦ/Госуслуги), ОМС, СНИЛС, пособия, материнский капитал. Пошагово.",
+        "fd_massage": "Расскажи о массаже и гимнастике для младенцев: с какого возраста, виды, техника для мамы дома, массаж при коликах, противопоказания.",
+        "fd_swim": "Расскажи о плавании с младенцем: рефлекс плавания, польза, как организовать дома, температура воды, когда можно в бассейн.",
+        "fd_doctors": "Составь календарь обходов врачей от рождения до 1 года: по месяцам, какие врачи, анализы, прививки по национальному календарю РФ.",
+        "fd_sadik": "Расскажи как записать ребёнка в детский сад в России: когда вставать в очередь, как через Госуслуги, документы, льготные очереди.",
+    }
+    for fd_key, fd_prompt in fd_map.items():
+        if payload == fd_key:
+            await send_message(chat_id, "⏳ Подбираю информацию...")
+            answer = await generate_text(EXPERT_BASE, fd_prompt)
+            await send_message(chat_id, answer,
+                [[{"type": "callback", "text": "🔙 К первым дням", "payload": "firstdays"},
+                  {"type": "callback", "text": "🏠 В меню", "payload": "back_menu"}]])
+            return
+
+    # ─── ГРУДНОЕ ВСКАРМЛИВАНИЕ — ПОДМЕНЮ ─────────────────────
+    if payload == "breastfeeding":
+        buttons = [
+            [{"type": "callback", "text": "🍼 Как наладить ГВ", "payload": "bf_start"}],
+            [{"type": "callback", "text": "🥛 Молока мало — расцедить", "payload": "bf_pump"}],
+            [{"type": "callback", "text": "🔴 Уплотнения и лактостаз", "payload": "bf_lactostaz"}],
+            [{"type": "callback", "text": "🥗 Питание мамы при ГВ", "payload": "bf_food"}],
+            [{"type": "callback", "text": "❌ Что нельзя при ГВ", "payload": "bf_nofood"}],
+            [{"type": "callback", "text": "🔄 Переход на смесь", "payload": "bf_formula"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "🤱 Грудное вскармливание\n\nНаучная поддержка на каждом этапе 💕", buttons)
+        return
+
+    bf_map = {
+        "bf_start": "Руководство по налаживанию ГВ по ВОЗ и ЮНИСЕФ: первое прикладывание, правильный захват, позиции, признаки что молока хватает, молозиво.",
+        "bf_pump": "Как увеличить лактацию и расцедиться: причины нехватки молока, ручное сцеживание пошагово, молокоотсос, питание мамы, лактогонные по науке.",
+        "bf_lactostaz": "Лактостаз и уплотнения: чем отличается от мастита, первая помощь, техника массажа, расцеживание, тепло или холод по доказательной медицине, красные флаги.",
+        "bf_food": "Питание кормящей мамы по ВОЗ: что обязательно включить, витамины, водный режим, развенчание мифов о диете при ГВ.",
+        "bf_nofood": "Что нельзя при ГВ: алкоголь, кофеин, аллергены, лекарства (LactMed), что влияет на вкус молока. Развенчай мифы об избыточных ограничениях.",
+        "bf_formula": "Переход на смесь: медицинские показания, как правильно завершить ГВ, как выбрать смесь, как разводить, смешанное вскармливание. Без осуждения.",
+    }
+    for bf_key, bf_prompt in bf_map.items():
+        if payload == bf_key:
+            await send_message(chat_id, "⏳ Подбираю информацию...")
+            answer = await generate_text(EXPERT_BASE, bf_prompt)
+            await send_message(chat_id, answer,
+                [[{"type": "callback", "text": "🔙 К ГВ", "payload": "breastfeeding"},
+                  {"type": "callback", "text": "🏠 В меню", "payload": "back_menu"}]])
+            return
+
+    # ─── ВОССТАНОВЛЕНИЕ — ПОДМЕНЮ ────────────────────────────
+    if payload == "recovery":
+        buttons = [
+            [{"type": "callback", "text": "🌸 После естественных родов", "payload": "rec_natural"}],
+            [{"type": "callback", "text": "🏥 После кесарева сечения", "payload": "rec_caesar"}],
+            [{"type": "callback", "text": "💪 Физическая активность", "payload": "rec_sport"}],
+            [{"type": "callback", "text": "❤️ Интимная жизнь", "payload": "rec_intimate"}],
+            [{"type": "callback", "text": "💇 Выпадение волос", "payload": "rec_hair"}],
+            [{"type": "callback", "text": "🏋️ Диастаз", "payload": "rec_diastaz"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "🏥 Восстановление мамы после родов\n\nТвоё здоровье так же важно как здоровье малыша 💕", buttons)
+        return
+
+    rec_map = {
+        "rec_natural": "Восстановление после естественных родов: первые 24 часа, лохии — нормы и красные флаги, швы и разрывы, восстановление матки, боль, туалет, геморрой.",
+        "rec_caesar": "Восстановление после кесарева сечения: первые дни, уход за швом, когда снимают, ограничения (тяжести, секс, спорт), рубец, следующая беременность.",
+        "rec_sport": "Возвращение к физической активности: сроки после естественных и КС, упражнения Кегеля, диастаз — как проверить, запрещённые упражнения при диастазе, план по месяцам.",
+        "rec_intimate": "Интимная жизнь после родов: когда можно по ACOG, почему боль и дискомфорт, сухость при ГВ, психологический аспект, контрацепция при ГВ. Деликатно.",
+        "rec_hair": "Послеродовое выпадение волос: почему происходит (телогеновая фаза), нормальные сроки, что реально помогает, что миф, когда к трихологу.",
+        "rec_diastaz": "Диастаз после родов: что это, как проверить самостоятельно, степени, запрещённые упражнения, что помогает, бандаж, когда операция.",
+    }
+    for rec_key, rec_prompt in rec_map.items():
+        if payload == rec_key:
+            await send_message(chat_id, "⏳ Подбираю информацию...")
+            answer = await generate_text(EXPERT_BASE, rec_prompt)
+            await send_message(chat_id, answer,
+                [[{"type": "callback", "text": "🔙 К восстановлению", "payload": "recovery"},
+                  {"type": "callback", "text": "🏠 В меню", "payload": "back_menu"}]])
+            return
+
+    # ─── ТРЕКЕР КОРМЛЕНИЙ ────────────────────────────────────
+    if payload == "feeding":
+        plan, _ = get_subscription(user_id)
+        if plan != "mama_premium":
+            await send_message(chat_id, "🔒 Трекер кормлений доступен в Премиум 💎", upgrade_buttons())
+            return
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? AND entry LIKE 'КОРМ:%' ORDER BY created_at DESC LIMIT 5",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "🤱 Левая грудь", "payload": "feed_left"},
+             {"type": "callback", "text": "🤱 Правая грудь", "payload": "feed_right"}],
+            [{"type": "callback", "text": "🍼 Смесь/бутылочка", "payload": "feed_bottle"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        text = "🤱 Трекер кормлений\n\n"
+        if entries:
+            for entry, dt in entries:
+                d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+                text += f"📅 {d} — {entry.replace('КОРМ:', '')}\n"
+        else:
+            text += "Записей нет. Нажми кнопку после каждого кормления!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    for feed_type in ["feed_left", "feed_right", "feed_bottle"]:
+        if payload == feed_type:
+            names = {"feed_left": "Левая грудь", "feed_right": "Правая грудь", "feed_bottle": "Смесь/бутылочка"}
+            set_step(user_id, f"feed_duration_{feed_type}")
+            await send_message(chat_id, f"⏱ Сколько минут кормила? ({names[feed_type]})\nВведи число:")
+            return
+
+    # ─── ДНЕВНИК СНА ─────────────────────────────────────────
+    if payload == "sleep_log":
+        plan, _ = get_subscription(user_id)
+        if plan != "mama_premium":
+            await send_message(chat_id, "🔒 Дневник сна доступен в Премиум 💎", upgrade_buttons())
+            return
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? AND entry LIKE 'СОН:%' ORDER BY created_at DESC LIMIT 6",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "😴 Уснул", "payload": "sleep_start"},
+             {"type": "callback", "text": "🌅 Проснулся", "payload": "sleep_end"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        text = "🌙 Дневник сна\n\n"
+        if entries:
+            for entry, dt in entries:
+                d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+                action = entry.replace("СОН:", "")
+                emoji = "😴" if "уснул" in action else "🌅"
+                text += f"{emoji} {d} — {action}\n"
+        else:
+            text += "Записей нет. Нажимай когда малыш засыпает и просыпается!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "sleep_start":
+        conn = sqlite3.connect(DB)
+        conn.execute("INSERT INTO diary (user_id, entry, created_at) VALUES (?,?,?)",
+                     (user_id, "СОН:уснул", datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        await send_message(chat_id, "😴 Записала — малыш уснул!", back_button())
+        return
+
+    if payload == "sleep_end":
+        conn = sqlite3.connect(DB)
+        conn.execute("INSERT INTO diary (user_id, entry, created_at) VALUES (?,?,?)",
+                     (user_id, "СОН:проснулся", datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        await send_message(chat_id, "🌅 Записала — малыш проснулся!", back_button())
+        return
+
     await send_message(chat_id, "Выбери действие из меню 👇", main_menu_buttons())
 
 # ========== ОБРАБОТКА КНОПОК ==========
@@ -564,6 +878,9 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     date_value = user.get("date_value", "")
     months = calc_child_age(date_value) if mode == "mama" and date_value else None
     weeks = calc_pregnancy_weeks(date_value) if mode == "pregnant" and date_value else None
+    m_label = age_label(months) if months is not None else "неизвестного возраста"
+    if mode == "pregnant" and weeks:
+        m_label = f"на {weeks} неделе беременности"
 
     if payload == "back_menu":
         set_step(user_id, "idle")
@@ -777,6 +1094,309 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "review":
         set_step(user_id, "review")
         await send_message(chat_id, "⭐ Напиши свой отзыв о боте 💕")
+        return
+
+
+    # ─── ГЛАВНАЯ И ИЗМЕНИТЬ ДАННЫЕ ───────────────────────────
+    if payload == "main_menu":
+        set_step(user_id, "idle")
+        await send_message(chat_id, WELCOME_TEXT.format(name=first_name or "мама"),
+            [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
+              {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+        return
+
+    if payload == "change_data":
+        set_step(user_id, "idle")
+        await send_message(chat_id, "Выбери свой статус 👇",
+            [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
+              {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+        return
+
+    # ─── БЕСПЛАТНЫЕ РАЗДЕЛЫ ──────────────────────────────────
+    if payload == "games":
+        await send_message(chat_id, "⏳ Подбираю игры...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Предложи 3-4 развивающие игры для ребёнка {m_label} по теории Выготского. "
+            f"Для каждой: название, как играть, что развивает. Простые, без дорогих игрушек.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё игры", "payload": "games_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "games_more":
+        await send_message(chat_id, "⏳ Подбираю ещё игры...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Предложи ещё 3-4 ДРУГИЕ игры для ребёнка {m_label}. Не повторяй предыдущие.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё игры", "payload": "games_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "books":
+        await send_message(chat_id, "⏳ Подбираю книги...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Порекомендуй 3 книги для ребёнка {m_label} с обоснованием. И 1 книгу для мамы.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё книги", "payload": "books_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "books_more":
+        await send_message(chat_id, "⏳ Подбираю ещё книги...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Ещё 3 ДРУГИЕ книги для ребёнка {m_label}. Не повторяй предыдущие.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё книги", "payload": "books_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "meds":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Расскажи о лекарствах для ребёнка {m_label} по стандартам AAP: "
+            f"жаропонижающие, колики, зубы, простуда. Конкретные дозы — только у врача.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    if payload == "teeth":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Расскажи о зубах ребёнка {m_label}: хронология прорезывания по ВОЗ, "
+            f"симптомы, как помочь, уход. Что НЕ работает по позиции AAP.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    if payload == "recipes":
+        await send_message(chat_id, "⏳ Подбираю рецепты...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Дай 2 рецепта для ребёнка {m_label} по нормам ВОЗ и ESPGHAN. "
+            f"Ингредиенты, способ приготовления, почему полезно.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё рецепты", "payload": "recipes_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "recipes_more":
+        await send_message(chat_id, "⏳ Подбираю ещё рецепты...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Ещё 2 ДРУГИХ рецепта для ребёнка {m_label}. Не повторяй предыдущие.")
+        await send_message(chat_id, answer,
+            [[{"type": "callback", "text": "➕ Ещё рецепты", "payload": "recipes_more"},
+              {"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
+        return
+
+    if payload == "family":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            f"Расскажи об отношениях в семье когда ребёнку {m_label}: "
+            f"роль папы, отношения с партнёром по Готтману, ревность старших, бабушки.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    if payload == "diary":
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "✏️ Добавить запись", "payload": "diary_add"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        if entries:
+            text = "📓 Дневник малыша\n\n"
+            for entry, dt in entries[:5]:
+                d = datetime.fromisoformat(dt).strftime("%d.%m.%Y")
+                text += f"📅 {d}\n{entry}\n\n"
+        else:
+            text = "📓 Дневник малыша\n\nЗаписей пока нет. Начни фиксировать важные моменты!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "diary_add":
+        set_step(user_id, "diary_add")
+        await send_message(chat_id, "📓 Напиши запись в дневник\n\nНапример: первый зуб, первый шаг, смешной момент 💕")
+        return
+
+    if payload == "emotions":
+        await send_message(chat_id, "⏳ Подбираю информацию...")
+        answer = await generate_text(EXPERT_BASE,
+            "Расскажи о послеродовой депрессии, беби-блюзе, материнском выгорании по DSM-5 и ВОЗ. "
+            "Как распознать, что делать, когда к специалисту. Тепло и без осуждения.")
+        await send_message(chat_id, answer, back_button())
+        return
+
+    # ─── ПЕРВЫЕ ДНИ — ПОДМЕНЮ ────────────────────────────────
+    if payload == "firstdays":
+        buttons = [
+            [{"type": "callback", "text": "👨‍⚕️ Первый осмотр педиатра", "payload": "fd_pediatr"}],
+            [{"type": "callback", "text": "📄 Свидетельство о рождении", "payload": "fd_svid"}],
+            [{"type": "callback", "text": "🤸 Массаж и гимнастика", "payload": "fd_massage"}],
+            [{"type": "callback", "text": "🏊 Плавание с малышом", "payload": "fd_swim"}],
+            [{"type": "callback", "text": "🩺 Обходы врачей по месяцам", "payload": "fd_doctors"}],
+            [{"type": "callback", "text": "🏫 Запись в садик", "payload": "fd_sadik"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "📋 Первые дни с малышом\n\nЧто нужно знать и сделать после рождения 👇", buttons)
+        return
+
+    fd_map = {
+        "fd_pediatr": "Расскажи о первом осмотре педиатра после выписки: когда придёт по закону, как вызвать, что проверяет, какие вопросы задать.",
+        "fd_svid": "Расскажи как оформить документы на новорождённого в России: свидетельство о рождении (ЗАГС/МФЦ/Госуслуги), ОМС, СНИЛС, пособия, материнский капитал. Пошагово.",
+        "fd_massage": "Расскажи о массаже и гимнастике для младенцев: с какого возраста, виды, техника для мамы дома, массаж при коликах, противопоказания.",
+        "fd_swim": "Расскажи о плавании с младенцем: рефлекс плавания, польза, как организовать дома, температура воды, когда можно в бассейн.",
+        "fd_doctors": "Составь календарь обходов врачей от рождения до 1 года: по месяцам, какие врачи, анализы, прививки по национальному календарю РФ.",
+        "fd_sadik": "Расскажи как записать ребёнка в детский сад в России: когда вставать в очередь, как через Госуслуги, документы, льготные очереди.",
+    }
+    for fd_key, fd_prompt in fd_map.items():
+        if payload == fd_key:
+            await send_message(chat_id, "⏳ Подбираю информацию...")
+            answer = await generate_text(EXPERT_BASE, fd_prompt)
+            await send_message(chat_id, answer,
+                [[{"type": "callback", "text": "🔙 К первым дням", "payload": "firstdays"},
+                  {"type": "callback", "text": "🏠 В меню", "payload": "back_menu"}]])
+            return
+
+    # ─── ГРУДНОЕ ВСКАРМЛИВАНИЕ — ПОДМЕНЮ ─────────────────────
+    if payload == "breastfeeding":
+        buttons = [
+            [{"type": "callback", "text": "🍼 Как наладить ГВ", "payload": "bf_start"}],
+            [{"type": "callback", "text": "🥛 Молока мало — расцедить", "payload": "bf_pump"}],
+            [{"type": "callback", "text": "🔴 Уплотнения и лактостаз", "payload": "bf_lactostaz"}],
+            [{"type": "callback", "text": "🥗 Питание мамы при ГВ", "payload": "bf_food"}],
+            [{"type": "callback", "text": "❌ Что нельзя при ГВ", "payload": "bf_nofood"}],
+            [{"type": "callback", "text": "🔄 Переход на смесь", "payload": "bf_formula"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "🤱 Грудное вскармливание\n\nНаучная поддержка на каждом этапе 💕", buttons)
+        return
+
+    bf_map = {
+        "bf_start": "Руководство по налаживанию ГВ по ВОЗ и ЮНИСЕФ: первое прикладывание, правильный захват, позиции, признаки что молока хватает, молозиво.",
+        "bf_pump": "Как увеличить лактацию и расцедиться: причины нехватки молока, ручное сцеживание пошагово, молокоотсос, питание мамы, лактогонные по науке.",
+        "bf_lactostaz": "Лактостаз и уплотнения: чем отличается от мастита, первая помощь, техника массажа, расцеживание, тепло или холод по доказательной медицине, красные флаги.",
+        "bf_food": "Питание кормящей мамы по ВОЗ: что обязательно включить, витамины, водный режим, развенчание мифов о диете при ГВ.",
+        "bf_nofood": "Что нельзя при ГВ: алкоголь, кофеин, аллергены, лекарства (LactMed), что влияет на вкус молока. Развенчай мифы об избыточных ограничениях.",
+        "bf_formula": "Переход на смесь: медицинские показания, как правильно завершить ГВ, как выбрать смесь, как разводить, смешанное вскармливание. Без осуждения.",
+    }
+    for bf_key, bf_prompt in bf_map.items():
+        if payload == bf_key:
+            await send_message(chat_id, "⏳ Подбираю информацию...")
+            answer = await generate_text(EXPERT_BASE, bf_prompt)
+            await send_message(chat_id, answer,
+                [[{"type": "callback", "text": "🔙 К ГВ", "payload": "breastfeeding"},
+                  {"type": "callback", "text": "🏠 В меню", "payload": "back_menu"}]])
+            return
+
+    # ─── ВОССТАНОВЛЕНИЕ — ПОДМЕНЮ ────────────────────────────
+    if payload == "recovery":
+        buttons = [
+            [{"type": "callback", "text": "🌸 После естественных родов", "payload": "rec_natural"}],
+            [{"type": "callback", "text": "🏥 После кесарева сечения", "payload": "rec_caesar"}],
+            [{"type": "callback", "text": "💪 Физическая активность", "payload": "rec_sport"}],
+            [{"type": "callback", "text": "❤️ Интимная жизнь", "payload": "rec_intimate"}],
+            [{"type": "callback", "text": "💇 Выпадение волос", "payload": "rec_hair"}],
+            [{"type": "callback", "text": "🏋️ Диастаз", "payload": "rec_diastaz"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        await send_message(chat_id, "🏥 Восстановление мамы после родов\n\nТвоё здоровье так же важно как здоровье малыша 💕", buttons)
+        return
+
+    rec_map = {
+        "rec_natural": "Восстановление после естественных родов: первые 24 часа, лохии — нормы и красные флаги, швы и разрывы, восстановление матки, боль, туалет, геморрой.",
+        "rec_caesar": "Восстановление после кесарева сечения: первые дни, уход за швом, когда снимают, ограничения (тяжести, секс, спорт), рубец, следующая беременность.",
+        "rec_sport": "Возвращение к физической активности: сроки после естественных и КС, упражнения Кегеля, диастаз — как проверить, запрещённые упражнения при диастазе, план по месяцам.",
+        "rec_intimate": "Интимная жизнь после родов: когда можно по ACOG, почему боль и дискомфорт, сухость при ГВ, психологический аспект, контрацепция при ГВ. Деликатно.",
+        "rec_hair": "Послеродовое выпадение волос: почему происходит (телогеновая фаза), нормальные сроки, что реально помогает, что миф, когда к трихологу.",
+        "rec_diastaz": "Диастаз после родов: что это, как проверить самостоятельно, степени, запрещённые упражнения, что помогает, бандаж, когда операция.",
+    }
+    for rec_key, rec_prompt in rec_map.items():
+        if payload == rec_key:
+            await send_message(chat_id, "⏳ Подбираю информацию...")
+            answer = await generate_text(EXPERT_BASE, rec_prompt)
+            await send_message(chat_id, answer,
+                [[{"type": "callback", "text": "🔙 К восстановлению", "payload": "recovery"},
+                  {"type": "callback", "text": "🏠 В меню", "payload": "back_menu"}]])
+            return
+
+    # ─── ТРЕКЕР КОРМЛЕНИЙ ────────────────────────────────────
+    if payload == "feeding":
+        plan, _ = get_subscription(user_id)
+        if plan != "mama_premium":
+            await send_message(chat_id, "🔒 Трекер кормлений доступен в Премиум 💎", upgrade_buttons())
+            return
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? AND entry LIKE 'КОРМ:%' ORDER BY created_at DESC LIMIT 5",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "🤱 Левая грудь", "payload": "feed_left"},
+             {"type": "callback", "text": "🤱 Правая грудь", "payload": "feed_right"}],
+            [{"type": "callback", "text": "🍼 Смесь/бутылочка", "payload": "feed_bottle"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        text = "🤱 Трекер кормлений\n\n"
+        if entries:
+            for entry, dt in entries:
+                d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+                text += f"📅 {d} — {entry.replace('КОРМ:', '')}\n"
+        else:
+            text += "Записей нет. Нажми кнопку после каждого кормления!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    for feed_type in ["feed_left", "feed_right", "feed_bottle"]:
+        if payload == feed_type:
+            names = {"feed_left": "Левая грудь", "feed_right": "Правая грудь", "feed_bottle": "Смесь/бутылочка"}
+            set_step(user_id, f"feed_duration_{feed_type}")
+            await send_message(chat_id, f"⏱ Сколько минут кормила? ({names[feed_type]})\nВведи число:")
+            return
+
+    # ─── ДНЕВНИК СНА ─────────────────────────────────────────
+    if payload == "sleep_log":
+        plan, _ = get_subscription(user_id)
+        if plan != "mama_premium":
+            await send_message(chat_id, "🔒 Дневник сна доступен в Премиум 💎", upgrade_buttons())
+            return
+        conn = sqlite3.connect(DB)
+        entries = conn.execute(
+            "SELECT entry, created_at FROM diary WHERE user_id=? AND entry LIKE 'СОН:%' ORDER BY created_at DESC LIMIT 6",
+            (user_id,)).fetchall()
+        conn.close()
+        buttons = [
+            [{"type": "callback", "text": "😴 Уснул", "payload": "sleep_start"},
+             {"type": "callback", "text": "🌅 Проснулся", "payload": "sleep_end"}],
+            [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]
+        ]
+        text = "🌙 Дневник сна\n\n"
+        if entries:
+            for entry, dt in entries:
+                d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+                action = entry.replace("СОН:", "")
+                emoji = "😴" if "уснул" in action else "🌅"
+                text += f"{emoji} {d} — {action}\n"
+        else:
+            text += "Записей нет. Нажимай когда малыш засыпает и просыпается!"
+        await send_message(chat_id, text, buttons)
+        return
+
+    if payload == "sleep_start":
+        conn = sqlite3.connect(DB)
+        conn.execute("INSERT INTO diary (user_id, entry, created_at) VALUES (?,?,?)",
+                     (user_id, "СОН:уснул", datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        await send_message(chat_id, "😴 Записала — малыш уснул!", back_button())
+        return
+
+    if payload == "sleep_end":
+        conn = sqlite3.connect(DB)
+        conn.execute("INSERT INTO diary (user_id, entry, created_at) VALUES (?,?,?)",
+                     (user_id, "СОН:проснулся", datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        await send_message(chat_id, "🌅 Записала — малыш проснулся!", back_button())
         return
 
     await send_message(chat_id, "Выбери действие из меню 👇", main_menu_buttons())
