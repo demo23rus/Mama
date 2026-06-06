@@ -54,6 +54,20 @@ class DiaryStates(StatesGroup):
 class PhotoStates(StatesGroup):
     waiting_photo = State()
 
+class GrowthStates(StatesGroup):
+    waiting_height = State()
+    waiting_weight = State()
+
+class SymptomStates(StatesGroup):
+    waiting_symptom = State()
+
+class FeedingStates(StatesGroup):
+    waiting_side = State()
+    waiting_duration = State()
+
+class BenefitsStates(StatesGroup):
+    waiting_params = State()
+
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect("/root/mama.db")
@@ -72,6 +86,50 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             entry TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS growth (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            height REAL,
+            weight REAL,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS symptoms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            symptom TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS feeding (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            side TEXT,
+            duration INTEGER,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sleep_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS vaccinations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            vaccine TEXT,
+            scheduled_date TEXT,
+            done INTEGER DEFAULT 0,
             created_at TEXT
         )
     """)
@@ -113,6 +171,93 @@ def get_diary(user_id):
     rows = c.fetchall()
     conn.close()
     return rows
+
+def save_growth(user_id, height, weight):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO growth (user_id, height, weight, created_at) VALUES (?, ?, ?, ?)",
+              (user_id, height, weight, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_growth(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def save_symptom(user_id, symptom):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO symptoms (user_id, symptom, created_at) VALUES (?, ?, ?)",
+              (user_id, symptom, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_symptoms(user_id, days=7):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT 30", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def save_feeding(user_id, side, duration):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO feeding (user_id, side, duration, created_at) VALUES (?, ?, ?, ?)",
+              (user_id, side, duration, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_feedings(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT side, duration, created_at FROM feeding WHERE user_id=? ORDER BY created_at DESC LIMIT 20", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def save_sleep(user_id, action):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO sleep_log (user_id, action, created_at) VALUES (?, ?, ?)",
+              (user_id, action, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_sleep_log(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT action, created_at FROM sleep_log WHERE user_id=? ORDER BY created_at DESC LIMIT 20", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def save_vaccination(user_id, vaccine, scheduled_date):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO vaccinations (user_id, vaccine, scheduled_date, created_at) VALUES (?, ?, ?, ?)",
+              (user_id, vaccine, scheduled_date, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_vaccinations(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT id, vaccine, scheduled_date, done FROM vaccinations WHERE user_id=? ORDER BY scheduled_date", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def mark_vaccination_done(vac_id):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("UPDATE vaccinations SET done=1 WHERE id=?", (vac_id,))
+    conn.commit()
+    conn.close()
 
 # ─── ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ─────────────────────────────────
 def calc_pregnancy_weeks(pdr_str):
@@ -192,6 +337,12 @@ def kb_pregnant_menu():
 def kb_mama_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
+        [InlineKeyboardButton(text="💉 Прививки", callback_data="tracker_vaccines"),
+         InlineKeyboardButton(text="📏 Рост и вес", callback_data="tracker_growth")],
+        [InlineKeyboardButton(text="🌡 Трекер симптомов", callback_data="tracker_symptoms"),
+         InlineKeyboardButton(text="🤱 Трекер кормлений", callback_data="tracker_feeding")],
+        [InlineKeyboardButton(text="🌙 Дневник сна", callback_data="tracker_sleep"),
+         InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="benefits_menu")],
         [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
         [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
         [InlineKeyboardButton(text="📊 Развитие по возрасту", callback_data="mama_dev"),
@@ -1432,9 +1583,30 @@ async def post_evening():   await post_rubric(16)
 async def post_night():     await post_rubric(20)
 
 
+async def check_vaccine_reminders():
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    today = date.today()
+    reminder_date = (today + __import__('datetime').timedelta(days=3)).strftime("%d.%m.%Y")
+    c.execute("SELECT user_id, vaccine, scheduled_date FROM vaccinations WHERE scheduled_date=? AND done=0", (reminder_date,))
+    rows = c.fetchall()
+    conn.close()
+    for user_id, vaccine, sdate in rows:
+        try:
+            await bot.send_message(user_id,
+                f"💉 Напоминание о прививке!\n\n"
+                f"Через 3 дня ({sdate}) запланирована:\n"
+                f"🔹 {vaccine}\n\n"
+                f"Не забудь записаться к педиатру заранее!"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка напоминания о прививке: {e}")
+
 # ─── ЗАПУСК ──────────────────────────────────────────────────
 async def main():
     init_db()
+    # Напоминания о прививках — каждый день в 9:00
+    scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0)
     scheduler.add_job(post_morning,   "cron", hour=8,  minute=0)
     scheduler.add_job(post_10,        "cron", hour=10, minute=0)
     scheduler.add_job(post_afternoon, "cron", hour=13, minute=0)
@@ -1446,3 +1618,422 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# ─── ТРЕКЕР РОСТА И ВЕСА ─────────────────────────────────────
+@dp.callback_query(F.data == "tracker_growth")
+async def tracker_growth(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    entries = get_growth(call.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить замер", callback_data="growth_add")],
+        [InlineKeyboardButton(text="📊 Анализ динамики", callback_data="growth_analyze")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+    if entries:
+        text = "📏 Рост и вес малыша\n\n"
+        for h, w, dt in entries[:5]:
+            d = datetime.fromisoformat(dt).strftime("%d.%m.%Y")
+            text += f"📅 {d} — рост {h} см, вес {w} кг\n"
+    else:
+        text = "📏 Рост и вес малыша\n\nЗамеров пока нет. Начни отслеживать!"
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "growth_add")
+async def growth_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(GrowthStates.waiting_height)
+    await call.message.answer("📏 Введи рост малыша в сантиметрах\nНапример: 67.5")
+
+@dp.message(GrowthStates.waiting_height, F.text)
+async def growth_height(message: Message, state: FSMContext):
+    try:
+        h = float(message.text.replace(",", "."))
+        await state.update_data(height=h)
+        await state.set_state(GrowthStates.waiting_weight)
+        await message.answer("⚖️ Теперь введи вес в килограммах\nНапример: 7.2")
+    except:
+        await message.answer("❌ Введи число, например: 67.5")
+
+@dp.message(GrowthStates.waiting_weight, F.text)
+async def growth_weight(message: Message, state: FSMContext):
+    try:
+        w = float(message.text.replace(",", "."))
+        data = await state.get_data()
+        h = data["height"]
+        save_growth(message.from_user.id, h, w)
+        await state.clear()
+        user = get_user(message.from_user.id)
+        months = 0
+        if user and user[0] == "mama":
+            months, _ = calc_child_age(user[1])
+        answer = await ask_gpt(
+            EXPERT_BASE,
+            f"Ребёнку {age_label(months)} ({months} месяцев). Рост {h} см, вес {w} кг. "
+            f"Оцени эти показатели по нормам ВОЗ — в каком перцентиле находится ребёнок. "
+            f"Скажи норма это или нет, и что делать если отклонение."
+        )
+        await message.answer(f"✅ Замер сохранён!\n\n{answer}", reply_markup=kb_mama_menu())
+    except:
+        await message.answer("❌ Введи число, например: 7.2")
+
+@dp.callback_query(F.data == "growth_analyze")
+async def growth_analyze(call: CallbackQuery):
+    entries = get_growth(call.from_user.id)
+    user = get_user(call.from_user.id)
+    if not entries:
+        await call.message.answer("Нет данных для анализа. Добавь хотя бы один замер!", reply_markup=kb_mama_menu())
+        return
+    await call.message.answer("⏳ Анализирую динамику...")
+    months = 0
+    if user and user[0] == "mama":
+        months, _ = calc_child_age(user[1])
+    data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m.%Y')}: рост {h} см, вес {w} кг"
+                          for h, w, dt in entries])
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот динамика роста и веса:\n{data_str}\n\n"
+        f"Проанализируй динамику по нормам ВОЗ — прибавки в норме или нет, тренд хороший или нет, "
+        f"на что обратить внимание педиатру."
+    )
+    await call.message.answer(answer, reply_markup=kb_mama_menu())
+
+# ─── ТРЕКЕР СИМПТОМОВ ────────────────────────────────────────
+@dp.callback_query(F.data == "tracker_symptoms")
+async def tracker_symptoms(call: CallbackQuery):
+    entries = get_symptoms(call.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Записать симптом", callback_data="symptom_add")],
+        [InlineKeyboardButton(text="🔍 Анализ за 7 дней", callback_data="symptom_analyze")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+    if entries:
+        text = "🌡 Трекер симптомов\n\n"
+        for s, dt in entries[:7]:
+            d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+            text += f"📅 {d} — {s}\n"
+    else:
+        text = "🌡 Трекер симптомов\n\nЗаписей нет. Фиксируй симптомы и бот поможет отследить динамику."
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "symptom_add")
+async def symptom_add(call: CallbackQuery, state: FSMContext):
+    await state.set_state(SymptomStates.waiting_symptom)
+    await call.message.answer(
+        "🌡 Опиши симптом малыша\n\n"
+        "Например: температура 38.2, кашель, сыпь на щеках, не ест, плачет, зелёный стул\n\n"
+        "Пиши как есть — бот сохранит с датой и временем."
+    )
+
+@dp.message(SymptomStates.waiting_symptom, F.text)
+async def save_symptom_entry(message: Message, state: FSMContext):
+    save_symptom(message.from_user.id, message.text)
+    await state.clear()
+    await message.answer("✅ Симптом записан!", reply_markup=kb_mama_menu())
+
+@dp.callback_query(F.data == "symptom_analyze")
+async def symptom_analyze(call: CallbackQuery):
+    entries = get_symptoms(call.from_user.id)
+    user = get_user(call.from_user.id)
+    if not entries:
+        await call.message.answer("Нет симптомов для анализа.", reply_markup=kb_mama_menu())
+        return
+    await call.message.answer("⏳ Анализирую симптомы...")
+    months = 0
+    if user and user[0] == "mama":
+        months, _ = calc_child_age(user[1])
+    data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {s}"
+                          for s, dt in entries])
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот симптомы за последние дни:\n{data_str}\n\n"
+        f"Проанализируй картину: что это может быть, какова динамика — лучше или хуже, "
+        f"стоит ли идти к врачу прямо сейчас или можно наблюдать дома. "
+        f"Красные флаги — если есть тревожные симптомы скажи прямо."
+    )
+    await call.message.answer(answer, reply_markup=kb_mama_menu())
+
+# ─── ТРЕКЕР КОРМЛЕНИЙ ────────────────────────────────────────
+@dp.callback_query(F.data == "tracker_feeding")
+async def tracker_feeding(call: CallbackQuery):
+    entries = get_feedings(call.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤱 Левая грудь", callback_data="feed_left"),
+         InlineKeyboardButton(text="🤱 Правая грудь", callback_data="feed_right")],
+        [InlineKeyboardButton(text="🍼 Смесь/бутылочка", callback_data="feed_bottle")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="feed_stats")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+    if entries:
+        text = "🤱 Трекер кормлений\n\n"
+        for side, dur, dt in entries[:5]:
+            d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+            text += f"📅 {d} — {side}, {dur} мин\n"
+        # Время с последнего кормления
+        last_dt = datetime.fromisoformat(entries[0][2])
+        diff = datetime.now() - last_dt
+        mins = int(diff.total_seconds() / 60)
+        if mins < 60:
+            text += f"\n⏱ Последнее кормление {mins} мин назад"
+        else:
+            text += f"\n⏱ Последнее кормление {mins // 60} ч {mins % 60} мин назад"
+    else:
+        text = "🤱 Трекер кормлений\n\nЗаписей нет. Нажми кнопку после каждого кормления!"
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data.in_({"feed_left", "feed_right", "feed_bottle"}))
+async def feed_start(call: CallbackQuery, state: FSMContext):
+    sides = {"feed_left": "Левая грудь", "feed_right": "Правая грудь", "feed_bottle": "Смесь/бутылочка"}
+    side = sides[call.data]
+    await state.set_state(FeedingStates.waiting_duration)
+    await state.update_data(side=side)
+    await call.message.answer(f"⏱ Сколько минут кормила? ({side})\nВведи число:")
+
+@dp.message(FeedingStates.waiting_duration, F.text)
+async def feed_duration(message: Message, state: FSMContext):
+    try:
+        dur = int(message.text.strip())
+        data = await state.get_data()
+        save_feeding(message.from_user.id, data["side"], dur)
+        await state.clear()
+        await message.answer(f"✅ Кормление записано! {data['side']}, {dur} мин 🤱", reply_markup=kb_mama_menu())
+    except:
+        await message.answer("❌ Введи число минут, например: 15")
+
+@dp.callback_query(F.data == "feed_stats")
+async def feed_stats(call: CallbackQuery):
+    entries = get_feedings(call.from_user.id)
+    user = get_user(call.from_user.id)
+    if not entries:
+        await call.message.answer("Нет данных для анализа.", reply_markup=kb_mama_menu())
+        return
+    await call.message.answer("⏳ Считаю статистику...")
+    months = 0
+    if user and user[0] == "mama":
+        months, _ = calc_child_age(user[1])
+    data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {side}, {dur} мин"
+                          for side, dur, dt in entries])
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот журнал кормлений:\n{data_str}\n\n"
+        f"Проанализируй: достаточно ли кормлений по нормам ВОЗ для этого возраста, "
+        f"правильные ли интервалы, достаточная ли продолжительность. "
+        f"Дай практические рекомендации."
+    )
+    await call.message.answer(answer, reply_markup=kb_mama_menu())
+
+# ─── ДНЕВНИК СНА ─────────────────────────────────────────────
+@dp.callback_query(F.data == "tracker_sleep")
+async def tracker_sleep(call: CallbackQuery):
+    entries = get_sleep_log(call.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="😴 Уснул", callback_data="sleep_start"),
+         InlineKeyboardButton(text="🌅 Проснулся", callback_data="sleep_end")],
+        [InlineKeyboardButton(text="📊 Анализ сна", callback_data="sleep_analyze")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+    if entries:
+        text = "🌙 Дневник сна\n\n"
+        for action, dt in entries[:6]:
+            d = datetime.fromisoformat(dt).strftime("%d.%m %H:%M")
+            emoji = "😴" if action == "уснул" else "🌅"
+            text += f"{emoji} {d} — {action}\n"
+    else:
+        text = "🌙 Дневник сна\n\nЗаписей нет. Нажимай кнопки когда малыш засыпает и просыпается!"
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "sleep_start")
+async def sleep_start(call: CallbackQuery):
+    save_sleep(call.from_user.id, "уснул")
+    await call.message.answer("😴 Записала — малыш уснул!", reply_markup=kb_mama_menu())
+
+@dp.callback_query(F.data == "sleep_end")
+async def sleep_end(call: CallbackQuery):
+    save_sleep(call.from_user.id, "проснулся")
+    await call.message.answer("🌅 Записала — малыш проснулся!", reply_markup=kb_mama_menu())
+
+@dp.callback_query(F.data == "sleep_analyze")
+async def sleep_analyze(call: CallbackQuery):
+    entries = get_sleep_log(call.from_user.id)
+    user = get_user(call.from_user.id)
+    if len(entries) < 4:
+        await call.message.answer("Нужно больше записей для анализа. Фиксируй сон несколько дней!", reply_markup=kb_mama_menu())
+        return
+    await call.message.answer("⏳ Анализирую сон...")
+    months = 0
+    if user and user[0] == "mama":
+        months, _ = calc_child_age(user[1])
+    data_str = "\n".join([f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {action}"
+                          for action, dt in entries])
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот дневник сна:\n{data_str}\n\n"
+        f"Проанализируй паттерн сна по нормам AAP и NSF для этого возраста: "
+        f"сколько часов спит суммарно, правильные ли интервалы бодрствования, "
+        f"есть ли проблемы и как их решить. Конкретные рекомендации."
+    )
+    await call.message.answer(answer, reply_markup=kb_mama_menu())
+
+# ─── ПРИВИВОЧНЫЙ КАЛЕНДАРЬ ───────────────────────────────────
+@dp.callback_query(F.data == "tracker_vaccines")
+async def tracker_vaccines(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    vaccinations = get_vaccinations(call.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Создать календарь", callback_data="vaccines_create")],
+        [InlineKeyboardButton(text="✅ Отметить сделанную", callback_data="vaccines_done")],
+        [InlineKeyboardButton(text="❓ Что такое эта прививка", callback_data="vaccines_info")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+    if vaccinations:
+        text = "💉 Прививочный календарь\n\n"
+        for vid, vaccine, sdate, done in vaccinations[:10]:
+            status = "✅" if done else "⏳"
+            text += f"{status} {sdate} — {vaccine}\n"
+    else:
+        text = "💉 Прививочный календарь\n\nКалендарь не создан. Нажми 'Создать календарь'!"
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "vaccines_create")
+async def vaccines_create(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user or user[0] != "mama":
+        await call.message.answer("Сначала введи дату рождения малыша!", reply_markup=kb_mama_menu())
+        return
+    months, _ = calc_child_age(user[1])
+    birth = datetime.strptime(user[1], "%d.%m.%Y")
+    await call.message.answer("⏳ Создаю персональный календарь прививок...")
+
+    # Стандартный календарь РФ
+    schedule = [
+        (0, "БЦЖ (туберкулёз)"),
+        (0, "Гепатит B — 1-я доза"),
+        (1, "Гепатит B — 2-я доза"),
+        (2, "АКДС — 1-я доза"),
+        (2, "Полиомиелит — 1-я доза"),
+        (2, "Пневмококк — 1-я доза"),
+        (3, "АКДС — 2-я доза"),
+        (3, "Полиомиелит — 2-я доза"),
+        (4, "АКДС — 3-я доза"),
+        (4, "Полиомиелит — 3-я доза"),
+        (4, "Пневмококк — 2-я доза"),
+        (6, "Гепатит B — 3-я доза"),
+        (12, "Корь, краснуха, паротит (КПК)"),
+        (12, "Ветряная оспа"),
+        (15, "Пневмококк — ревакцинация"),
+        (18, "АКДС — ревакцинация"),
+        (18, "Полиомиелит — ревакцинация"),
+    ]
+
+    added = 0
+    for month_age, vaccine in schedule:
+        if month_age >= months:
+            vac_date = (birth + __import__('datetime').timedelta(days=month_age*30)).strftime("%d.%m.%Y")
+            save_vaccination(call.from_user.id, vaccine, vac_date)
+            added += 1
+
+    await call.message.answer(
+        f"✅ Календарь создан! Добавлено {added} прививок.\n\n"
+        f"Бот будет напоминать за 3 дня до каждой прививки.",
+        reply_markup=kb_mama_menu()
+    )
+
+@dp.callback_query(F.data == "vaccines_info")
+async def vaccines_info(call: CallbackQuery):
+    await call.message.answer("⏳ Подбираю информацию...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        "Дай понятное объяснение основных прививок из национального календаря РФ для детей до 2 лет. "
+        "Для каждой прививки: название, от чего защищает, почему важна, возможные реакции и как с ними справляться. "
+        "БЦЖ, Гепатит B, АКДС, Полиомиелит, Пневмококк, КПК, Ветрянка. "
+        "Развенчай главные мифы о прививках с научными аргументами."
+    )
+    await call.message.answer(answer, reply_markup=kb_mama_menu())
+
+# ─── ПОСОБИЯ И ВЫПЛАТЫ ───────────────────────────────────────
+@dp.callback_query(F.data == "benefits_menu")
+async def benefits_menu(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👶 Единовременное при рождении", callback_data="ben_birth")],
+        [InlineKeyboardButton(text="🤱 Пособие по уходу до 1.5 лет", callback_data="ben_15")],
+        [InlineKeyboardButton(text="📅 Выплаты до 3 лет", callback_data="ben_3")],
+        [InlineKeyboardButton(text="🏠 Материнский капитал", callback_data="ben_matcap")],
+        [InlineKeyboardButton(text="💊 По беременности и родам", callback_data="ben_decree")],
+        [InlineKeyboardButton(text="👨‍👩‍👧 Многодетная семья", callback_data="ben_multi")],
+        [InlineKeyboardButton(text="❓ Что положено именно мне", callback_data="ben_personal")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+    await call.message.answer(
+        "💰 Пособия и выплаты\n\n"
+        "Узнай на что ты имеешь право 👇",
+        reply_markup=kb
+    )
+
+async def benefits_gpt(call, prompt):
+    await call.message.answer("⏳ Подбираю актуальную информацию...")
+    answer = await ask_gpt(
+        "Ты эксперт по социальным выплатам и пособиям в России. "
+        "Давай актуальную информацию на 2024-2025 год. "
+        "Указывай конкретные суммы, сроки подачи, необходимые документы и куда обращаться. "
+        "Отвечай структурированно и понятно.",
+        prompt
+    )
+    await call.message.answer(answer, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К пособиям", callback_data="benefits_menu")]
+    ]))
+
+@dp.callback_query(F.data == "ben_birth")
+async def ben_birth(call: CallbackQuery):
+    await benefits_gpt(call, "Расскажи о единовременном пособии при рождении ребёнка в России в 2024-2025 году. "
+                       "Размер, кто имеет право, документы, куда подавать, сроки.")
+
+@dp.callback_query(F.data == "ben_15")
+async def ben_15(call: CallbackQuery):
+    await benefits_gpt(call, "Расскажи о ежемесячном пособии по уходу за ребёнком до 1.5 лет в России 2024-2025. "
+                       "Размер для работающих и неработающих мам, как рассчитывается, документы, сроки.")
+
+@dp.callback_query(F.data == "ben_3")
+async def ben_3(call: CallbackQuery):
+    await benefits_gpt(call, "Расскажи о выплатах и пособиях на ребёнка от 1.5 до 3 лет в России 2024-2025. "
+                       "Путинские выплаты, региональные пособия, условия получения.")
+
+@dp.callback_query(F.data == "ben_matcap")
+async def ben_matcap(call: CallbackQuery):
+    await benefits_gpt(call, "Расскажи о материнском капитале в России 2024-2025. "
+                       "Размер на первого и второго ребёнка, на что можно потратить, как оформить через Госуслуги, "
+                       "сроки получения сертификата.")
+
+@dp.callback_query(F.data == "ben_decree")
+async def ben_decree(call: CallbackQuery):
+    await benefits_gpt(call, "Расскажи о пособии по беременности и родам (декретные) в России 2024-2025. "
+                       "Как рассчитывается для работающих, ИП, безработных. "
+                       "Сроки декрета, документы, куда обращаться.")
+
+@dp.callback_query(F.data == "ben_multi")
+async def ben_multi(call: CallbackQuery):
+    await benefits_gpt(call, "Расскажи о льготах и выплатах многодетным семьям в России 2024-2025. "
+                       "Федеральные и региональные льготы, налоговые вычеты, земельные участки, "
+                       "транспортный налог, ЖКХ, досрочная пенсия мамы.")
+
+@dp.callback_query(F.data == "ben_personal")
+async def ben_personal(call: CallbackQuery, state: FSMContext):
+    await state.set_state(BenefitsStates.waiting_params)
+    await call.message.answer(
+        "❓ Расскажи о своей ситуации и я скажу что тебе положено\n\n"
+        "Напиши: работаешь или нет, какой по счёту ребёнок, "
+        "замужем или нет, регион проживания\n\n"
+        "Например: работаю официально, второй ребёнок, замужем, Москва"
+    )
+
+@dp.message(BenefitsStates.waiting_params, F.text)
+async def ben_personal_answer(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("⏳ Подбираю что положено именно тебе...")
+    answer = await ask_gpt(
+        "Ты эксперт по социальным выплатам в России 2024-2025. "
+        "Давай конкретные персональные рекомендации на основе ситуации мамы.",
+        f"Мама описала свою ситуацию: {message.text}\n\n"
+        f"Перечисли все федеральные и региональные пособия и выплаты на которые она имеет право. "
+        f"Для каждого: название, размер, как оформить, куда обратиться. "
+        f"Отсортируй по сумме — сначала самые крупные."
+    )
+    await message.answer(answer, reply_markup=kb_mama_menu())
+
