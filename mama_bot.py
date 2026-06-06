@@ -34,6 +34,8 @@ _env = load_env()
 
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN  = "8769245157:AAH2EbEFpGj8MzuHUMiBKeLB7eJztyxfC1s"
+SUPPORT_USERNAME = "@demo23rus"
+BOT_NAME = "Мамин помощник"
 OPENAI_KEY = "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"
 
 # ─── ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
@@ -71,6 +73,9 @@ class FeedingStates(StatesGroup):
 
 class BenefitsStates(StatesGroup):
     waiting_params = State()
+
+class PsychoStates(StatesGroup):
+    in_session = State()
 
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────
 def init_db():
@@ -124,6 +129,15 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             action TEXT,
+            created_at TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS psycho_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            role TEXT,
+            content TEXT,
             created_at TEXT
         )
     """)
@@ -338,6 +352,29 @@ def get_vaccinations(user_id):
     rows = c.fetchall()
     conn.close()
     return rows
+
+def save_psycho_message(user_id, role, content):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("INSERT INTO psycho_history (user_id, role, content, created_at) VALUES (?,?,?,?)",
+              (user_id, role, content, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_psycho_history(user_id, limit=15):
+    conn = sqlite3.connect("/root/mama.db")
+    c = conn.cursor()
+    c.execute("SELECT role, content FROM psycho_history WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+              (user_id, limit))
+    rows = c.fetchall()
+    conn.close()
+    return list(reversed(rows))
+
+def clear_psycho_history(user_id):
+    conn = sqlite3.connect("/root/mama.db")
+    conn.execute("DELETE FROM psycho_history WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
 def mark_vaccination_done(vac_id):
     conn = sqlite3.connect("/root/mama.db")
@@ -2534,6 +2571,179 @@ async def ben_personal_answer(message: Message, state: FSMContext):
         f"Отсортируй по сумме — сначала самые крупные."
     )
     await message.answer(answer, reply_markup=kb_mama_menu())
+
+
+# ─── МАМИН ПСИХОЛОГ ──────────────────────────────────────────
+PSYCHO_SYSTEM = """Ты Мамин психолог — тёплый, внимательный, профессиональный психолог специально для мам.
+
+Твои принципы:
+- Ты помнишь всё что мама рассказывала тебе раньше — используй это в ответах
+- Отвечаешь как живой человек, не как робот — с теплом, эмпатией, без шаблонов
+- Опираешься на доказательные методы: КПТ (когнитивно-поведенческая терапия), ACT (терапия принятия), нарративную терапию, теорию привязанности Петрановской
+- Никогда не осуждаешь маму — любое её чувство нормально
+- Не даёшь советов пока не поймёшь ситуацию — сначала слушаешь и задаёшь вопросы
+- Замечаешь паттерны в том что мама рассказывает и мягко указываешь на них
+- Помогаешь маме понять себя, а не просто решаешь проблему
+- При серьёзных симптомах (суицидальные мысли, тяжёлая депрессия) мягко направляешь к специалисту
+
+Ты знаешь что материнство — это огромный труд. Мама важна не меньше ребёнка."""
+
+@dp.callback_query(F.data == "check_premium_psycho")
+async def check_prem_psycho(call: CallbackQuery, state: FSMContext):
+    if not is_premium(call.from_user.id):
+        await call.message.answer(
+            "🧠 Мамин психолог доступен в Премиум 💎\n\n"
+            "Персональный психолог который помнит тебя и твою историю.",
+            reply_markup=kb_premium()
+        )
+        return
+    await psycho_start(call, state)
+
+@dp.callback_query(F.data == "psycho_start")
+async def psycho_start(call: CallbackQuery, state: FSMContext):
+    if not is_premium(call.from_user.id):
+        await call.message.answer("🔒 Мамин психолог доступен в Премиум 💎", reply_markup=kb_premium())
+        return
+    await state.set_state(PsychoStates.in_session)
+    history = get_psycho_history(call.from_user.id)
+    user = get_user(call.from_user.id)
+    name = user[2] if user and user[2] else "мама"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Начать новый диалог", callback_data="psycho_clear")],
+        [InlineKeyboardButton(text="🏠 Выйти из сеанса", callback_data="psycho_exit")]
+    ])
+    if history:
+        await call.message.answer(
+            f"🧠 С возвращением, {name}!\n\n"
+            f"Я помню наш последний разговор. Как ты сейчас? 💕",
+            reply_markup=kb
+        )
+    else:
+        await call.message.answer(
+            f"🧠 Привет, {name}! Я твой личный психолог 💕\n\n"
+            f"Здесь можно говорить обо всём — усталость, тревога, отношения, "
+            f"чувство вины, злость, растерянность. Всё что накопилось.\n\n"
+            f"Я слушаю. Расскажи как ты сейчас?",
+            reply_markup=kb
+        )
+
+@dp.callback_query(F.data == "psycho_clear")
+async def psycho_clear(call: CallbackQuery, state: FSMContext):
+    clear_psycho_history(call.from_user.id)
+    await state.set_state(PsychoStates.in_session)
+    await call.message.answer(
+        "🧠 Начинаем с чистого листа 💕\n\nКак ты сейчас?"
+    )
+
+@dp.callback_query(F.data == "psycho_exit")
+async def psycho_exit(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer(
+        "🧠 До встречи! Ты молодец что заботишься о себе 💕",
+        reply_markup=kb_mama_menu()
+    )
+
+@dp.message(PsychoStates.in_session, F.text)
+async def psycho_message(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    user = get_user(user_id)
+
+    # Сохраняем сообщение мамы
+    save_psycho_message(user_id, "user", message.text)
+
+    # Получаем историю
+    history = get_psycho_history(user_id, limit=15)
+
+    # Строим контекст пользователя
+    context = ""
+    if user:
+        mode, date_value, name = user
+        if mode == "pregnant":
+            weeks, _ = calc_pregnancy_weeks(date_value)
+            context = f"Это беременная женщина на {weeks} неделе."
+        else:
+            months, _ = calc_child_age(date_value)
+            context = f"Это мама, ребёнку {age_label(months)} ({months} месяцев)."
+
+    await message.answer("🧠 Думаю...")
+
+    # Строим сообщения для GPT с историей
+    messages = [{"role": "system", "content": PSYCHO_SYSTEM + (f"\n\nКонтекст: {context}" if context else "")}]
+    for role, content_msg in history[:-1]:  # все кроме последнего (только что сохранённого)
+        messages.append({"role": role, "content": content_msg})
+    messages.append({"role": "user", "content": message.text})
+
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            max_tokens=800
+        )
+        answer = clean_text(response.choices[0].message.content)
+
+        # Сохраняем ответ психолога
+        save_psycho_message(user_id, "assistant", answer)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Новый диалог", callback_data="psycho_clear"),
+             InlineKeyboardButton(text="🏠 Выйти", callback_data="psycho_exit")]
+        ])
+        await message.answer(answer, reply_markup=kb)
+
+    except Exception as e:
+        logging.error(f"Psycho GPT error: {e}")
+        await message.answer("Что-то пошло не так. Попробуй ещё раз 💕")
+
+@dp.message(PsychoStates.in_session, F.voice)
+async def psycho_voice(message: Message, state: FSMContext):
+    """Голос тоже работает в сеансе психолога"""
+    if not is_premium(message.from_user.id):
+        await message.answer("🔒 Голосовые сообщения доступны в Премиум 💎", reply_markup=kb_premium())
+        return
+    try:
+        file = await bot.get_file(message.voice.file_id)
+        file_path = f"/tmp/mama_psycho_{message.from_user.id}.ogg"
+        await bot.download_file(file.file_path, file_path)
+        with open(file_path, "rb") as f:
+            transcript = await client.audio.transcriptions.create(
+                model="whisper-1", file=f, language="ru"
+            )
+        text = transcript.text.strip()
+        if not text:
+            await message.answer("Не удалось распознать. Говори чуть громче 🎤")
+            return
+        message.text = text
+        await psycho_message(message, state)
+    except Exception as e:
+        logging.error(f"Psycho voice error: {e}")
+        await message.answer("Ошибка распознавания голоса 💕")
+
+
+
+@dp.callback_query(F.data == "vaccines_done")
+async def vaccines_done(call: CallbackQuery):
+    vaccinations = get_vaccinations(call.from_user.id)
+    if not vaccinations:
+        await call.message.answer("Нет прививок в календаре.", reply_markup=kb_mama_menu())
+        return
+    kb_rows = []
+    for vid, vaccine, sdate, done in vaccinations:
+        if not done:
+            kb_rows.append([InlineKeyboardButton(
+                text=f"✅ {vaccine} ({sdate})",
+                callback_data=f"vac_done_{vid}"
+            )])
+    kb_rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="tracker_vaccines")])
+    await call.message.answer(
+        "Выбери прививку которую уже сделали:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
+
+@dp.callback_query(F.data.startswith("vac_done_"))
+async def vac_mark_done(call: CallbackQuery):
+    vac_id = int(call.data.replace("vac_done_", ""))
+    mark_vaccination_done(vac_id)
+    await call.message.answer("✅ Прививка отмечена как сделанная!", reply_markup=kb_mama_menu())
 
 async def check_vaccine_reminders():
     conn = sqlite3.connect("/root/mama.db")
