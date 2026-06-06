@@ -38,6 +38,16 @@ SUPPORT_USERNAME = "@demo23rus"
 BOT_NAME = "Мамин помощник"
 OPENAI_KEY = "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"
 
+# ─── ЮКАССА ──────────────────────────────────────────────────
+YOOKASSA_SHOP_ID = "1363324"
+YOOKASSA_SECRET  = "live_-RKE9nsi8wZiM-5f00z78E84OYSi3M0Dj9w_-pE0Mvw"
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key  = YOOKASSA_SECRET
+
+# ─── GOOGLE SHEETS ─────────────────────────────────────────
+SPREADSHEET_ID   = "1PE7CaFuWOe_eygQqIoMAmUdJBtATbIaNfZR4cvarPCA"
+CREDENTIALS_FILE = "/root/google_credentials.json"
+
 # ─── ИНИЦИАЛИЗАЦИЯ ───────────────────────────────────────────
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -1712,7 +1722,7 @@ async def handle_photo(message: Message, state: FSMContext):
         logging.error(f"Ошибка анализа фото: {e}")
         await message.answer("Не удалось проанализировать фото. Попробуй ещё раз.", reply_markup=kb_photo_menu())
 
-@dp.message(PhotoStates.waiting_photo)
+@dp.message(PhotoStates.waiting_photo, ~F.voice)
 async def photo_wrong_input(message: Message, state: FSMContext):
     await message.answer("📸 Жду именно фото — отправь изображение 🤍")
 
