@@ -736,6 +736,29 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         weeks_preg = calc_pregnancy_weeks(birth_date.replace("pdr:", ""))
         m_label = f"на {weeks_preg} неделе беременности" if weeks_preg else "беременная"
 
+    # Скрытая команда владельца: публикует НОВЫЙ тестовый пост в канал.
+    if text.strip().lower() in ("/test_channel_link", "test_channel_link"):
+        if user_id != OWNER_ID:
+            await send_message(chat_id, "Команда доступна только владельцу.")
+            return
+        test_buttons = [
+            [{"type": "link", "text": "Открыть бота напрямую", "url": MAX_BOT_DEEPLINK}],
+            [{"type": "link", "text": "Открыть через сайт", "url": MAX_BOT_CHANNEL_LINK}],
+        ]
+        test_text = (
+            "🧪 Тест перехода в Мамин Помощник\n\n"
+            "Это новый тестовый пост, опубликованный после обновления кода.\n"
+            "Нажмите первую кнопку. Если она не откроется — попробуйте вторую.\n\n"
+            f"Прямая ссылка: {MAX_BOT_DEEPLINK}\n"
+            f"Резервная ссылка: {MAX_BOT_CHANNEL_LINK}"
+        )
+        ok = await send_to_channel(test_text, test_buttons)
+        if ok:
+            await send_message(chat_id, "✅ Новый тестовый пост опубликован в канале. Проверяй только его, старые посты не меняются.")
+        else:
+            await send_message(chat_id, "❌ Не удалось опубликовать тестовый пост. Проверь логи MAX API.")
+        return
+
     if text in ("/start", "start"):
         set_step(user_id, "idle")
         plan, _ = get_subscription(user_id)
