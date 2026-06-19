@@ -352,10 +352,20 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT DEFAULT '',
         first_name TEXT DEFAULT '', review TEXT, created_at TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, slot TEXT, theme TEXT, format_name TEXT,
+        title TEXT, text TEXT, created_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS channel_poll_votes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, poll_key TEXT, user_id INTEGER, option_key TEXT,
+        created_at TEXT, UNIQUE(poll_key, user_id)
+    )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_diary_user_created ON diary(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_growth_user_created ON growth(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_symptoms_user_created ON symptoms(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_vaccinations_user ON vaccinations(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_created ON channel_posts(created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_channel_votes_poll ON channel_poll_votes(poll_key, option_key)")
     # Перенос старого счётчика вопросов, если таблица существовала.
     old_tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "requests_count" in old_tables:
@@ -933,6 +943,28 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     if callback_requires_premium(payload) and plan != "mama_premium":
         await send_message(chat_id, "🔒 Этот раздел доступен в Премиум 💎", upgrade_buttons())
+        return
+
+    if payload == "channel_open_bot":
+        await send_message(user_id,
+            "🤍 Ты пришла из канала «Я МАМА». Здесь можно получить персональный план, вести трекеры и задать вопрос с учётом возраста ребёнка.",
+            pregnant_menu_buttons() if birth_date.startswith("pdr:") else main_menu_buttons() if birth_date else [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"}, {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+        return
+
+    if payload.startswith("channel_poll_"):
+        parts = payload.split("_", 3)
+        if len(parts) == 4:
+            _, _, poll_key, option_key = parts
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO channel_poll_votes (poll_key, user_id, option_key, created_at) VALUES (?,?,?,?)",
+                    (poll_key, user_id, option_key, datetime.now().isoformat()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            await send_message(user_id, "Спасибо за ответ 🤍 Он поможет делать канал полезнее именно для мам.")
         return
 
     if payload == "noop":
@@ -1918,44 +1950,296 @@ async def process_photo(chat_id, user_id, photo_url):
 
 
 # ========== АВТОПОСТИНГ В КАНАЛ ==========
-DAILY_THEMES = {
-    0: "беременность и подготовка к родам",
-    1: "новорождённый 0-3 месяца",
-    2: "малыш 3-12 месяцев",
-    3: "ребёнок 1-3 года",
-    4: "дошкольник 3-7 лет",
-    5: "здоровье и педиатрия",
-    6: "мама о себе — восстановление и психология",
+# Редакционная система MAX-канала: 3 публикации в день,
+# память тем, защита от повторов, опросы и мягкие переходы в личный чат бота.
+
+WEEKLY_EDITORIAL = {
+    0: "организация недели, режим семьи и снижение бытового хаоса",
+    1: "развитие ребёнка без сравнений и лишней тревоги",
+    2: "здоровье понятным языком и безопасные алгоритмы действий",
+    3: "сон, режим и восстановление всей семьи",
+    4: "эмоции мамы, чувство вины, усталость и отношения",
+    5: "семейная жизнь, папа, бабушки, прогулки и простые игры",
+    6: "итоги недели, наблюдения, полезные привычки и подготовка к новой неделе",
 }
 
-RUBRICS = {
-    8:  ("🌅 Доброе утро, мама", "Заряд на день — мотивация, поддержка. 100-150 слов."),
-    10: ("🔬 Научный факт дня", "Интересный факт о детях по ВОЗ или AAP. 150-200 слов."),
-    13: ("💡 Совет педиатра", "Практический совет по ВОЗ/AAP. 200-250 слов."),
-    16: ("🧠 Детская психология", "Объяснение поведения ребёнка по Петрановской/Сигелу. 200-250 слов."),
-    20: ("❤️ Для мамы", "О восстановлении, выгорании. Тепло. 150-200 слов."),
-}
+MORNING_FORMATS = [
+    "короткое тёплое напоминание без наставлений",
+    "одна маленькая задача на день",
+    "поддерживающая мысль для уставшей мамы",
+    "мини-практика на две минуты",
+    "разрешение не быть идеальной",
+]
 
-async def send_to_channel(text):
+DAY_FORMATS = [
+    "сохраняемый чек-лист",
+    "миф или правда с объяснением",
+    "одна ситуация для трёх возрастов",
+    "разбор частой ошибки без осуждения",
+    "пошаговый алгоритм действий",
+    "короткий разбор вопроса мамы",
+    "что нормально, а что стоит обсудить со специалистом",
+    "три практических шага на сегодня",
+]
+
+EVENING_FORMATS = [
+    "короткая история с узнаваемой ситуацией",
+    "вопрос для самопроверки",
+    "мини-кейс до и после использования трекера",
+    "подборка из трёх полезных наблюдений",
+    "мягкая демонстрация одной функции бота",
+]
+
+CHANNEL_SYSTEM_PROMPT = (
+    "Ты редактор полезного канала «Я МАМА» в MAX для беременных и родителей детей до 7 лет. "
+    "Пиши живо, тепло и естественно, без ощущения нейросетевой статьи. "
+    "Не изображай врача и не придумывай истории реальных подписчиц. "
+    "Не вставляй несуществующие исследования, ссылки, точные проценты или спорные медицинские дозировки. "
+    "Медицинские темы подавай осторожно: объясняй общие ориентиры, красные флаги и необходимость очной помощи. "
+    "Не используй канцелярит, длинное вступление, хэштеги и фразы «важно помнить», «давайте разберёмся». "
+    "Каждый пост должен иметь одну ясную мысль и практическую пользу. "
+    "Не повторяй темы и формулировки из истории публикаций."
+)
+
+
+def save_channel_post(slot, theme, format_name, title, text):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO channel_posts (slot, theme, format_name, title, text, created_at) VALUES (?,?,?,?,?,?)",
+            (slot, theme, format_name, title, text, datetime.now().isoformat()),
+        )
+
+
+def get_recent_channel_posts(limit=40):
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT title, theme, format_name, text FROM channel_posts ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def channel_history_for_prompt(limit=30):
+    rows = get_recent_channel_posts(limit)
+    if not rows:
+        return "История пока пустая."
+    lines = []
+    for title, theme, format_name, text in rows:
+        compact = " ".join((text or "").split())[:180]
+        lines.append(f"- {title} | {theme} | {format_name} | {compact}")
+    return "\n".join(lines)
+
+
+def normalize_for_similarity(text):
+    import re
+    return " ".join(re.sub(r"[^а-яёa-z0-9 ]", " ", (text or "").lower()).split())
+
+
+def is_channel_post_too_similar(title, text, threshold=0.66):
+    from difflib import SequenceMatcher
+    candidate = normalize_for_similarity(f"{title} {text}")[:1200]
+    if not candidate:
+        return True
+    for old_title, _, _, old_text in get_recent_channel_posts(50):
+        previous = normalize_for_similarity(f"{old_title} {old_text}")[:1200]
+        if previous and SequenceMatcher(None, candidate, previous).ratio() >= threshold:
+            return True
+    return False
+
+
+def parse_generated_channel_post(raw):
+    raw = (raw or "").replace("**", "").strip()
+    title = "Полезное для мамы"
+    body = raw
+    if raw.startswith("ЗАГОЛОВОК:"):
+        first, _, rest = raw.partition("\n")
+        title = first.replace("ЗАГОЛОВОК:", "", 1).strip() or title
+        body = rest.strip()
+    elif "\n" in raw:
+        first, rest = raw.split("\n", 1)
+        if len(first) <= 90:
+            title = first.strip(" —:•") or title
+            body = rest.strip()
+    return title[:100], body
+
+
+async def generate_channel_post(slot, theme, format_name, instruction, max_chars, with_bot_bridge=False):
+    history = channel_history_for_prompt()
+    bridge = (
+        "В конце добавь один естественный переход к конкретной функции личного бота — не продавай подписку напрямую. "
+        "Подходящие функции: персональный план «Сегодня», дневник сна, трекер кормлений, сводка к врачу, "
+        "недельный отчёт, тревожная кнопка «Ребёнку плохо», психолог. "
+        if with_bot_bridge else
+        "Не упоминай бот и не продавай ничего."
+    )
+    prompt = (
+        f"Время публикации: {slot}.\n"
+        f"Тема дня: {theme}.\n"
+        f"Формат: {format_name}.\n"
+        f"Задача: {instruction}.\n"
+        f"Ограничение: до {max_chars} знаков. Короткие абзацы, удобно читать одной рукой.\n"
+        f"{bridge}\n"
+        "Верни текст в формате:\nЗАГОЛОВОК: короткий цепляющий заголовок\nтекст поста\n\n"
+        "Недавние публикации, которые нельзя повторять:\n"
+        f"{history}"
+    )
+    for _ in range(3):
+        raw = await generate_text(CHANNEL_SYSTEM_PROMPT, prompt, model="gpt-4o-mini")
+        title, body = parse_generated_channel_post(raw)
+        body = body[:max_chars].rstrip()
+        if body and not is_channel_post_too_similar(title, body):
+            return title, body
+        prompt += "\nПредыдущий вариант оказался слишком похож на старые публикации. Выбери совершенно другой угол и примеры."
+    return None, None
+
+
+def channel_open_button(text="Открыть Мамин Помощник"):
+    return [[{"type": "callback", "text": text, "payload": "channel_open_bot"}]]
+
+
+async def send_to_channel(text, buttons=None):
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    payload = {"text": text[:4000]}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{MAX_API}/messages?chat_id={CHANNEL_ID}", json=payload, headers=headers)
-        logging.info(f"Channel post: {r.status_code}")
+    payload = {"text": text[:MAX_TEXT_LIMIT]}
+    if buttons:
+        payload["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(f"{MAX_API}/messages?chat_id={CHANNEL_ID}", json=payload, headers=headers)
+            if not r.is_success:
+                logging.error("Канал MAX: ошибка %s %s", r.status_code, r.text[:500])
+                return False
+            logging.info("Канал MAX: публикация отправлена status=%s", r.status_code)
+            return True
+    except Exception as exc:
+        logging.exception("Канал MAX: ошибка отправки: %s", exc)
+        return False
+
+
+async def publish_channel_post(slot, theme, format_name, title, body, with_button=False, button_text="Открыть Мамин Помощник"):
+    if not title or not body:
+        logging.warning("Канал: публикация %s пропущена — не удалось получить уникальный текст", slot)
+        return
+    final_text = f"{title}\n\n{body}".strip()
+    ok = await send_to_channel(final_text, channel_open_button(button_text) if with_button else None)
+    if ok:
+        save_channel_post(slot, theme, format_name, title, final_text)
+        logging.info("Канал: опубликовано %s | %s | %s", slot, format_name, title)
+
+
+async def post_morning():
+    today = datetime.now(ZoneInfo("Europe/Moscow"))
+    theme = WEEKLY_EDITORIAL[today.weekday()]
+    format_name = MORNING_FORMATS[today.date().toordinal() % len(MORNING_FORMATS)]
+    title, body = await generate_channel_post(
+        "08:00", theme, format_name,
+        "Создай короткий утренний пост на 350–650 знаков. Он должен поддержать маму и дать одно маленькое выполнимое действие на сегодня.",
+        700, with_bot_bridge=False,
+    )
+    await publish_channel_post("morning", theme, format_name, title, body)
+
+
+async def post_afternoon():
+    today = datetime.now(ZoneInfo("Europe/Moscow"))
+    theme = WEEKLY_EDITORIAL[today.weekday()]
+    format_name = DAY_FORMATS[(today.date().toordinal() + today.weekday()) % len(DAY_FORMATS)]
+    title, body = await generate_channel_post(
+        "13:00", theme, format_name,
+        "Создай главный полезный материал дня на 1000–1800 знаков. Дай конкретный алгоритм, чек-лист или разбор ситуации. Материал должен хотеться сохранить или переслать. Не перегружай теорией.",
+        1900, with_bot_bridge=True,
+    )
+    await publish_channel_post("afternoon", theme, format_name, title, body, True, "Получить персональную помощь")
+
+
+async def post_evening_poll():
+    today = datetime.now(ZoneInfo("Europe/Moscow"))
+    polls = {
+        2: ("health", "Что сейчас тревожит вас сильнее всего?", [
+            ("sleep", "Сон ребёнка"), ("food", "Питание или прикорм"),
+            ("health", "Здоровье"), ("fatigue", "Моя усталость"),
+        ]),
+        6: ("week", "Что было самым сложным на этой неделе?", [
+            ("sleep", "Недосып"), ("tantrums", "Капризы ребёнка"),
+            ("time", "Нехватка времени"), ("anxiety", "Тревога и чувство вины"),
+        ]),
+    }
+    poll_data = polls.get(today.weekday())
+    if not poll_data:
+        logging.warning("Канал: для weekday=%s вечерний опрос не настроен", today.weekday())
+        return
+    poll_key_base, question, options = poll_data
+    poll_key = f"{poll_key_base}{today.strftime('%y%m%d')}"
+    buttons = [[{"type": "callback", "text": label, "payload": f"channel_poll_{poll_key}_{key}"}] for key, label in options]
+    ok = await send_to_channel(f"📊 {question}\n\nВыберите один вариант — ответ сохранится анонимно для других участников.", buttons)
+    if ok:
+        save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(label for _, label in options))
+        logging.info("Канал: опубликован опрос | %s", question)
+
+
+async def post_evening():
+    today = datetime.now(ZoneInfo("Europe/Moscow"))
+    if today.weekday() in (2, 6):
+        await post_evening_poll()
+        return
+    theme = WEEKLY_EDITORIAL[today.weekday()]
+    format_name = EVENING_FORMATS[(today.date().toordinal() * 3) % len(EVENING_FORMATS)]
+    with_bridge = today.weekday() in (0, 3, 4)
+    title, body = await generate_channel_post(
+        "20:00", theme, format_name,
+        "Создай вечерний пост на 550–1000 знаков. Он должен вызывать узнавание, реакцию или желание ответить себе на вопрос. Не повторяй дневной материал и не пиши длинную лекцию.",
+        1100, with_bot_bridge=with_bridge,
+    )
+    await publish_channel_post("evening", theme, format_name, title, body, with_bridge, "Попробовать в боте")
+
+
+async def channel_weekly_editorial_report():
+    conn = db_connect()
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    rows = conn.execute(
+        "SELECT slot, format_name, COUNT(*) FROM channel_posts WHERE created_at>=? GROUP BY slot, format_name ORDER BY slot, format_name",
+        (week_ago,),
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM channel_posts WHERE created_at>=?", (week_ago,)).fetchone()[0]
+    last_post = conn.execute("SELECT created_at, slot, title FROM channel_posts ORDER BY created_at DESC LIMIT 1").fetchone()
+    vote_rows = conn.execute(
+        "SELECT poll_key, option_key, COUNT(*) FROM channel_poll_votes WHERE created_at>=? GROUP BY poll_key, option_key ORDER BY poll_key, COUNT(*) DESC",
+        (week_ago,),
+    ).fetchall()
+    conn.close()
+
+    by_slot, by_format = {}, {}
+    for slot, format_name, count in rows:
+        by_slot[slot] = by_slot.get(slot, 0) + count
+        by_format[format_name] = by_format.get(format_name, 0) + count
+    slot_labels = {"morning": "Утренних постов", "afternoon": "Полезных разборов", "evening": "Вечерних постов", "evening_poll": "Опросов"}
+    lines = ["📊 Отчёт MAX-канала за неделю", "", f"Опубликовано материалов: {total}"]
+    for slot in ("morning", "afternoon", "evening", "evening_poll"):
+        lines.append(f"{slot_labels[slot]}: {by_slot.get(slot, 0)}")
+    if by_format:
+        lines.extend(["", "Форматы:"])
+        for format_name, count in sorted(by_format.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(f"• {format_name} — {count}")
+    if vote_rows:
+        lines.extend(["", "Ответы в опросах:"])
+        for poll_key, option_key, count in vote_rows:
+            lines.append(f"• {poll_key}: {option_key} — {count}")
+    if last_post:
+        created_at, slot, title = last_post
+        try: created_label = datetime.fromisoformat(created_at).strftime("%d.%m.%Y %H:%M")
+        except Exception: created_label = created_at
+        lines.extend(["", f"Последняя публикация: {created_label}", f"• {title} ({slot})"])
+    report_text = "\n".join(lines)
+    logging.info("Канал: недельный редакционный отчёт: %s", report_text)
+    await send_message(OWNER_ID, report_text)
+
 
 async def channel_posting_loop():
     from apscheduler.schedulers.asyncio import AsyncIOScheduler as _APScheduler
     scheduler = _APScheduler(timezone="Europe/Moscow")
-    for hour, (rubric_name, rubric_instruction) in RUBRICS.items():
-        async def post_job(h=hour, rn=rubric_name, ri=rubric_instruction):
-            weekday = datetime.now(ZoneInfo("Europe/Moscow")).weekday()
-            daily_theme = DAILY_THEMES[weekday]
-            post = await generate_text(
-                "Ты автор экспертного канала 'Я МАМА' в MAX. Пишешь на основе ВОЗ, AAP, Петрановской. Тепло и научно. В конце — практический совет.",
-                f"Рубрика: {rn}\nТема: {daily_theme}\nИнструкция: {ri}\nНачни с эмодзи рубрики и её названия."
-            )
-            await send_to_channel(post)
-        scheduler.add_job(post_job, "cron", hour=hour, minute=0, id=f"mama_channel_{hour}", replace_existing=True, coalesce=True, misfire_grace_time=1800, max_instances=1)
+    scheduler.add_job(post_morning, "cron", hour=8, minute=0, id="mama_channel_morning", replace_existing=True, coalesce=True, misfire_grace_time=1800, max_instances=1)
+    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0, id="mama_channel_afternoon", replace_existing=True, coalesce=True, misfire_grace_time=1800, max_instances=1)
+    scheduler.add_job(post_evening, "cron", hour=20, minute=0, id="mama_channel_evening", replace_existing=True, coalesce=True, misfire_grace_time=1800, max_instances=1)
+    scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="mama_channel_weekly_report", replace_existing=True, coalesce=True, misfire_grace_time=3600, max_instances=1)
     scheduler.start()
     while True:
         await asyncio.sleep(3600)
