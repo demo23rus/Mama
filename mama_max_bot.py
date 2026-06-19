@@ -21,8 +21,8 @@ OPENAI_KEY = "sk-proj-LXBYeHEQwaKAgRt8EW36D5a74MzZ2vEu1b9s6pFVt-UW73mdwB2udTw72b
 OWNER_ID = 549639607
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
-MAX_BOT_USERNAME = os.getenv("MAX_BOT_USERNAME", "").strip().lstrip("@")
-MAX_BOT_DEEPLINK = f"https://max.ru/{MAX_BOT_USERNAME}?start=channel" if MAX_BOT_USERNAME else ""
+MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
+MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
 
 # Лимиты
 FREE_REQUESTS = 15
@@ -221,27 +221,12 @@ def detect_image_mime(data, declared=None):
     return "image/jpeg"
 
 async def refresh_max_bot_identity():
-    """Получает публичный username бота и собирает официальный MAX deep link."""
-    global MAX_BOT_USERNAME, MAX_BOT_DEEPLINK
-    headers = {"Authorization": MAX_TOKEN}
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(f"{MAX_API}/me", headers=headers)
-        if not response.is_success:
-            logging.error("MAX GET /me: %s %s", response.status_code, response.text[:500])
-            return False
-        data = response.json()
-        username = (data.get("username") or "").strip().lstrip("@")
-        if not username:
-            logging.error("MAX GET /me не вернул username бота")
-            return False
-        MAX_BOT_USERNAME = username
-        MAX_BOT_DEEPLINK = f"https://max.ru/{username}?start=channel"
-        logging.info("MAX deep link для канала: https://max.ru/%s?start=channel", username)
-        return True
-    except Exception as exc:
-        logging.exception("Не удалось получить username MAX-бота: %s", exc)
+    """Использует подтверждённую публичную ссылку MAX-бота."""
+    if not MAX_BOT_PUBLIC_URL:
+        logging.error("Публичная ссылка MAX-бота не задана")
         return False
+    logging.info("MAX ссылка для канала: %s", MAX_BOT_PUBLIC_URL)
+    return True
 
 
 # ========== КНОПКИ ==========
@@ -2123,7 +2108,7 @@ async def generate_channel_post(slot, theme, format_name, instruction, max_chars
 
 def channel_open_button(text="Открыть Мамин Помощник"):
     if not MAX_BOT_DEEPLINK:
-        logging.error("Кнопка перехода в бот не добавлена: неизвестен MAX_BOT_USERNAME")
+        logging.error("Кнопка перехода в бот не добавлена: не задан MAX_BOT_PUBLIC_URL")
         return None
     return [[{"type": "link", "text": text, "url": MAX_BOT_DEEPLINK}]]
 
@@ -2150,8 +2135,20 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     if not title or not body:
         logging.warning("Канал: публикация %s пропущена — не удалось получить уникальный текст", slot)
         return
+
     final_text = f"{title}\n\n{body}".strip()
-    ok = await send_to_channel(final_text, channel_open_button(button_text) if with_button else None)
+    buttons = None
+
+    # В каналах некоторые клиенты MAX не открывают внутренний max.ru deep link
+    # из inline link-кнопки. Поэтому дублируем переход обычной ссылкой в тексте.
+    if with_button:
+        if MAX_BOT_DEEPLINK:
+            final_text += f"\n\n🤍 Персональная помощь в боте:\n{MAX_BOT_DEEPLINK}"
+            buttons = channel_open_button(button_text)
+        else:
+            logging.error("Канал: публикация без перехода — публичная ссылка бота не определена")
+
+    ok = await send_to_channel(final_text, buttons)
     if ok:
         save_channel_post(slot, theme, format_name, title, final_text)
         logging.info("Канал: опубликовано %s | %s | %s", slot, format_name, title)
@@ -2283,7 +2280,15 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup():
     init_db()
-    await refresh_max_bot_identity()
+    identity_ok = await refresh_max_bot_identity()
+    if identity_ok and MAX_BOT_DEEPLINK:
+        logging.info("Публичная ссылка MAX-бота для канала: %s", MAX_BOT_DEEPLINK)
+        try:
+            await send_message(OWNER_ID, f"✅ Ссылка канала на бота настроена:\n{MAX_BOT_DEEPLINK}\n\nОна будет публиковаться и текстом, и кнопкой.")
+        except Exception as exc:
+            logging.warning("Не удалось отправить владельцу диагностическую ссылку: %s", exc)
+    else:
+        logging.error("Публичная ссылка MAX-бота не определена в MAX_BOT_PUBLIC_URL.")
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
