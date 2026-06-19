@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import uvicorn
 import gspread
 from google.oauth2.service_account import Credentials
@@ -23,6 +23,7 @@ CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
 MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
 MAX_BOT_DEEPLINK = f"{MAX_BOT_PUBLIC_URL}?start=channel"
+MAX_BOT_CHANNEL_LINK = "https://maminpomoshnik.ru/open-max-bot"
 
 # Лимиты
 FREE_REQUESTS = 15
@@ -2107,10 +2108,10 @@ async def generate_channel_post(slot, theme, format_name, instruction, max_chars
 
 
 def channel_open_button(text="Открыть Мамин Помощник"):
-    if not MAX_BOT_DEEPLINK:
-        logging.error("Кнопка перехода в бот не добавлена: не задан MAX_BOT_PUBLIC_URL")
+    if not MAX_BOT_CHANNEL_LINK:
+        logging.error("Кнопка перехода в бот не добавлена: не задан MAX_BOT_CHANNEL_LINK")
         return None
-    return [[{"type": "link", "text": text, "url": MAX_BOT_DEEPLINK}]]
+    return [[{"type": "link", "text": text, "url": MAX_BOT_CHANNEL_LINK}]]
 
 
 async def send_to_channel(text, buttons=None):
@@ -2142,8 +2143,8 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     # Дублируем переход двумя официально поддерживаемыми способами:
     # Markdown-ссылкой в тексте и link-кнопкой.
     if with_button:
-        if MAX_BOT_DEEPLINK:
-            final_text += f"\n\n🤍 [{button_text}]({MAX_BOT_DEEPLINK})"
+        if MAX_BOT_CHANNEL_LINK:
+            final_text += f"\n\n🤍 Открыть бота: {MAX_BOT_CHANNEL_LINK}"
             buttons = channel_open_button(button_text)
         else:
             logging.error("Канал: публикация без перехода — публичная ссылка бота не определена")
@@ -2424,6 +2425,37 @@ async def process_voice(chat_id, user_id, audio_url, first_name=""):
         logging.error(f"Voice error: {e}")
         await send_message(chat_id, "Ошибка распознавания. Попробуй написать текстом 💕")
 
+
+
+@app.get("/open-max-bot")
+async def open_max_bot():
+    """Промежуточная страница для перехода из канала MAX в личный чат бота."""
+    target = MAX_BOT_DEEPLINK or MAX_BOT_PUBLIC_URL
+    return HTMLResponse(f"""
+    <!doctype html>
+    <html lang="ru">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      <meta http-equiv="refresh" content="0;url={target}">
+      <title>Открываем Мамин Помощник</title>
+      <style>
+        body {{font-family:Arial,sans-serif;background:#fff5f8;color:#222;text-align:center;padding:48px 20px}}
+        .card {{max-width:520px;margin:auto;background:#fff;border-radius:24px;padding:32px;box-shadow:0 12px 40px rgba(0,0,0,.08)}}
+        a {{display:inline-block;margin-top:20px;padding:15px 24px;border-radius:14px;background:#7b61ff;color:#fff;text-decoration:none;font-weight:700}}
+      </style>
+      <script>setTimeout(function(){{window.location.href={target!r};}},300);</script>
+    </head>
+    <body>
+      <div class="card">
+        <div style="font-size:52px">🤱</div>
+        <h1>Открываем Мамин Помощник</h1>
+        <p>Если приложение MAX не открылось автоматически, нажмите кнопку ниже.</p>
+        <a href="{target}">Открыть бота в MAX</a>
+      </div>
+    </body>
+    </html>
+    """)
 
 @app.get("/payment/success")
 async def payment_success():
