@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 import logging
+import os
 import uuid
 import httpx
 import calendar
@@ -20,6 +21,8 @@ OPENAI_KEY = "sk-proj-LXBYeHEQwaKAgRt8EW36D5a74MzZ2vEu1b9s6pFVt-UW73mdwB2udTw72b
 OWNER_ID = 549639607
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
+MAX_BOT_USERNAME = os.getenv("MAX_BOT_USERNAME", "").strip().lstrip("@")
+MAX_BOT_DEEPLINK = f"https://max.ru/{MAX_BOT_USERNAME}?start=channel" if MAX_BOT_USERNAME else ""
 
 # Лимиты
 FREE_REQUESTS = 15
@@ -216,6 +219,30 @@ def detect_image_mime(data, declared=None):
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
     return "image/jpeg"
+
+async def refresh_max_bot_identity():
+    """Получает публичный username бота и собирает официальный MAX deep link."""
+    global MAX_BOT_USERNAME, MAX_BOT_DEEPLINK
+    headers = {"Authorization": MAX_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.get(f"{MAX_API}/me", headers=headers)
+        if not response.is_success:
+            logging.error("MAX GET /me: %s %s", response.status_code, response.text[:500])
+            return False
+        data = response.json()
+        username = (data.get("username") or "").strip().lstrip("@")
+        if not username:
+            logging.error("MAX GET /me не вернул username бота")
+            return False
+        MAX_BOT_USERNAME = username
+        MAX_BOT_DEEPLINK = f"https://max.ru/{username}?start=channel"
+        logging.info("MAX deep link для канала: https://max.ru/%s?start=channel", username)
+        return True
+    except Exception as exc:
+        logging.exception("Не удалось получить username MAX-бота: %s", exc)
+        return False
+
 
 # ========== КНОПКИ ==========
 def pregnant_menu_buttons():
@@ -2095,7 +2122,10 @@ async def generate_channel_post(slot, theme, format_name, instruction, max_chars
 
 
 def channel_open_button(text="Открыть Мамин Помощник"):
-    return [[{"type": "callback", "text": text, "payload": "channel_open_bot"}]]
+    if not MAX_BOT_DEEPLINK:
+        logging.error("Кнопка перехода в бот не добавлена: неизвестен MAX_BOT_USERNAME")
+        return None
+    return [[{"type": "link", "text": text, "url": MAX_BOT_DEEPLINK}]]
 
 
 async def send_to_channel(text, buttons=None):
@@ -2253,6 +2283,7 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup():
     init_db()
+    await refresh_max_bot_identity()
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -2277,8 +2308,9 @@ async def webhook(request: Request):
 
         if update_type == "bot_started":
             user = data.get("user", {})
-            chat_id = user.get("user_id")
-            user_id = chat_id
+            start_payload = data.get("payload") or ""
+            chat_id = data.get("chat_id") or user.get("user_id")
+            user_id = user.get("user_id") or chat_id
             # Игнорируем если это канал
             if not user_id or user_id == CHANNEL_ID:
                 return JSONResponse({"ok": True})
@@ -2288,9 +2320,22 @@ async def webhook(request: Request):
             set_step(user_id, "idle")
             plan, _ = get_subscription(user_id)
             asyncio.create_task(asyncio.to_thread(sheets_log_visit, user_id, first_name, username, plan))
-            await send_message(chat_id, WELCOME_TEXT.format(name=first_name),
-                [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-                  {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+            existing_user = get_user(user_id, username, first_name)
+            existing_birth_date = existing_user.get("birth_date", "")
+            if start_payload == "channel":
+                intro = "🤍 Ты пришла из канала «Я МАМА». Здесь рекомендации становятся персональными — с учётом срока беременности или возраста малыша.\n\n"
+            else:
+                intro = ""
+            if existing_birth_date.startswith("pdr:"):
+                weeks = calc_pregnancy_weeks(existing_birth_date[4:])
+                await send_message(chat_id, intro + f"🤰 Ты на {weeks} неделе беременности. Чем могу помочь?", pregnant_menu_buttons())
+            elif existing_birth_date:
+                months = calc_child_age(existing_birth_date)
+                await send_message(chat_id, intro + f"👶 Малышу {age_label(months)}. Чем могу помочь?", main_menu_buttons())
+            else:
+                await send_message(chat_id, intro + WELCOME_TEXT.format(name=first_name),
+                    [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
+                      {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
 
         elif update_type == "message_created":
             sender = message.get("sender", {})
