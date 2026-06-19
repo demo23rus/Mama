@@ -22,7 +22,7 @@ OWNER_ID = 549639607
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
 MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
-MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
+MAX_BOT_DEEPLINK = f"{MAX_BOT_PUBLIC_URL}?start=channel"
 
 # Лимиты
 FREE_REQUESTS = 15
@@ -2115,7 +2115,7 @@ def channel_open_button(text="Открыть Мамин Помощник"):
 
 async def send_to_channel(text, buttons=None):
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    payload = {"text": text[:MAX_TEXT_LIMIT]}
+    payload = {"text": text[:MAX_TEXT_LIMIT], "format": "markdown"}
     if buttons:
         payload["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
     try:
@@ -2139,11 +2139,11 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     final_text = f"{title}\n\n{body}".strip()
     buttons = None
 
-    # В каналах некоторые клиенты MAX не открывают внутренний max.ru deep link
-    # из inline link-кнопки. Поэтому дублируем переход обычной ссылкой в тексте.
+    # Дублируем переход двумя официально поддерживаемыми способами:
+    # Markdown-ссылкой в тексте и link-кнопкой.
     if with_button:
         if MAX_BOT_DEEPLINK:
-            final_text += f"\n\n🤍 Персональная помощь в боте:\n{MAX_BOT_DEEPLINK}"
+            final_text += f"\n\n🤍 [{button_text}]({MAX_BOT_DEEPLINK})"
             buttons = channel_open_button(button_text)
         else:
             logging.error("Канал: публикация без перехода — публичная ссылка бота не определена")
