@@ -2,9 +2,9 @@ import asyncio
 import logging
 import sqlite3
 import os
-from datetime import datetime, date
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from datetime import datetime, date, timedelta
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,6 +35,7 @@ _env = load_env()
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN  = "8769245157:AAH2EbEFpGj8MzuHUMiBKeLB7eJztyxfC1s"
 SUPPORT_USERNAME = "@demo23rus"
+CHANNEL_REPORT_CHAT_ID = _env.get("CHANNEL_REPORT_CHAT_ID", SUPPORT_USERNAME)
 BOT_NAME = "Мамин помощник"
 OPENAI_KEY = "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"
 
@@ -54,6 +55,10 @@ dp = Dispatcher(storage=MemoryStorage())
 client = AsyncOpenAI(api_key=OPENAI_KEY)
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 logging.basicConfig(level=logging.INFO)
+
+DB_PATH = "/root/mama.db"
+FREE_REQUESTS = 10
+
 
 # ─── FSM СОСТОЯНИЯ ───────────────────────────────────────────
 class RegStates(StatesGroup):
@@ -87,9 +92,130 @@ class BenefitsStates(StatesGroup):
 class PsychoStates(StatesGroup):
     in_session = State()
 
+class EmergencyStates(StatesGroup):
+    waiting_description = State()
+
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+def _table_columns(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+def _add_column_if_missing(conn, table, column, definition):
+    if column not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        logging.info(f"DB migration: added {table}.{column}")
+
+def _run_db_migrations(conn):
+    """Безопасно обновляет старую mama.db без удаления пользовательских данных."""
+    migrations = {
+        "users": {
+            "mode": "TEXT DEFAULT ''",
+            "date_value": "TEXT DEFAULT ''",
+            "name": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "diary": {
+            "user_id": "INTEGER",
+            "entry": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "growth": {
+            "user_id": "INTEGER",
+            "height": "REAL",
+            "weight": "REAL",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "symptoms": {
+            "user_id": "INTEGER",
+            "symptom": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "feeding": {
+            "user_id": "INTEGER",
+            "side": "TEXT DEFAULT ''",
+            "duration": "INTEGER DEFAULT 0",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "sleep_log": {
+            "user_id": "INTEGER",
+            "action": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "psycho_history": {
+            "user_id": "INTEGER",
+            "role": "TEXT DEFAULT ''",
+            "content": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "vaccinations": {
+            "user_id": "INTEGER",
+            "vaccine": "TEXT DEFAULT ''",
+            "scheduled_date": "TEXT DEFAULT ''",
+            "done": "INTEGER DEFAULT 0",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "subscriptions": {
+            "plan": "TEXT DEFAULT ''",
+            "sub_end": "TEXT DEFAULT ''",
+        },
+        "pending_payments": {
+            "user_id": "INTEGER",
+            "plan": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+        "requests_count": {
+            "count": "INTEGER DEFAULT 0",
+        },
+        "channel_posts": {
+            "slot": "TEXT DEFAULT ''",
+            "theme": "TEXT DEFAULT ''",
+            "format_name": "TEXT DEFAULT ''",
+            "title": "TEXT DEFAULT ''",
+            "text": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+        },
+    }
+    for table, columns in migrations.items():
+        for column, definition in columns.items():
+            _add_column_if_missing(conn, table, column, definition)
+
+    # Совместимость с возможной старой схемой MAX/ранней TG-версии.
+    user_cols = _table_columns(conn, "users")
+    if "first_name" in user_cols and "name" in user_cols:
+        conn.execute(
+            "UPDATE users SET name=COALESCE(NULLIF(name, ''), first_name, '')"
+        )
+    if "birth_date" in user_cols and "date_value" in user_cols:
+        conn.execute(
+            "UPDATE users SET date_value=COALESCE(NULLIF(date_value, ''), REPLACE(birth_date, 'pdr:', ''), '')"
+        )
+    if "birth_date" in user_cols and "mode" in user_cols:
+        conn.execute(
+            "UPDATE users SET mode=CASE "
+            "WHEN COALESCE(mode, '')<>'' THEN mode "
+            "WHEN birth_date LIKE 'pdr:%' THEN 'pregnant' "
+            "WHEN COALESCE(birth_date, '')<>'' THEN 'mama' ELSE mode END"
+        )
+
+    # Индексы ускоряют отчёты, трекеры и напоминания на существующей базе.
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_diary_user_date ON diary(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_growth_user_date ON growth(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_symptoms_user_date ON symptoms(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feeding_user_date ON feeding(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sleep_user_date ON sleep_log(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_psycho_user_date ON psycho_history(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_vaccinations_user_date ON vaccinations(user_id, scheduled_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_date ON channel_posts(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_channel_posts_slot ON channel_posts(slot, created_at)")
+
 def init_db():
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
+    conn.execute("PRAGMA journal_mode=WAL")
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -182,11 +308,23 @@ def init_db():
             count INTEGER DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS channel_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slot TEXT DEFAULT '',
+            theme TEXT DEFAULT '',
+            format_name TEXT DEFAULT '',
+            title TEXT DEFAULT '',
+            text TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        )
+    """)
+    _run_db_migrations(conn)
     conn.commit()
     conn.close()
 
 def save_user(user_id, mode, date_value, name=""):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("""
         INSERT OR REPLACE INTO users (user_id, mode, date_value, name, created_at)
@@ -196,7 +334,7 @@ def save_user(user_id, mode, date_value, name=""):
     conn.close()
 
 def get_user(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT mode, date_value, name FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -204,7 +342,7 @@ def get_user(user_id):
     return row
 
 def save_diary(user_id, entry):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("""
         INSERT INTO diary (user_id, entry, created_at)
@@ -214,7 +352,7 @@ def save_diary(user_id, entry):
     conn.close()
 
 def get_diary(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT entry, created_at FROM diary WHERE user_id=? ORDER BY created_at DESC LIMIT 20", (user_id,))
     rows = c.fetchall()
@@ -222,7 +360,7 @@ def get_diary(user_id):
     return rows
 
 def save_growth(user_id, height, weight):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO growth (user_id, height, weight, created_at) VALUES (?, ?, ?, ?)",
               (user_id, height, weight, datetime.now().isoformat()))
@@ -230,7 +368,7 @@ def save_growth(user_id, height, weight):
     conn.close()
 
 def get_growth(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user_id,))
     rows = c.fetchall()
@@ -238,7 +376,7 @@ def get_growth(user_id):
     return rows
 
 def save_symptom(user_id, symptom):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO symptoms (user_id, symptom, created_at) VALUES (?, ?, ?)",
               (user_id, symptom, datetime.now().isoformat()))
@@ -246,7 +384,7 @@ def save_symptom(user_id, symptom):
     conn.close()
 
 def get_symptoms(user_id, days=7):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT 30", (user_id,))
     rows = c.fetchall()
@@ -254,7 +392,7 @@ def get_symptoms(user_id, days=7):
     return rows
 
 def save_feeding(user_id, side, duration):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO feeding (user_id, side, duration, created_at) VALUES (?, ?, ?, ?)",
               (user_id, side, duration, datetime.now().isoformat()))
@@ -262,7 +400,7 @@ def save_feeding(user_id, side, duration):
     conn.close()
 
 def get_feedings(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT side, duration, created_at FROM feeding WHERE user_id=? ORDER BY created_at DESC LIMIT 20", (user_id,))
     rows = c.fetchall()
@@ -270,7 +408,7 @@ def get_feedings(user_id):
     return rows
 
 def save_sleep(user_id, action):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO sleep_log (user_id, action, created_at) VALUES (?, ?, ?)",
               (user_id, action, datetime.now().isoformat()))
@@ -278,7 +416,7 @@ def save_sleep(user_id, action):
     conn.close()
 
 def get_sleep_log(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT action, created_at FROM sleep_log WHERE user_id=? ORDER BY created_at DESC LIMIT 20", (user_id,))
     rows = c.fetchall()
@@ -286,7 +424,7 @@ def get_sleep_log(user_id):
     return rows
 
 def get_subscription(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT plan, sub_end FROM subscriptions WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -296,9 +434,17 @@ def get_subscription(user_id):
     return row[0], row[1]
 
 def set_subscription(user_id, plan, days):
-    from datetime import timedelta
-    end = (datetime.now() + timedelta(days=days)).isoformat()
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
+    row = conn.execute("SELECT sub_end FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
+    start = datetime.now()
+    if row and row[0]:
+        try:
+            current_end = datetime.fromisoformat(row[0])
+            if current_end > start:
+                start = current_end
+        except ValueError:
+            pass
+    end = (start + timedelta(days=days)).isoformat()
     conn.execute("INSERT OR REPLACE INTO subscriptions (user_id, plan, sub_end) VALUES (?,?,?)",
                  (user_id, plan, end))
     conn.commit()
@@ -312,7 +458,7 @@ def is_premium(user_id):
     return False
 
 def get_request_count(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT count FROM requests_count WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -320,21 +466,21 @@ def get_request_count(user_id):
     return row[0] if row else 0
 
 def increment_request_count(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     conn.execute("INSERT OR REPLACE INTO requests_count (user_id, count) VALUES (?, COALESCE((SELECT count FROM requests_count WHERE user_id=?), 0) + 1)",
                  (user_id, user_id))
     conn.commit()
     conn.close()
 
 def save_pending_payment(payment_id, user_id, plan):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     conn.execute("INSERT INTO pending_payments (payment_id, user_id, plan, created_at) VALUES (?,?,?,?)",
                  (payment_id, user_id, plan, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
 def get_pending_payments():
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT payment_id, user_id, plan FROM pending_payments")
     rows = c.fetchall()
@@ -342,13 +488,13 @@ def get_pending_payments():
     return rows
 
 def delete_pending_payment(payment_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
     conn.commit()
     conn.close()
 
 def save_vaccination(user_id, vaccine, scheduled_date):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO vaccinations (user_id, vaccine, scheduled_date, created_at) VALUES (?, ?, ?, ?)",
               (user_id, vaccine, scheduled_date, datetime.now().isoformat()))
@@ -356,7 +502,7 @@ def save_vaccination(user_id, vaccine, scheduled_date):
     conn.close()
 
 def get_vaccinations(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT id, vaccine, scheduled_date, done FROM vaccinations WHERE user_id=? ORDER BY scheduled_date", (user_id,))
     rows = c.fetchall()
@@ -364,7 +510,7 @@ def get_vaccinations(user_id):
     return rows
 
 def save_psycho_message(user_id, role, content):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("INSERT INTO psycho_history (user_id, role, content, created_at) VALUES (?,?,?,?)",
               (user_id, role, content, datetime.now().isoformat()))
@@ -372,7 +518,7 @@ def save_psycho_message(user_id, role, content):
     conn.close()
 
 def get_psycho_history(user_id, limit=15):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     c.execute("SELECT role, content FROM psycho_history WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
               (user_id, limit))
@@ -381,15 +527,15 @@ def get_psycho_history(user_id, limit=15):
     return list(reversed(rows))
 
 def clear_psycho_history(user_id):
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     conn.execute("DELETE FROM psycho_history WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
 
-def mark_vaccination_done(vac_id):
-    conn = sqlite3.connect("/root/mama.db")
+def mark_vaccination_done(vac_id, user_id):
+    conn = db_connect()
     c = conn.cursor()
-    c.execute("UPDATE vaccinations SET done=1 WHERE id=?", (vac_id,))
+    c.execute("UPDATE vaccinations SET done=1 WHERE id=? AND user_id=?", (vac_id, user_id))
     conn.commit()
     conn.close()
 
@@ -461,6 +607,105 @@ async def ask_gpt(system_prompt, user_prompt):
     except Exception as e:
         return f"Ошибка GPT: {e}"
 
+# ─── ПЕРСОНАЛЬНАЯ АНАЛИТИКА И ДОСТУП ────────────────────────
+PREMIUM_CALLBACKS = {
+    "tracker_growth", "growth_add", "growth_analyze",
+    "tracker_symptoms", "symptom_add", "symptom_analyze",
+    "tracker_feeding", "feed_left", "feed_right", "feed_bottle", "feed_stats",
+    "tracker_sleep", "sleep_start", "sleep_end", "sleep_analyze",
+    "tracker_vaccines", "vaccines_create", "vaccines_done", "vaccines_info",
+    "vac_bcg", "vac_hepb", "vac_akds", "vac_polio", "vac_pneumo", "vac_kpk", "vac_varicella",
+    "benefits_menu", "ben_birth", "ben_15", "ben_3", "ben_matcap", "ben_decree", "ben_multi", "ben_personal",
+    "photo_menu", "photo_analysis", "photo_uzi", "photo_med_preg", "photo_skin", "photo_stool", "photo_food", "photo_package",
+    "psycho_start", "psycho_clear", "doctor_prep", "weekly_report"
+}
+
+class PremiumCallbackMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        if isinstance(event, CallbackQuery):
+            payload = event.data or ""
+            protected = payload in PREMIUM_CALLBACKS or payload.startswith("vac_done_")
+            if protected and not is_premium(event.from_user.id):
+                await event.answer("Функция доступна в Премиум", show_alert=True)
+                await event.message.answer(
+                    "🔒 Эта функция доступна в Премиум 💎\n\n"
+                    "Трекеры, фото, психолог, отчёты и безлимитные вопросы — 299 руб/месяц.",
+                    reply_markup=kb_premium()
+                )
+                return
+        return await handler(event, data)
+
+
+def get_recent_family_data(user_id, days=7):
+    since = (datetime.now() - timedelta(days=days)).isoformat()
+    conn = db_connect()
+    symptoms = conn.execute(
+        "SELECT symptom, created_at FROM symptoms WHERE user_id=? AND created_at>=? ORDER BY created_at",
+        (user_id, since)
+    ).fetchall()
+    diary = conn.execute(
+        "SELECT entry, created_at FROM diary WHERE user_id=? AND created_at>=? ORDER BY created_at",
+        (user_id, since)
+    ).fetchall()
+    feedings = conn.execute(
+        "SELECT side, duration, created_at FROM feeding WHERE user_id=? AND created_at>=? ORDER BY created_at",
+        (user_id, since)
+    ).fetchall()
+    sleep = conn.execute(
+        "SELECT action, created_at FROM sleep_log WHERE user_id=? AND created_at>=? ORDER BY created_at",
+        (user_id, since)
+    ).fetchall()
+    growth = conn.execute(
+        "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 3",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+    return {"symptoms": symptoms, "diary": diary, "feedings": feedings, "sleep": sleep, "growth": growth}
+
+
+def format_recent_data(data, days=7):
+    parts = [
+        f"Период: последние {days} дней.",
+        f"Кормления: {len(data['feedings'])} записей.",
+        f"Сон: {len(data['sleep'])} событий.",
+        f"Симптомы: {len(data['symptoms'])} записей.",
+        f"Дневник: {len(data['diary'])} записей.",
+    ]
+    if data["symptoms"]:
+        parts.append("Симптомы:\n" + "\n".join(
+            f"- {datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {text}"
+            for text, dt in data["symptoms"][-10:]
+        ))
+    if data["growth"]:
+        parts.append("Последние замеры:\n" + "\n".join(
+            f"- {datetime.fromisoformat(dt).strftime('%d.%m.%Y')}: {h} см, {w} кг"
+            for h, w, dt in reversed(data["growth"])
+        ))
+    if data["feedings"]:
+        parts.append("Последние кормления:\n" + "\n".join(
+            f"- {datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {side}, {dur} мин"
+            for side, dur, dt in data["feedings"][-10:]
+        ))
+    if data["sleep"]:
+        parts.append("Последние события сна:\n" + "\n".join(
+            f"- {datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {action}"
+            for action, dt in data["sleep"][-12:]
+        ))
+    return "\n\n".join(parts)
+
+
+def kb_emergency():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌡 Температура", callback_data="em_fever"),
+         InlineKeyboardButton(text="😮‍💨 Дыхание", callback_data="em_breath")],
+        [InlineKeyboardButton(text="🤮 Рвота/понос", callback_data="em_vomit"),
+         InlineKeyboardButton(text="😴 Сильная вялость", callback_data="em_lethargic")],
+        [InlineKeyboardButton(text="🔴 Внезапная сыпь", callback_data="em_rash"),
+         InlineKeyboardButton(text="😭 Безутешный плач", callback_data="em_crying")],
+        [InlineKeyboardButton(text="✍️ Другое — описать", callback_data="em_other")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="menu_mama")]
+    ])
+
 # ─── КЛАВИАТУРЫ ──────────────────────────────────────────────
 def kb_start():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -473,11 +718,12 @@ def kb_start():
 
 def kb_pregnant_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✨ Сегодня для меня", callback_data="today_brief")],
         [InlineKeyboardButton(text="📊 Мой срок", callback_data="preg_week")],
         [InlineKeyboardButton(text="👶 Развитие малыша", callback_data="preg_baby")],
         [InlineKeyboardButton(text="✅ Чек-лист", callback_data="preg_checklist")],
         [InlineKeyboardButton(text="🛍 Список покупок", callback_data="preg_shop")],
-        [InlineKeyboardButton(text="📸 Анализ фото 🔒", callback_data="show_premium")],
+        [InlineKeyboardButton(text="📸 Анализ фото 🔒", callback_data="photo_menu")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
@@ -487,6 +733,9 @@ def kb_pregnant_menu():
 
 def kb_mama_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✨ Сегодня для нас", callback_data="today_brief")],
+        [InlineKeyboardButton(text="🚨 Ребёнку плохо", callback_data="emergency"),
+         InlineKeyboardButton(text="🩺 К врачу 🔒", callback_data="doctor_prep")],
         [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
         [InlineKeyboardButton(text="💉 Прививки 🔒", callback_data="check_premium_vaccines"),
          InlineKeyboardButton(text="📏 Рост и вес 🔒", callback_data="check_premium_growth")],
@@ -510,7 +759,9 @@ def kb_mama_menu():
          InlineKeyboardButton(text="👨‍👩‍👧 Отношения в семье", callback_data="mama_family")],
         [InlineKeyboardButton(text="🧠 Эмоции мамы", callback_data="mama_emotions"),
          InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
-        [InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог 🔒", callback_data="psycho_start"),
+         InlineKeyboardButton(text="📸 Анализ фото 🔒", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="📈 Отчёт за 7 дней 🔒", callback_data="weekly_report")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
@@ -734,6 +985,131 @@ async def change_data(call: CallbackQuery, state: FSMContext):
         "Выбери свой статус 👇",
         reply_markup=kb_start()
     )
+
+# ─── ПЕРСОНАЛЬНЫЕ И КОММЕРЧЕСКИЕ ФУНКЦИИ ─────────────────
+@dp.callback_query(F.data == "today_brief")
+async def today_brief(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user:
+        await call.answer("Сначала укажи данные", show_alert=True)
+        return
+    mode, date_value, _ = user
+    await call.message.answer("✨ Собираю персональный план на сегодня...")
+    if mode == "pregnant":
+        weeks, days = calc_pregnancy_weeks(date_value)
+        prompt = (
+            f"Беременная на {weeks} неделе и {days} дне. Составь короткий персональный план на сегодня: "
+            "что происходит с малышом, один пункт заботы о маме, одно полезное действие и один красный флаг. "
+            "Не ставь диагноз и не запугивай. Максимум 350 слов."
+        )
+        title = "✨ Сегодня для тебя"
+        markup = kb_back_to_menu("pregnant")
+    else:
+        months, _ = calc_child_age(date_value)
+        data = get_recent_family_data(call.from_user.id, 2)
+        prompt = (
+            f"Ребёнку {age_label(months)}. За 2 дня: кормлений {len(data['feedings'])}, "
+            f"событий сна {len(data['sleep'])}, симптомов {len(data['symptoms'])}. "
+            "Составь короткий план на сегодня: возрастной фокус, одна игра, совет по режиму и забота о маме. "
+            "При недостатке данных не делай медицинских выводов. Максимум 350 слов."
+        )
+        title = "✨ Сегодня для вас"
+        markup = kb_back_to_menu("mama")
+    answer = await ask_gpt(EXPERT_BASE if mode == "mama" else EXPERT_PREG, prompt)
+    await send_long_message(call.message.chat.id, f"{title}\n\n{answer}", reply_markup=markup)
+
+
+@dp.callback_query(F.data == "emergency")
+async def emergency_menu(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user or user[0] != "mama":
+        await call.message.answer("Тревожная кнопка предназначена для ребёнка после рождения. При угрозе жизни звони 112.")
+        return
+    await call.message.answer(
+        "🚨 Ребёнку плохо\n\nВыбери главное проявление. Раздел помогает оценить срочность, но не заменяет врача. "
+        "Если ребёнок не дышит, синеет, не реагирует или у него судороги — звони 112 сразу.",
+        reply_markup=kb_emergency()
+    )
+
+EMERGENCY_GUIDES = {
+    "em_fever": ("🌡 Температура", "Звони 112 при судорогах, нарушении дыхания, синюшности, потере сознания или не бледнеющей сыпи. Для ребёнка младше 3 месяцев температура 38°C и выше требует срочной медицинской оценки. Не укутывай и не растирай спиртом или уксусом. Предлагай питьё или грудь чаще. Лекарство давай только подходящее по возрасту и весу по рекомендации врача."),
+    "em_breath": ("😮‍💨 Проблемы с дыханием", "Звони 112 немедленно, если синеют губы, есть паузы дыхания, выраженное втяжение межрёберий, спутанность или потеря сознания. Держи ребёнка вертикально, освободи тесную одежду, не давай еду и не пытайся осматривать горло предметами."),
+    "em_vomit": ("🤮 Рвота или понос", "Звони 112 при крови, зелёной рвоте, судорогах, резкой боли или нарушении сознания. Срочно к врачу при отсутствии мочи, сухих губах, отсутствии слёз и запавших глазах. Отпаивай часто маленькими порциями; не давай противорвотные и противодиарейные средства без врача."),
+    "em_lethargic": ("😴 Сильная вялость", "Если ребёнка трудно разбудить, он не удерживает взгляд, необычно обмяк или вялость сопровождается нарушением дыхания — звони 112. Проверь дыхание, цвет кожи и температуру. Не заставляй есть и не оставляй одного."),
+    "em_rash": ("🔴 Внезапная сыпь", "Надави прозрачным стаканом на сыпь. Если пятна не бледнеют, особенно вместе с температурой или вялостью, — звони 112. Также срочно вызывай помощь при отёке губ или языка, осиплости и затруднении дыхания."),
+    "em_crying": ("😭 Безутешный плач", "Звони 112 при нарушении дыхания, посинении, судорогах, травме, резкой вялости или необычном пронзительном крике с рвотой. Проверь температуру, подгузник, голод, одежду и пальцы на пережимающий волос. Никогда не встряхивай ребёнка."),
+}
+
+@dp.callback_query(F.data.in_(set(EMERGENCY_GUIDES)))
+async def emergency_guide(call: CallbackQuery):
+    title, guide = EMERGENCY_GUIDES[call.data]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К симптомам", callback_data="emergency")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="menu_mama")]
+    ])
+    await call.message.answer(f"🚨 {title}\n\n{guide}\n\nЕсли сомневаешься — лучше позвонить 112 или в неотложную помощь.", reply_markup=kb)
+
+@dp.callback_query(F.data == "em_other")
+async def emergency_other_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(EmergencyStates.waiting_description)
+    await call.message.answer(
+        "✍️ Опиши ситуацию одним сообщением:\n\n• возраст;\n• что произошло;\n• температура;\n• как дышит и реагирует;\n• когда началось.\n\n"
+        "При потере сознания, судорогах или нарушении дыхания не жди ответа — звони 112."
+    )
+
+@dp.message(EmergencyStates.waiting_description, F.text)
+async def emergency_other_answer(message: Message, state: FSMContext):
+    await state.clear()
+    user = get_user(message.from_user.id)
+    months = calc_child_age(user[1])[0] if user and user[0] == "mama" else None
+    answer = await ask_gpt(
+        "Ты медицинский навигатор. Сначала укажи, есть ли повод звонить 112. Затем безопасные действия до врача и уточняющие вопросы. Не ставь диагноз, не назначай препараты и дозировки.",
+        f"Ребёнку {age_label(months) if months is not None else 'неизвестного возраста'}. Ситуация: {message.text}"
+    )
+    await message.answer("🚨 Оценка срочности\n\n" + answer, reply_markup=kb_emergency())
+
+@dp.callback_query(F.data == "doctor_prep")
+async def doctor_prep(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user or user[0] != "mama":
+        await call.message.answer("Сводка для педиатра доступна после рождения малыша.")
+        return
+    months, _ = calc_child_age(user[1])
+    data = get_recent_family_data(call.from_user.id, 14)
+    raw = format_recent_data(data, 14)
+    await call.message.answer("🩺 Готовлю сводку для врача...")
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)}. Составь сводку для педиатра: причина обращения, хронология, что отслеживали, 5 вопросов врачу и какие данные взять. Не ставь диагноз и не придумывай факты.\n\n{raw}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 Отчёт за 7 дней", callback_data="weekly_report")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, "🩺 Сводка к педиатру\n\n" + answer, reply_markup=kb)
+
+@dp.callback_query(F.data == "weekly_report")
+async def weekly_report(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    if not user or user[0] != "mama":
+        await call.message.answer("Недельный отчёт доступен для профиля малыша.")
+        return
+    months, _ = calc_child_age(user[1])
+    data = get_recent_family_data(call.from_user.id, 7)
+    if not any((data["symptoms"], data["diary"], data["feedings"], data["sleep"], data["growth"])):
+        await call.message.answer("Пока недостаточно записей. Несколько дней отмечай сон, кормления, симптомы или события — и бот соберёт динамику.", reply_markup=kb_mama_menu())
+        return
+    await call.message.answer("📈 Анализирую последние 7 дней...")
+    raw = format_recent_data(data, 7)
+    answer = await ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)}. Подготовь недельный отчёт: краткие цифры, что стабильно, что изменилось, что отслеживать и 3 действия на следующую неделю. Не ставь диагноз.\n\n{raw}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🩺 Подготовить к врачу", callback_data="doctor_prep")],
+        [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
+    ])
+    await send_long_message(call.message.chat.id, "📈 Ваши 7 дней\n\n" + answer, reply_markup=kb)
 
 # ─── БЕРЕМЕННОСТЬ — РАЗДЕЛЫ ──────────────────────────────────
 EXPERT_PREG = (
@@ -1185,9 +1561,9 @@ async def handle_question(message: Message, state: FSMContext):
     # Проверка лимита запросов
     if not is_premium(message.from_user.id):
         count = get_request_count(message.from_user.id)
-        if count >= 10:
+        if count >= FREE_REQUESTS:
             await message.answer(
-                "❓ Ты использовала 10 бесплатных вопросов\n\n"
+                "❓ Ты использовала все бесплатные вопросы\n\n"
                 "Для продолжения оформи Премиум — 299 руб/месяц\n"
                 "Безлимитные вопросы + все функции бота!",
                 reply_markup=kb_premium()
@@ -1877,20 +2253,6 @@ async def handle_voice(message: Message, state: FSMContext):
 
 
 # ─── ПРЕМИУМ ПРОВЕРКИ ────────────────────────────────────────
-async def premium_gate(call: CallbackQuery, target_cb: str):
-    if is_premium(call.from_user.id):
-        # Разблокировано — вызываем нужный обработчик
-        await call.data.__class__
-        call.data = target_cb
-        await dp.process_update(call._bot if hasattr(call, "_bot") else call)
-    else:
-        await call.message.answer(
-            "🔒 Эта функция доступна в Премиум\n\n"
-            "💎 Премиум — 299 руб/месяц\n"
-            "Открывает все трекеры, анализ фото, голос и безлимитные вопросы.",
-            reply_markup=kb_premium()
-        )
-
 @dp.callback_query(F.data == "check_premium_vaccines")
 async def check_prem_vaccines(call: CallbackQuery):
     if is_premium(call.from_user.id):
@@ -2152,59 +2514,330 @@ async def suggestion_send(message: Message, state: FSMContext):
 # ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
 
 CHANNEL_ID = "@yamama_ai"
+BOT_PUBLIC_URL = "https://t.me/MaminPomoshnikAI_bot?start=channel"
 
-DAILY_THEMES = {
-    0: "беременность и подготовка к родам",
-    1: "новорождённый 0-3 месяца",
-    2: "малыш 3-12 месяцев",
-    3: "ребёнок 1-3 года",
-    4: "дошкольник 3-7 лет",
-    5: "здоровье и педиатрия",
-    6: "мама о себе — восстановление и психология",
+# Три сильных публикации в день вместо пяти однотипных статей.
+# Форматы вращаются по дням и сохраняются в БД, чтобы канал не повторялся.
+WEEKLY_EDITORIAL = {
+    0: "организация недели, режим семьи и снижение бытового хаоса",
+    1: "развитие ребёнка без сравнений и лишней тревоги",
+    2: "здоровье понятным языком и безопасные алгоритмы действий",
+    3: "сон, режим и восстановление всей семьи",
+    4: "эмоции мамы, чувство вины, усталость и отношения",
+    5: "семейная жизнь, папа, бабушки, прогулки и простые игры",
+    6: "итоги недели, наблюдения, полезные привычки и подготовка к новой неделе",
 }
 
-RUBRICS = {
-    8:  ("🌅 Доброе утро, мама",
-         "Короткий заряд на день — мотивация, поддержка, маленький совет психолога. Тёплый тон. 100-150 слов."),
-    10: ("🔬 Научный факт дня",
-         "Интересный научный факт который удивляет и хочется переслать подруге. Ссылка на ВОЗ или AAP. 150-200 слов."),
-    13: ("💡 Совет педиатра",
-         "Практический научно обоснованный совет — конкретный и применимый сегодня. По рекомендациям ВОЗ, AAP. 200-250 слов."),
-    16: ("🧠 Детская психология",
-         "Объяснение поведения ребёнка с нейронаучной точки зрения. Опирайся на Петрановскую, Сигела. 200-250 слов."),
-    20: ("❤️ Для мамы",
-         "О восстановлении, выгорании, отношениях, самой себе. Тепло и поддерживающе. 150-200 слов."),
-}
+MORNING_FORMATS = [
+    "короткое тёплое напоминание без наставлений",
+    "одна маленькая задача на день",
+    "поддерживающая мысль для уставшей мамы",
+    "мини-практика на две минуты",
+    "разрешение не быть идеальной",
+]
 
-async def post_rubric(hour: int):
-    from datetime import datetime
-    weekday = datetime.now().weekday()
-    daily_theme = DAILY_THEMES[weekday]
-    rubric_name, rubric_instruction = RUBRICS[hour]
-    post = await ask_gpt(
-        "Ты автор экспертного Telegram-канала 'Я МАМА' для современных мам. "
-        "Пишешь на основе научных исследований, рекомендаций ВОЗ, AAP, ACOG и ведущих специалистов — "
-        "Петрановской, Карпа, Серза, Готтмана, Сигела. "
-        "Стиль: тепло и по-человечески, но с научной точностью. "
-        "Без воды, с конкретной пользой. Добавляй эмодзи уместно. "
-        "ВАЖНО: каждый пост должен быть на уникальную подтему, не повторяй предыдущие посты. "
-        "В конце — один практический совет который мама может применить сегодня.",
-        f"Рубрика: {rubric_name}\n"
-        f"Тема дня: {daily_theme}\n"
-        f"Инструкция: {rubric_instruction}\n"
-        f"Начни пост с эмодзи рубрики и её названия."
+DAY_FORMATS = [
+    "сохраняемый чек-лист",
+    "миф или правда с объяснением",
+    "одна ситуация для трёх возрастов",
+    "разбор частой ошибки без осуждения",
+    "пошаговый алгоритм действий",
+    "короткий разбор вопроса мамы",
+    "что нормально, а что стоит обсудить со специалистом",
+    "три практических шага на сегодня",
+]
+
+EVENING_FORMATS = [
+    "короткая история с узнаваемой ситуацией",
+    "вопрос для самопроверки",
+    "мини-кейс до и после использования трекера",
+    "подборка из трёх полезных наблюдений",
+    "мягкая демонстрация одной функции бота",
+]
+
+CHANNEL_SYSTEM_PROMPT = (
+    "Ты редактор полезного Telegram-канала «Я МАМА» для беременных и родителей детей до 7 лет. "
+    "Пиши живо, тепло и естественно, без ощущения нейросетевой статьи. "
+    "Не изображай врача и не придумывай истории реальных подписчиц. "
+    "Не вставляй несуществующие исследования, ссылки, точные проценты или спорные медицинские дозировки. "
+    "Медицинские темы подавай осторожно: объясняй общие ориентиры, красные флаги и необходимость очной помощи. "
+    "Не используй канцелярит, длинное вступление, хэштеги и фразы «важно помнить», «давайте разберёмся». "
+    "Каждый пост должен иметь одну ясную мысль и практическую пользу. "
+    "Не повторяй темы и формулировки из истории публикаций."
+)
+
+
+def save_channel_post(slot, theme, format_name, title, text):
+    conn = db_connect()
+    conn.execute(
+        "INSERT INTO channel_posts (slot, theme, format_name, title, text, created_at) VALUES (?,?,?,?,?,?)",
+        (slot, theme, format_name, title, text, datetime.now().isoformat()),
     )
-    try:
-        await bot.send_message(CHANNEL_ID, post)
-        logging.info(f"Пост опубликован: {rubric_name} | {daily_theme}")
-    except Exception as e:
-        logging.error(f"Ошибка постинга: {e}")
+    conn.commit()
+    conn.close()
 
-async def post_morning():   await post_rubric(8)
-async def post_10():        await post_rubric(10)
-async def post_afternoon(): await post_rubric(13)
-async def post_evening():   await post_rubric(16)
-async def post_night():     await post_rubric(20)
+
+def get_recent_channel_posts(limit=40):
+    conn = db_connect()
+    rows = conn.execute(
+        "SELECT title, theme, format_name, text FROM channel_posts ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def channel_history_for_prompt(limit=30):
+    rows = get_recent_channel_posts(limit)
+    if not rows:
+        return "История пока пустая."
+    lines = []
+    for title, theme, format_name, text in rows:
+        compact = " ".join((text or "").split())[:180]
+        lines.append(f"- {title} | {theme} | {format_name} | {compact}")
+    return "\n".join(lines)
+
+
+def normalize_for_similarity(text):
+    import re
+    return " ".join(re.sub(r"[^а-яёa-z0-9 ]", " ", (text or "").lower()).split())
+
+
+def is_channel_post_too_similar(title, text, threshold=0.66):
+    from difflib import SequenceMatcher
+    candidate = normalize_for_similarity(f"{title} {text}")[:1200]
+    if not candidate:
+        return True
+    for old_title, _, _, old_text in get_recent_channel_posts(50):
+        previous = normalize_for_similarity(f"{old_title} {old_text}")[:1200]
+        if previous and SequenceMatcher(None, candidate, previous).ratio() >= threshold:
+            return True
+    return False
+
+
+def parse_generated_channel_post(raw):
+    raw = clean_text(raw or "").strip()
+    title = "Полезное для мамы"
+    body = raw
+    if raw.startswith("ЗАГОЛОВОК:"):
+        first, _, rest = raw.partition("\n")
+        title = first.replace("ЗАГОЛОВОК:", "", 1).strip() or title
+        body = rest.strip()
+    elif "\n" in raw:
+        first, rest = raw.split("\n", 1)
+        if len(first) <= 90:
+            title = first.strip(" —:•") or title
+            body = rest.strip()
+    return title[:100], body
+
+
+async def generate_channel_post(slot, theme, format_name, instruction, max_chars, with_bot_bridge=False):
+    history = channel_history_for_prompt()
+    bridge = (
+        "В конце добавь один естественный переход к конкретной функции бота — не продавай подписку напрямую. "
+        "Подходящие функции: персональный план «Сегодня», дневник сна, трекер кормлений, сводка к врачу, "
+        "недельный отчёт, тревожная кнопка «Ребёнку плохо», психолог. "
+        if with_bot_bridge else
+        "Не упоминай бот и не продавай ничего."
+    )
+    prompt = (
+        f"Время публикации: {slot}.\n"
+        f"Тема дня: {theme}.\n"
+        f"Формат: {format_name}.\n"
+        f"Задача: {instruction}.\n"
+        f"Ограничение: до {max_chars} знаков. Короткие абзацы, удобно читать одной рукой.\n"
+        f"{bridge}\n"
+        "Верни текст в формате:\nЗАГОЛОВОК: короткий цепляющий заголовок\nтекст поста\n\n"
+        "Недавние публикации, которые нельзя повторять:\n"
+        f"{history}"
+    )
+    for _ in range(3):
+        raw = await ask_gpt(CHANNEL_SYSTEM_PROMPT, prompt)
+        title, body = parse_generated_channel_post(raw)
+        body = body[:max_chars].rstrip()
+        if body and not is_channel_post_too_similar(title, body):
+            return title, body
+        prompt += "\nПредыдущий вариант оказался слишком похож на старые публикации. Выбери совершенно другой угол и примеры."
+    return None, None
+
+
+def channel_post_markup(button_text="Открыть Мамин помощник"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=button_text, url=BOT_PUBLIC_URL)]
+    ])
+
+
+async def publish_channel_post(slot, theme, format_name, title, body, with_button=False, button_text="Открыть Мамин помощник"):
+    if not title or not body:
+        logging.warning(f"Канал: публикация {slot} пропущена — не удалось получить уникальный текст")
+        return
+    final_text = f"{title}\n\n{body}".strip()
+    try:
+        await bot.send_message(
+            CHANNEL_ID,
+            final_text,
+            reply_markup=channel_post_markup(button_text) if with_button else None,
+            disable_web_page_preview=True,
+        )
+        save_channel_post(slot, theme, format_name, title, final_text)
+        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title}")
+    except Exception as e:
+        logging.error(f"Канал: ошибка публикации {slot}: {e}")
+
+
+async def post_morning():
+    today = datetime.now()
+    theme = WEEKLY_EDITORIAL[today.weekday()]
+    format_name = MORNING_FORMATS[today.toordinal() % len(MORNING_FORMATS)]
+    title, body = await generate_channel_post(
+        "08:00",
+        theme,
+        format_name,
+        "Создай короткий утренний пост на 350–650 знаков. Он должен поддержать маму и дать одно маленькое выполнимое действие на сегодня.",
+        700,
+        with_bot_bridge=False,
+    )
+    await publish_channel_post("morning", theme, format_name, title, body)
+
+
+async def post_afternoon():
+    today = datetime.now()
+    theme = WEEKLY_EDITORIAL[today.weekday()]
+    format_name = DAY_FORMATS[(today.toordinal() + today.weekday()) % len(DAY_FORMATS)]
+    title, body = await generate_channel_post(
+        "13:00",
+        theme,
+        format_name,
+        "Создай главный полезный материал дня на 1000–1800 знаков. Дай конкретный алгоритм, чек-лист или разбор ситуации. "
+        "Материал должен хотеться сохранить или переслать. Не перегружай теорией.",
+        1900,
+        with_bot_bridge=True,
+    )
+    await publish_channel_post(
+        "afternoon", theme, format_name, title, body,
+        with_button=True, button_text="Получить персональную помощь"
+    )
+
+
+async def post_evening_poll():
+    today = datetime.now()
+    polls = {
+        2: (
+            "Что сейчас тревожит вас сильнее всего?",
+            ["Сон ребёнка", "Питание или прикорм", "Здоровье", "Моя усталость"],
+        ),
+        6: (
+            "Что было самым сложным на этой неделе?",
+            ["Недосып", "Капризы ребёнка", "Нехватка времени", "Тревога и чувство вины"],
+        ),
+    }
+    poll_data = polls.get(today.weekday())
+    if not poll_data:
+        logging.warning(f"Канал: для weekday={today.weekday()} вечерний опрос не настроен")
+        return
+    question, options = poll_data
+    try:
+        await bot.send_poll(
+            CHANNEL_ID,
+            question=question,
+            options=options,
+            is_anonymous=True,
+            allows_multiple_answers=False,
+        )
+        save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(options))
+        logging.info(f"Канал: опубликован опрос | {question}")
+    except Exception as e:
+        logging.error(f"Канал: ошибка публикации опроса: {e}")
+
+
+async def post_evening():
+    today = datetime.now()
+    if today.weekday() in (2, 6):
+        await post_evening_poll()
+        return
+
+    theme = WEEKLY_EDITORIAL[today.weekday()]
+    format_name = EVENING_FORMATS[(today.toordinal() * 3) % len(EVENING_FORMATS)]
+    # Мягкая демонстрация продукта только три вечера в неделю.
+    with_bridge = today.weekday() in (0, 3, 4)
+    title, body = await generate_channel_post(
+        "20:00",
+        theme,
+        format_name,
+        "Создай вечерний пост на 550–1000 знаков. Он должен вызывать узнавание, реакцию или желание ответить себе на вопрос. "
+        "Не повторяй дневной материал и не пиши длинную лекцию.",
+        1100,
+        with_bot_bridge=with_bridge,
+    )
+    await publish_channel_post(
+        "evening", theme, format_name, title, body,
+        with_button=with_bridge,
+        button_text="Попробовать в боте",
+    )
+
+
+async def channel_weekly_editorial_report():
+    """Отправляет владельцу сводку автоканала за последние 7 дней и сохраняет её в лог."""
+    conn = db_connect()
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    rows = conn.execute(
+        "SELECT slot, format_name, COUNT(*) FROM channel_posts WHERE created_at>=? GROUP BY slot, format_name ORDER BY slot, format_name",
+        (week_ago,),
+    ).fetchall()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM channel_posts WHERE created_at>=?",
+        (week_ago,),
+    ).fetchone()[0]
+    bridges = conn.execute(
+        "SELECT COUNT(*) FROM channel_posts "
+        "WHERE created_at>=? AND (slot='afternoon' OR (slot='evening' AND strftime('%w', created_at) IN ('1','4','5')))",
+        (week_ago,),
+    ).fetchone()[0]
+    last_post = conn.execute(
+        "SELECT created_at, slot, title FROM channel_posts ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+
+    by_slot = {}
+    by_format = {}
+    for slot, format_name, count in rows:
+        by_slot[slot] = by_slot.get(slot, 0) + count
+        by_format[format_name] = by_format.get(format_name, 0) + count
+
+    slot_labels = {
+        "morning": "Утренних постов",
+        "afternoon": "Полезных разборов",
+        "evening": "Вечерних постов",
+        "evening_poll": "Опросов",
+    }
+    lines = [
+        "📊 Отчёт канала за неделю",
+        "",
+        f"Опубликовано материалов: {total}",
+    ]
+    for slot in ("morning", "afternoon", "evening", "evening_poll"):
+        lines.append(f"{slot_labels[slot]}: {by_slot.get(slot, 0)}")
+
+    if by_format:
+        lines.extend(["", "Форматы:"])
+        for format_name, count in sorted(by_format.items(), key=lambda item: (-item[1], item[0])):
+            lines.append(f"• {format_name} — {count}")
+
+    lines.extend(["", f"Материалов с потенциальным переходом в бот: {bridges}"])
+    if last_post:
+        created_at, slot, title = last_post
+        try:
+            created_label = datetime.fromisoformat(created_at).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            created_label = created_at
+        lines.extend(["", f"Последняя публикация: {created_label}", f"• {title} ({slot})"])
+
+    report_text = "\n".join(lines)
+    logging.info(f"Канал: недельный редакционный отчёт: {report_text}")
+    try:
+        await bot.send_message(CHANNEL_REPORT_CHAT_ID, report_text)
+    except Exception as e:
+        logging.error(f"Канал: не удалось отправить недельный отчёт получателю {CHANNEL_REPORT_CHAT_ID}: {e}")
 
 
 # ─── ТРЕКЕР РОСТА И ВЕСА ─────────────────────────────────────
@@ -2511,9 +3144,22 @@ async def vaccines_create(call: CallbackQuery):
         (18, "Полиомиелит — ревакцинация"),
     ]
 
+    conn = db_connect()
+    conn.execute("DELETE FROM vaccinations WHERE user_id=?", (call.from_user.id,))
+    conn.commit()
+    conn.close()
+
+    from calendar import monthrange
+    def add_months(dt, count):
+        month = dt.month - 1 + count
+        year = dt.year + month // 12
+        month = month % 12 + 1
+        day = min(dt.day, monthrange(year, month)[1])
+        return dt.replace(year=year, month=month, day=day)
+
     added = 0
     for month_age, vaccine in schedule:
-        vac_date = (birth + __import__('datetime').timedelta(days=month_age*30)).strftime("%d.%m.%Y")
+        vac_date = add_months(birth, month_age).strftime("%d.%m.%Y")
         save_vaccination(call.from_user.id, vaccine, vac_date)
         added += 1
 
@@ -2606,7 +3252,7 @@ async def benefits_gpt(call, prompt):
     await call.message.answer("⏳ Подбираю актуальную информацию...")
     answer = await ask_gpt(
         "Ты эксперт по социальным выплатам и пособиям в России. "
-        "Давай актуальную информацию на 2024-2025 год. "
+        "Давай актуальную информацию на текущую дату; если точная сумма может измениться, предупреди и предложи проверить на Госуслугах или СФР. "
         "Указывай конкретные суммы, сроки подачи, необходимые документы и куда обращаться. "
         "Отвечай структурированно и понятно.",
         prompt
@@ -2617,34 +3263,34 @@ async def benefits_gpt(call, prompt):
 
 @dp.callback_query(F.data == "ben_birth")
 async def ben_birth(call: CallbackQuery):
-    await benefits_gpt(call, "Расскажи о единовременном пособии при рождении ребёнка в России в 2024-2025 году. "
+    await benefits_gpt(call, "Расскажи о единовременном пособии при рождении ребёнка в России на текущую дату. "
                        "Размер, кто имеет право, документы, куда подавать, сроки.")
 
 @dp.callback_query(F.data == "ben_15")
 async def ben_15(call: CallbackQuery):
-    await benefits_gpt(call, "Расскажи о ежемесячном пособии по уходу за ребёнком до 1.5 лет в России 2024-2025. "
+    await benefits_gpt(call, "Расскажи о ежемесячном пособии по уходу за ребёнком до 1.5 лет в России на текущую дату. "
                        "Размер для работающих и неработающих мам, как рассчитывается, документы, сроки.")
 
 @dp.callback_query(F.data == "ben_3")
 async def ben_3(call: CallbackQuery):
-    await benefits_gpt(call, "Расскажи о выплатах и пособиях на ребёнка от 1.5 до 3 лет в России 2024-2025. "
+    await benefits_gpt(call, "Расскажи о выплатах и пособиях на ребёнка от 1.5 до 3 лет в России на текущую дату. "
                        "Путинские выплаты, региональные пособия, условия получения.")
 
 @dp.callback_query(F.data == "ben_matcap")
 async def ben_matcap(call: CallbackQuery):
-    await benefits_gpt(call, "Расскажи о материнском капитале в России 2024-2025. "
+    await benefits_gpt(call, "Расскажи о материнском капитале в России на текущую дату. "
                        "Размер на первого и второго ребёнка, на что можно потратить, как оформить через Госуслуги, "
                        "сроки получения сертификата.")
 
 @dp.callback_query(F.data == "ben_decree")
 async def ben_decree(call: CallbackQuery):
-    await benefits_gpt(call, "Расскажи о пособии по беременности и родам (декретные) в России 2024-2025. "
+    await benefits_gpt(call, "Расскажи о пособии по беременности и родам (декретные) в России на текущую дату. "
                        "Как рассчитывается для работающих, ИП, безработных. "
                        "Сроки декрета, документы, куда обращаться.")
 
 @dp.callback_query(F.data == "ben_multi")
 async def ben_multi(call: CallbackQuery):
-    await benefits_gpt(call, "Расскажи о льготах и выплатах многодетным семьям в России 2024-2025. "
+    await benefits_gpt(call, "Расскажи о льготах и выплатах многодетным семьям в России на текущую дату. "
                        "Федеральные и региональные льготы, налоговые вычеты, земельные участки, "
                        "транспортный налог, ЖКХ, досрочная пенсия мамы.")
 
@@ -2663,7 +3309,7 @@ async def ben_personal_answer(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("⏳ Подбираю что положено именно тебе...")
     answer = await ask_gpt(
-        "Ты эксперт по социальным выплатам в России 2024-2025. "
+        "Ты эксперт по социальным выплатам в России на текущую дату. "
         "Давай конкретные персональные рекомендации на основе ситуации мамы.",
         f"Мама описала свою ситуацию: {message.text}\n\n"
         f"Перечисли все федеральные и региональные пособия и выплаты на которые она имеет право. "
@@ -2842,11 +3488,11 @@ async def vaccines_done(call: CallbackQuery):
 @dp.callback_query(F.data.startswith("vac_done_"))
 async def vac_mark_done(call: CallbackQuery):
     vac_id = int(call.data.replace("vac_done_", ""))
-    mark_vaccination_done(vac_id)
+    mark_vaccination_done(vac_id, call.from_user.id)
     await call.message.answer("✅ Прививка отмечена как сделанная!", reply_markup=kb_mama_menu())
 
 async def check_vaccine_reminders():
-    conn = sqlite3.connect("/root/mama.db")
+    conn = db_connect()
     c = conn.cursor()
     today = date.today()
     reminder_date = (today + __import__('datetime').timedelta(days=3)).strftime("%d.%m.%Y")
@@ -2867,13 +3513,13 @@ async def check_vaccine_reminders():
 # ─── ЗАПУСК ──────────────────────────────────────────────────
 async def main():
     init_db()
+    dp.callback_query.outer_middleware(PremiumCallbackMiddleware())
     # Напоминания о прививках — каждый день в 9:00
-    scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0)
-    scheduler.add_job(post_morning,   "cron", hour=8,  minute=0)
-    scheduler.add_job(post_10,        "cron", hour=10, minute=0)
-    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0)
-    scheduler.add_job(post_evening,   "cron", hour=16, minute=0)
-    scheduler.add_job(post_night,     "cron", hour=20, minute=0)
+    scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0, id="vaccine_reminders", replace_existing=True, coalesce=True, max_instances=1)
+    scheduler.add_job(post_morning, "cron", hour=8, minute=0, id="channel_morning", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=1800)
+    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0, id="channel_afternoon", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=1800)
+    scheduler.add_job(post_evening, "cron", hour=20, minute=0, id="channel_evening", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=1800)
+    scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="channel_weekly_report", replace_existing=True, coalesce=True, max_instances=1)
     scheduler.start()
     logging.info("Мамин помощник запущен!")
     asyncio.create_task(check_payments_loop())
