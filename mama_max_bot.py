@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sqlite3
 import logging
 import os
@@ -18,12 +19,12 @@ from google.oauth2.service_account import Credentials
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
 OPENAI_KEY = "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"
-OWNER_ID = 549639607
+OWNER_ID = int(os.getenv("MAX_OWNER_ID", "549639607"))
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
 MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
-MAX_BOT_DEEPLINK = f"{MAX_BOT_PUBLIC_URL}?start=channel"
-MAX_BOT_CHANNEL_LINK = "https://maminpomoshnik.ru/open-max-bot"
+MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
+MAX_BOT_CHANNEL_LINK = MAX_BOT_PUBLIC_URL
 
 # Лимиты
 FREE_REQUESTS = 15
@@ -719,6 +720,10 @@ def age_label(months):
     return f"{years} г. {m} мес." if m else f"{years} г."
 
 async def process_command(chat_id, user_id, text, username="", first_name=""):
+    # Служебная команда доступна всем и помогает узнать реальный MAX user_id.
+    if text.strip().lower() == "/my_id":
+        await send_message(chat_id, f"Ваш MAX user_id: {user_id}")
+        return
     get_user(user_id, username, first_name)
     name = first_name or "мама"
     user = get_user(user_id)
