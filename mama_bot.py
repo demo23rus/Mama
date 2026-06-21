@@ -16,8 +16,9 @@ import base64
 import gspread
 from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
+from urllib.parse import quote
 
-APP_VERSION = "10.0"
+APP_VERSION = "10.1-referral"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -376,6 +377,21 @@ def init_db():
         event_name TEXT NOT NULL, source TEXT DEFAULT '', details TEXT DEFAULT ''
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event_date ON analytics_events(event_name, created_at)")
+    c.execute("""CREATE TABLE IF NOT EXISTS referrals (
+        invited_user_id INTEGER PRIMARY KEY,
+        referrer_user_id INTEGER NOT NULL,
+        platform TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        first_payment_at TEXT DEFAULT '',
+        start_reward_granted INTEGER NOT NULL DEFAULT 0,
+        payment_reward_granted INTEGER NOT NULL DEFAULT 0
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS referral_bonus_questions (
+        user_id INTEGER PRIMARY KEY,
+        bonus_questions INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id, started_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS marketing_offers (
         user_id INTEGER NOT NULL, offer_type TEXT NOT NULL, last_shown_at TEXT NOT NULL,
         show_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(user_id, offer_type)
@@ -581,9 +597,17 @@ def get_request_count(user_id):
 
 
 def increment_request_count(user_id):
-    _usage_period_row(user_id)
+    row = _usage_period_row(user_id)
+    used = int(row[3] or 0)
+    base = PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+    now = datetime.now().isoformat()
     with db_connect() as conn:
-        conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(), user_id))
+        if base is not None and used >= int(base):
+            bonus = conn.execute("SELECT bonus_questions FROM referral_bonus_questions WHERE user_id=?", (user_id,)).fetchone()
+            if bonus and int(bonus[0] or 0) > 0:
+                conn.execute("UPDATE referral_bonus_questions SET bonus_questions=bonus_questions-1,updated_at=? WHERE user_id=?", (now,user_id))
+                return
+        conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (now,user_id))
 
 
 def log_analytics_event(event_name, user_id=0, source="", details=""):
@@ -595,6 +619,96 @@ def log_analytics_event(event_name, user_id=0, source="", details=""):
             )
     except Exception as exc:
         logging.error(f"Analytics TG error: {exc}")
+
+def _referral_month_start():
+    now = datetime.now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def get_referral_bonus_questions(user_id):
+    with db_connect() as conn:
+        row = conn.execute("SELECT bonus_questions FROM referral_bonus_questions WHERE user_id=?", (user_id,)).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def register_referral(invited_user_id, referrer_user_id):
+    """Фиксирует первое приглашение и начисляет до 5 бонусных вопросов в месяц."""
+    try:
+        invited_user_id = int(invited_user_id)
+        referrer_user_id = int(referrer_user_id)
+    except (TypeError, ValueError):
+        return None
+    if invited_user_id <= 0 or referrer_user_id <= 0 or invited_user_id == referrer_user_id:
+        return None
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        exists = conn.execute("SELECT 1 FROM referrals WHERE invited_user_id=?", (invited_user_id,)).fetchone()
+        if exists:
+            conn.rollback(); return None
+        conn.execute(
+            "INSERT INTO referrals(invited_user_id,referrer_user_id,platform,started_at) VALUES (?,?,?,?)",
+            (invited_user_id, referrer_user_id, "telegram", now),
+        )
+        rewarded_this_month = conn.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_user_id=? AND start_reward_granted=1 AND started_at>=?",
+            (referrer_user_id, _referral_month_start()),
+        ).fetchone()[0]
+        granted = rewarded_this_month < 5
+        if granted:
+            conn.execute(
+                "INSERT INTO referral_bonus_questions(user_id,bonus_questions,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET bonus_questions=bonus_questions+1,updated_at=excluded.updated_at",
+                (referrer_user_id, 1, now),
+            )
+            conn.execute("UPDATE referrals SET start_reward_granted=1 WHERE invited_user_id=?", (invited_user_id,))
+        conn.commit()
+    log_analytics_event("referral_started", invited_user_id, f"ref_{referrer_user_id}", "bonus=1" if granted else "monthly_cap")
+    return referrer_user_id if granted else None
+
+
+def reward_referrer_for_first_payment(invited_user_id, conn):
+    """Один раз начисляет пригласившему 7 дней Про после первой оплаты приглашённого."""
+    row = conn.execute(
+        "SELECT referrer_user_id,payment_reward_granted FROM referrals WHERE invited_user_id=?",
+        (invited_user_id,),
+    ).fetchone()
+    if not row or int(row[1] or 0):
+        return None
+    referrer_id = int(row[0])
+    now = datetime.now()
+    sub = conn.execute("SELECT plan,sub_end FROM subscriptions WHERE user_id=?", (referrer_id,)).fetchone()
+    reward_plan = sub[0] if sub and sub[0] in ("pro", "pro_year") else "pro"
+    start = now
+    if sub and sub[1]:
+        try:
+            old_end = datetime.fromisoformat(sub[1])
+            if old_end > now:
+                start = old_end
+        except (TypeError, ValueError):
+            pass
+    end = start + timedelta(days=7)
+    conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)", (referrer_id, reward_plan, end.isoformat()))
+    conn.execute(
+        "UPDATE referrals SET payment_reward_granted=1,first_payment_at=? WHERE invited_user_id=?",
+        (now.isoformat(), invited_user_id),
+    )
+    return referrer_id
+
+
+def referral_stats(user_id):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*),COALESCE(SUM(start_reward_granted),0),COALESCE(SUM(payment_reward_granted),0) "
+            "FROM referrals WHERE referrer_user_id=?",
+            (user_id,),
+        ).fetchone()
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+
+
+def referral_link_tg(user_id):
+    return f"https://t.me/MaminPomoshnikAI_bot?start=ref_{int(user_id)}"
+
 
 def save_pending_payment(payment_id,user_id,plan,amount=None):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now().isoformat(); amount=amount or info["amount"]
@@ -627,7 +741,9 @@ def process_subscription_payment(payment_id,user_id,plan):
         reset_usage_period(user_id, plan, conn=conn)
         conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?",(now_iso,payment_id))
         conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",(payment_id,now_iso,"telegram",user_id,plan,info["amount"],"RUB",end.isoformat()))
-        conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,)); conn.commit(); return True,end
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+        reward_referrer_for_first_payment(user_id, conn)
+        conn.commit(); return True,end
     except Exception:
         conn.rollback(); raise
     finally: conn.close()
@@ -699,7 +815,8 @@ def can_use_product(user_id, product_code):
 
 
 def question_limit_for(user_id):
-    return PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+    base = PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+    return None if base is None else int(base) + get_referral_bonus_questions(user_id)
 
 
 def psycho_limit_for(user_id):
@@ -1137,6 +1254,7 @@ def kb_pregnant_menu():
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
+        [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
     ])
 
@@ -1153,6 +1271,7 @@ def kb_mama_menu():
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
         [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
+        [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
     ])
 
@@ -1334,6 +1453,17 @@ async def cmd_start(message: Message, state: FSMContext):
     start_payload = parts[1].strip() if len(parts) > 1 else ""
     user = get_user(message.from_user.id)
     name = message.from_user.first_name or "мамочка"
+    rewarded_referrer = None
+    if user is None and start_payload.startswith("ref_"):
+        try:
+            rewarded_referrer = register_referral(message.from_user.id, int(start_payload[4:]))
+        except (TypeError, ValueError):
+            rewarded_referrer = None
+        if rewarded_referrer:
+            try:
+                await bot.send_message(rewarded_referrer, "🎁 По твоей ссылке пришёл новый пользователь. Начислен 1 дополнительный AI-вопрос.")
+            except Exception as exc:
+                logging.warning(f"Не удалось уведомить пригласившего {rewarded_referrer}: {exc}")
     if start_payload.startswith("channel_"):
         await state.update_data(channel_start_payload=start_payload)
         log_analytics_event("channel_click", message.from_user.id, start_payload)
@@ -1557,6 +1687,35 @@ async def cat_preg_health(call: CallbackQuery):
 @dp.callback_query(F.data == "cat_mom_preg")
 async def cat_mom_preg(call: CallbackQuery):
     await call.message.edit_text("🧠 Для мамы\n\nЭмоциональная и практическая поддержка во время беременности.", reply_markup=kb_cat_mom_preg())
+
+@dp.callback_query(F.data == "invite_friend")
+async def invite_friend(call: CallbackQuery):
+    user_id = call.from_user.id
+    invited, start_rewards, payment_rewards = referral_stats(user_id)
+    available_bonus = get_referral_bonus_questions(user_id)
+    link = referral_link_tg(user_id)
+    share_url = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote(
+        "Я пользуюсь «Маминым Помощником» — здесь можно получить поддержку по беременности, ребёнку, сну, питанию и развитию 🤍",
+        safe="",
+    )
+    text = (
+        "🎁 Пригласить подругу\n\n"
+        "Поделись личной ссылкой:\n"
+        f"{link}\n\n"
+        "За первый запуск подруги — 1 дополнительный AI-вопрос. "
+        "За её первую оплату — 7 дней тарифа Про.\n\n"
+        "За запуск начисляется не более 5 бонусов в месяц. Самоприглашения и повторные регистрации не учитываются.\n\n"
+        f"Приглашено: {invited}\n"
+        f"Бонусов начислено: {start_rewards}\n"
+        f"Доступно AI-вопросов: {available_bonus}\n"
+        f"Наград Про: {payment_rewards}"
+    )
+    await call.answer()
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться", url=share_url)],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")],
+    ]))
+
 
 @dp.callback_query(F.data == "profile")
 async def profile_view(call: CallbackQuery):
@@ -3077,6 +3236,7 @@ def process_commercial_payment(payment_id, user_id, product_code):
         conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?", (now_iso,payment_id))
         conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)", (payment_id,now_iso,"telegram",user_id,product_code,info["amount"],"RUB",ends_at))
         conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+        reward_referrer_for_first_payment(user_id, conn)
         conn.commit(); return True, result_end, product_type
     except Exception:
         conn.rollback(); raise

@@ -33,7 +33,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.0"
+APP_VERSION = "10.1-referral"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -324,6 +324,7 @@ def pregnant_menu_buttons():
         [{"type":"callback","text":"🧠 Для мамы","payload":"cat_mom_preg"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
         [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
+        [{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}],
         [{"type":"callback","text":"🔄 Изменить данные","payload":"change_data"}],
     ]
 
@@ -336,6 +337,7 @@ def main_menu_buttons():
         [{"type":"callback","text":"👨‍👩‍👧 Семья","payload":"cat_family"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
         [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
+        [{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}],
         [{"type":"callback","text":"🔄 Изменить данные","payload":"change_data"}],
     ]
 
@@ -566,6 +568,21 @@ def init_db():
         event_name TEXT NOT NULL, source TEXT DEFAULT '', details TEXT DEFAULT ''
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event_date ON analytics_events(event_name, created_at)")
+    c.execute("""CREATE TABLE IF NOT EXISTS referrals (
+        invited_user_id INTEGER PRIMARY KEY,
+        referrer_user_id INTEGER NOT NULL,
+        platform TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        first_payment_at TEXT DEFAULT '',
+        start_reward_granted INTEGER NOT NULL DEFAULT 0,
+        payment_reward_granted INTEGER NOT NULL DEFAULT 0
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS referral_bonus_questions (
+        user_id INTEGER PRIMARY KEY,
+        bonus_questions INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_user_id, started_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS marketing_offers (
         user_id INTEGER NOT NULL, offer_type TEXT NOT NULL, last_shown_at TEXT NOT NULL,
         show_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(user_id, offer_type)
@@ -681,14 +698,88 @@ def get_limits(user_id):
 
 def get_request_count(user_id): return get_limits(user_id)["requests"]
 def increment_request_count(user_id):
-    _usage_period_row(user_id)
-    with db_connect() as conn: conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(),user_id))
+    row = _usage_period_row(user_id)
+    used = int(row[3] or 0)
+    base = PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        if base is not None and used >= int(base):
+            bonus = conn.execute("SELECT bonus_questions FROM referral_bonus_questions WHERE user_id=?", (user_id,)).fetchone()
+            if bonus and int(bonus[0] or 0) > 0:
+                conn.execute("UPDATE referral_bonus_questions SET bonus_questions=bonus_questions-1,updated_at=? WHERE user_id=?", (now,user_id))
+                return
+        conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (now,user_id))
 
 
 def log_analytics_event(event_name,user_id=0,source="",details=""):
     try:
         with db_connect() as conn: conn.execute("INSERT INTO analytics_events(created_at,platform,user_id,event_name,source,details) VALUES (?,?,?,?,?,?)", (datetime.now().isoformat(),"max",int(user_id or 0),event_name,source or "",str(details or "")[:1000]))
     except Exception as exc: logging.error("Analytics MAX error: %s", exc)
+
+def _referral_month_start():
+    now = datetime.now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def get_referral_bonus_questions(user_id):
+    with db_connect() as conn:
+        row = conn.execute("SELECT bonus_questions FROM referral_bonus_questions WHERE user_id=?", (user_id,)).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def register_referral(invited_user_id, referrer_user_id):
+    try:
+        invited_user_id = int(invited_user_id); referrer_user_id = int(referrer_user_id)
+    except (TypeError, ValueError):
+        return None
+    if invited_user_id <= 0 or referrer_user_id <= 0 or invited_user_id == referrer_user_id:
+        return None
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM referrals WHERE invited_user_id=?", (invited_user_id,)).fetchone():
+            conn.rollback(); return None
+        conn.execute("INSERT INTO referrals(invited_user_id,referrer_user_id,platform,started_at) VALUES (?,?,?,?)", (invited_user_id,referrer_user_id,"max",now))
+        count = conn.execute("SELECT COUNT(*) FROM referrals WHERE referrer_user_id=? AND start_reward_granted=1 AND started_at>=?", (referrer_user_id,_referral_month_start())).fetchone()[0]
+        granted = count < 5
+        if granted:
+            conn.execute(
+                "INSERT INTO referral_bonus_questions(user_id,bonus_questions,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET bonus_questions=bonus_questions+1,updated_at=excluded.updated_at",
+                (referrer_user_id,1,now),
+            )
+            conn.execute("UPDATE referrals SET start_reward_granted=1 WHERE invited_user_id=?", (invited_user_id,))
+        conn.commit()
+    log_analytics_event("referral_started", invited_user_id, f"ref_{referrer_user_id}", "bonus=1" if granted else "monthly_cap")
+    return referrer_user_id if granted else None
+
+
+def reward_referrer_for_first_payment(invited_user_id, conn):
+    row = conn.execute("SELECT referrer_user_id,payment_reward_granted FROM referrals WHERE invited_user_id=?", (invited_user_id,)).fetchone()
+    if not row or int(row[1] or 0): return None
+    referrer_id = int(row[0]); now = datetime.now(); start = now
+    sub = conn.execute("SELECT plan,sub_end FROM subscriptions WHERE user_id=?", (referrer_id,)).fetchone()
+    reward_plan = sub[0] if sub and sub[0] in ("pro", "pro_year") else "pro"
+    if sub and sub[1]:
+        try:
+            old_end = datetime.fromisoformat(sub[1])
+            if old_end > now: start = old_end
+        except (TypeError, ValueError): pass
+    end = start + timedelta(days=7)
+    conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)", (referrer_id,reward_plan,end.isoformat()))
+    conn.execute("UPDATE referrals SET payment_reward_granted=1,first_payment_at=? WHERE invited_user_id=?", (now.isoformat(),invited_user_id))
+    return referrer_id
+
+
+def referral_stats(user_id):
+    with db_connect() as conn:
+        row = conn.execute("SELECT COUNT(*),COALESCE(SUM(start_reward_granted),0),COALESCE(SUM(payment_reward_granted),0) FROM referrals WHERE referrer_user_id=?", (user_id,)).fetchone()
+    return int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+
+
+def referral_link_max(user_id):
+    return f"{MAX_BOT_PUBLIC_URL}?start=ref_{int(user_id)}"
+
 
 def save_pending_payment(payment_id,user_id,plan,amount=None):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now().isoformat(); amount=amount or info["amount"]
@@ -721,7 +812,9 @@ def process_subscription_payment(payment_id,user_id,plan):
         reset_usage_period(user_id, plan, conn=conn)
         conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?",(now_iso,payment_id))
         conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",(payment_id,now_iso,"max",user_id,plan,info["amount"],"RUB",end.isoformat()))
-        conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,)); conn.commit(); return True,end
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+        reward_referrer_for_first_payment(user_id, conn)
+        conn.commit(); return True,end
     except Exception:
         conn.rollback(); raise
     finally: conn.close()
@@ -822,7 +915,9 @@ def can_use_product(user_id, product_code):
     return get_user_plan(user_id) in PRO_PLANS or get_credit(user_id,product_code)>0
 
 
-def question_limit_for(user_id): return PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+def question_limit_for(user_id):
+    base = PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+    return None if base is None else int(base) + get_referral_bonus_questions(user_id)
 def psycho_limit_for(user_id): return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
 
 def get_usage_counter(user_id,counter):
@@ -1188,6 +1283,7 @@ def process_commercial_payment(payment_id,user_id,product_code):
         conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?",(now_iso,payment_id))
         conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",(payment_id,now_iso,"max",user_id,product_code,info["amount"],"RUB",ends_at))
         conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+        reward_referrer_for_first_payment(user_id, conn)
         conn.commit(); return True,result_end,product_type
     except Exception:
         conn.rollback(); raise
@@ -1769,6 +1865,27 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             "🧠 Для мамы\n\nЭмоциональная и практическая поддержка во время беременности.",
             preg_mom_category_buttons(),
         )
+        return
+
+    if payload == "invite_friend":
+        invited, start_rewards, payment_rewards = referral_stats(user_id)
+        available_bonus = get_referral_bonus_questions(user_id)
+        link = referral_link_max(user_id)
+        text = (
+            "🎁 Пригласить подругу\n\n"
+            "Отправь ей личную ссылку:\n"
+            f"{link}\n\n"
+            "За первый запуск — 1 дополнительный AI-вопрос. За первую оплату — 7 дней тарифа Про.\n\n"
+            "Не более 5 бонусов за запуск в месяц. Самоприглашения и повторные регистрации не учитываются.\n\n"
+            f"Приглашено: {invited}\n"
+            f"Бонусов начислено: {start_rewards}\n"
+        f"Доступно AI-вопросов: {available_bonus}\n"
+            f"Наград Про: {payment_rewards}"
+        )
+        await send_message(chat_id, text, [
+            [{"type":"link","text":"📤 Открыть ссылку","url":link}],
+            [{"type":"callback","text":"🔙 В меню","payload":"back_menu"}],
+        ])
         return
 
     if payload == "profile":
@@ -3266,7 +3383,16 @@ async def webhook(request: Request):
                 return JSONResponse({"ok": True})
             first_name = user.get("name", "мама")
             username = user.get("username", "")
+            with db_connect() as conn:
+                was_known = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone() is not None
             get_user(user_id, username, first_name)
+            if not was_known and start_payload.startswith("ref_"):
+                try:
+                    rewarded_referrer = register_referral(user_id, int(start_payload[4:]))
+                    if rewarded_referrer:
+                        await send_message(rewarded_referrer, "🎁 По твоей ссылке пришёл новый пользователь. Начислен 1 дополнительный AI-вопрос.")
+                except (TypeError, ValueError):
+                    pass
             set_step(user_id, "idle")
             plan, _ = get_subscription(user_id)
             asyncio.create_task(asyncio.to_thread(sheets_log_visit, user_id, first_name, username, plan))
