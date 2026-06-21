@@ -670,7 +670,15 @@ def reset_usage_period(user_id, plan, conn=None):
     if own: conn.commit(); conn.close()
 
 
-def get_request_count(user_id): return int(_usage_period_row(user_id)[3])
+def get_limits(user_id):
+    """Возвращает актуальные счётчики текущего тарифного периода."""
+    row = _usage_period_row(user_id)
+    return {
+        "requests": int(row[3] or 0),
+        "psycho": int(row[4] or 0),
+    }
+
+def get_request_count(user_id): return get_limits(user_id)["requests"]
 def increment_request_count(user_id):
     _usage_period_row(user_id)
     with db_connect() as conn: conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(),user_id))
