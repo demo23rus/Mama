@@ -427,7 +427,8 @@ def set_subscription(user_id, plan, days):
         conn.execute("INSERT OR REPLACE INTO subscriptions (user_id, plan, sub_end) VALUES (?,?,?)", (user_id, plan, end))
 
 def is_premium(user_id):
-    return get_subscription(user_id)[0] == "mama_premium"
+    plan, end = get_subscription(user_id)
+    return plan == "mama_premium" and end is not None
 
 def get_limits(user_id):
     conn = db_connect()
@@ -888,7 +889,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
     # Психолог
     if step == "psycho":
         plan, _ = get_subscription(user_id)
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             set_step(user_id, "idle")
             await send_message(chat_id, "🔒 Мамин психолог доступен в Премиум 💎", upgrade_buttons())
             return
@@ -936,10 +937,10 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
     if step == "ask":
         set_step(user_id, "idle")
         plan, _ = get_subscription(user_id)
-        if plan != "mama_premium" and get_request_count(user_id) >= FREE_REQUESTS:
+        if not is_premium(user_id) and get_request_count(user_id) >= FREE_REQUESTS:
             await send_message(chat_id, f"Использовано {FREE_REQUESTS} бесплатных вопросов. Оформи Премиум — 299 руб/мес", upgrade_buttons())
             return
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             increment_request_count(user_id)
         context = f"Ребёнку {m_label}." if months is not None else f"Беременная {m_label}." if weeks_preg else ""
         await send_message(chat_id, "⏳ Думаю...")
@@ -1089,7 +1090,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     context = f"Ребёнку {m_label}." if months is not None else f"Беременная {m_label}." if weeks_preg else ""
 
-    if callback_requires_premium(payload) and plan != "mama_premium":
+    if callback_requires_premium(payload) and not is_premium(user_id):
         await send_message(chat_id, "🔒 Этот раздел доступен в Премиум 💎", upgrade_buttons())
         return
 
@@ -1478,7 +1479,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "ask":
-        if plan != "mama_premium" and get_request_count(user_id) >= FREE_REQUESTS:
+        if not is_premium(user_id) and get_request_count(user_id) >= FREE_REQUESTS:
             await send_message(chat_id, f"Использовано {FREE_REQUESTS} бесплатных вопросов. Оформи Премиум — 299 руб/мес", upgrade_buttons())
             return
         set_step(user_id, "ask")
@@ -1577,7 +1578,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     # ─── ПРЕМИУМ РАЗДЕЛЫ ─────────────────────────────────────
     if payload == "psycho":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Мамин психолог доступен в Премиум 💎\n\nПерсональный психолог который тебя помнит.", upgrade_buttons())
             return
         history = get_psycho_history(user_id)
@@ -1591,7 +1592,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "photo_menu":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Анализ фото доступен в Премиум 💎", upgrade_buttons())
             return
         # Разное меню для беременных и мам
@@ -1631,7 +1632,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             return
 
     if payload == "growth":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Трекер роста и веса доступен в Премиум 💎", upgrade_buttons())
             return
         entries = get_growth(user_id)
@@ -1668,7 +1669,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "symptoms":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Трекер симптомов доступен в Премиум 💎", upgrade_buttons())
             return
         entries = get_symptoms_list(user_id)
@@ -1705,7 +1706,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "feeding":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Трекер кормлений доступен в Премиум 💎", upgrade_buttons())
             return
         conn = db_connect()
@@ -1755,7 +1756,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             return
 
     if payload == "sleep_log":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Дневник сна доступен в Премиум 💎", upgrade_buttons())
             return
         conn = db_connect()
@@ -1819,7 +1820,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "vaccines":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Прививочный календарь доступен в Премиум 💎", upgrade_buttons())
             return
         # Получаем прививки из БД
@@ -1932,7 +1933,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload == "benefits":
-        if plan != "mama_premium":
+        if not is_premium(user_id):
             await send_message(chat_id, "🔒 Пособия и выплаты доступны в Премиум 💎", upgrade_buttons())
             return
         buttons = [
