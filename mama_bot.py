@@ -814,6 +814,14 @@ async def notify_owner_tg(text, key="general", cooldown_minutes=30):
     except Exception as exc:
         logging.error(f"Owner notify TG error: {exc}")
 
+async def show_typing(chat_id):
+    """Показывает системный индикатор набора вместо отдельного сообщения-заглушки."""
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+
+
 async def ask_gpt(system_prompt, user_prompt):
     try:
         response = await client.chat.completions.create(
@@ -1358,51 +1366,53 @@ async def enter_birthdate(message: Message, state: FSMContext):
 # ─── ГЛАВНОЕ МЕНЮ ────────────────────────────────────────────
 @dp.callback_query(F.data == "main_menu")
 async def main_menu(call: CallbackQuery, state: FSMContext):
+    """Отправляет новое меню, не удаляя полезный ответ пользователя."""
+    await call.answer()
     await state.clear()
     user = get_user(call.from_user.id)
     if user:
         mode, date_value, name = user
         if mode == "pregnant":
             weeks, days = calc_pregnancy_weeks(date_value)
-            await call.message.edit_text(
+            await call.message.answer(
                 f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?",
-                
                 reply_markup=kb_pregnant_menu()
             )
         else:
             months, _ = calc_child_age(date_value)
-            await call.message.edit_text(
+            await call.message.answer(
                 f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?",
-                
                 reply_markup=kb_mama_menu()
             )
     else:
-        await call.message.edit_text(
+        await call.message.answer(
             "👋 Привет! Расскажи мне о себе 👇",
             reply_markup=kb_start()
         )
 
 @dp.callback_query(F.data == "menu_pregnant")
 async def menu_pregnant(call: CallbackQuery):
+    """Возвращает в меню беременной отдельным сообщением, сохраняя результат выше."""
+    await call.answer()
     user = get_user(call.from_user.id)
     if user:
         _, date_value, _ = user
         weeks, days = calc_pregnancy_weeks(date_value)
-        await call.message.edit_text(
+        await call.message.answer(
             f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?",
-            
             reply_markup=kb_pregnant_menu()
         )
 
 @dp.callback_query(F.data == "menu_mama")
 async def menu_mama(call: CallbackQuery):
+    """Возвращает в меню мамы отдельным сообщением, сохраняя результат выше."""
+    await call.answer()
     user = get_user(call.from_user.id)
     if user:
         _, date_value, _ = user
         months, _ = calc_child_age(date_value)
-        await call.message.edit_text(
+        await call.message.answer(
             f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?",
-            
             reply_markup=kb_mama_menu()
         )
 
@@ -1464,7 +1474,7 @@ async def today_brief(call: CallbackQuery):
         await call.answer("Сначала укажи данные", show_alert=True)
         return
     mode, date_value, _ = user
-    await call.message.answer("✨ Собираю персональный план на сегодня...")
+    await show_typing(call.message.chat.id)
     if mode == "pregnant":
         weeks, days = calc_pregnancy_weeks(date_value)
         prompt = (
@@ -1547,7 +1557,7 @@ async def doctor_prep(call: CallbackQuery):
     months, _ = calc_child_age(user[1])
     data = get_recent_family_data(call.from_user.id, 14)
     raw = format_recent_data(data, 14)
-    await call.message.answer("🩺 Готовлю сводку для врача...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Ребёнку {age_label(months)}. Составь сводку для педиатра: причина обращения, хронология, что отслеживали, 5 вопросов врачу и какие данные взять. Не ставь диагноз и не придумывай факты.\n\n{raw}"
@@ -1571,7 +1581,7 @@ async def weekly_report(call: CallbackQuery):
     if not any((data["symptoms"], data["diary"], data["feedings"], data["sleep"], data["growth"])):
         await call.message.answer("Пока недостаточно записей. Несколько дней отмечай сон, кормления, симптомы или события — и бот соберёт динамику.", reply_markup=kb_mama_menu())
         return
-    await call.message.answer("📈 Анализирую последние 7 дней...")
+    await show_typing(call.message.chat.id)
     raw = format_recent_data(data, 7)
     answer = await ask_gpt(
         EXPERT_BASE,
@@ -1617,7 +1627,7 @@ async def preg_baby(call: CallbackQuery):
         return
     _, date_value, _ = user
     weeks, _ = calc_pregnancy_weeks(date_value)
-    await call.message.edit_text("⏳ Узнаю как развивается малыш...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_PREG,
         f"Дай подробное научное описание развития плода на {weeks} неделе беременности. "
@@ -1642,7 +1652,7 @@ async def preg_checklist(call: CallbackQuery):
         return
     _, date_value, _ = user
     weeks, _ = calc_pregnancy_weeks(date_value)
-    await call.message.edit_text("⏳ Составляю чек-лист для твоего срока...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_PREG,
         f"Составь исчерпывающий чек-лист для {weeks} недели беременности по протоколам ВОЗ и ACOG. "
@@ -1666,7 +1676,7 @@ async def preg_shop(call: CallbackQuery):
         return
     _, date_value, _ = user
     weeks, _ = calc_pregnancy_weeks(date_value)
-    await call.message.edit_text("⏳ Составляю список покупок...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_PREG,
         f"Составь практичный список покупок для мамы на {weeks} неделе беременности. "
@@ -1691,7 +1701,7 @@ async def mama_gpt_handler(call: CallbackQuery, system: str, prompt_fn):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(system, prompt_fn(months))
     await send_long_message(call.message.chat.id, answer, reply_markup=kb_back_to_menu("mama"))
 
@@ -1730,7 +1740,7 @@ async def mama_games(call: CallbackQuery):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.edit_text("⏳ Подбираю игры...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Предложи 3-4 научно обоснованные развивающие игры для ребёнка {age_label(months)} ({months} месяцев). "
@@ -1752,7 +1762,7 @@ async def mama_games_more(call: CallbackQuery):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.answer("⏳ Подбираю ещё игры...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Предложи ещё 3-4 ДРУГИЕ развивающие игры для ребёнка {age_label(months)} ({months} месяцев). "
@@ -1773,7 +1783,7 @@ async def mama_books(call: CallbackQuery):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.edit_text("⏳ Подбираю книги...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Порекомендуй 3 книги для чтения ребёнку {age_label(months)} ({months} месяцев). "
@@ -1794,7 +1804,7 @@ async def mama_books_more(call: CallbackQuery):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.answer("⏳ Подбираю ещё книги...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Порекомендуй ещё 3 ДРУГИЕ книги для ребёнка {age_label(months)} ({months} месяцев). "
@@ -1870,7 +1880,7 @@ async def mama_recipes(call: CallbackQuery):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.edit_text("⏳ Подбираю рецепты...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Дай 2 рецепта для ребёнка {age_label(months)} ({months} месяцев) по нормам ВОЗ и ESPGHAN. "
@@ -1891,7 +1901,7 @@ async def mama_recipes_more(call: CallbackQuery):
         return
     _, date_value, _ = user
     months, _ = calc_child_age(date_value)
-    await call.message.answer("⏳ Подбираю ещё рецепты...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Дай ещё 2 ДРУГИХ рецепта для ребёнка {age_label(months)} ({months} месяцев). "
@@ -1963,7 +1973,7 @@ async def mama_family(call: CallbackQuery):
 @dp.callback_query(F.data == "mama_emotions")
 async def mama_emotions(call: CallbackQuery):
     user = get_user(call.from_user.id)
-    await call.message.edit_text("⏳ Готовлю поддержку для тебя...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE + " Ты также специалист по послеродовой психологии и материнскому выгоранию. "
         "Говори с мамой как заботливый друг-эксперт — тепло, без осуждения, с глубоким пониманием. "
@@ -2057,7 +2067,7 @@ async def handle_question(message: Message, state: FSMContext):
     else:
         context = "Мама задаёт вопрос о ребёнке или беременности."
 
-    await message.answer("⏳ Думаю над ответом...")
+    await show_typing(message.chat.id)
     answer = await ask_gpt(
         f"Ты эксперт в педиатрии, перинатальной психологии и детском развитии. "
         f"{context} "
@@ -2100,7 +2110,7 @@ async def mama_firstdays(call: CallbackQuery):
 
 @dp.callback_query(F.data == "fd_pediatr")
 async def fd_pediatr(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Расскажи подробно о первом осмотре педиатра после выписки из роддома. "
@@ -2115,7 +2125,7 @@ async def fd_pediatr(call: CallbackQuery):
 
 @dp.callback_query(F.data == "fd_doctors")
 async def fd_doctors(call: CallbackQuery):
-    await call.message.edit_text("⏳ Составляю расписание врачей...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Составь подробный календарь обходов врачей для ребёнка по месяцам — от рождения до 1 года. "
@@ -2128,7 +2138,7 @@ async def fd_doctors(call: CallbackQuery):
 
 @dp.callback_query(F.data == "fd_svid")
 async def fd_svid(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию о документах...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай пошаговую инструкцию по оформлению документов на новорождённого в России. "
@@ -2144,7 +2154,7 @@ async def fd_svid(call: CallbackQuery):
 
 @dp.callback_query(F.data == "fd_sadik")
 async def fd_sadik(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию о садике...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай подробную инструкцию по записи ребёнка в детский сад в России. "
@@ -2160,7 +2170,7 @@ async def fd_sadik(call: CallbackQuery):
 
 @dp.callback_query(F.data == "fd_massage")
 async def fd_massage(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию о массаже...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай научно обоснованное руководство по массажу и гимнастике для младенцев. "
@@ -2177,7 +2187,7 @@ async def fd_massage(call: CallbackQuery):
 
 @dp.callback_query(F.data == "fd_swim")
 async def fd_swim(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию о плавании...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай научно обоснованное руководство по плаванию с младенцем. "
@@ -2203,7 +2213,7 @@ async def mama_breastfeeding(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bf_start")
 async def bf_start(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай исчерпывающее руководство по налаживанию грудного вскармливания с первых дней "
@@ -2221,7 +2231,7 @@ async def bf_start(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bf_pump")
 async def bf_pump(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай научно обоснованное руководство по увеличению лактации и расцеживанию. "
@@ -2237,7 +2247,7 @@ async def bf_pump(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bf_lactostaz")
 async def bf_lactostaz(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай исчерпывающее руководство по лактостазу и уплотнениям в груди. "
@@ -2256,7 +2266,7 @@ async def bf_lactostaz(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bf_food")
 async def bf_food(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай научно обоснованные рекомендации по питанию кормящей мамы. "
@@ -2272,7 +2282,7 @@ async def bf_food(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bf_nofood")
 async def bf_nofood(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай научно обоснованный список того что нельзя или нужно ограничить при грудном вскармливании. "
@@ -2288,7 +2298,7 @@ async def bf_nofood(call: CallbackQuery):
 
 @dp.callback_query(F.data == "bf_formula")
 async def bf_formula(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай поддерживающее и научно обоснованное руководство по переходу на смесь. "
@@ -2313,7 +2323,7 @@ async def mama_recovery(call: CallbackQuery):
 
 @dp.callback_query(F.data == "rec_natural")
 async def rec_natural(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай подробное руководство по восстановлению после естественных родов. "
@@ -2331,7 +2341,7 @@ async def rec_natural(call: CallbackQuery):
 
 @dp.callback_query(F.data == "rec_caesar")
 async def rec_caesar(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай исчерпывающее руководство по восстановлению после кесарева сечения. "
@@ -2350,7 +2360,7 @@ async def rec_caesar(call: CallbackQuery):
 
 @dp.callback_query(F.data == "rec_sport")
 async def rec_sport(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай научно обоснованный план возвращения к физической активности после родов. "
@@ -2367,7 +2377,7 @@ async def rec_sport(call: CallbackQuery):
 
 @dp.callback_query(F.data == "rec_intimate")
 async def rec_intimate(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай деликатное и научно обоснованное руководство по интимной жизни после родов. "
@@ -2383,7 +2393,7 @@ async def rec_intimate(call: CallbackQuery):
 
 @dp.callback_query(F.data == "rec_hair")
 async def rec_hair(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Объясни послеродовое выпадение волос научно и дай практические рекомендации. "
@@ -2399,7 +2409,7 @@ async def rec_hair(call: CallbackQuery):
 
 @dp.callback_query(F.data == "rec_diastaz")
 async def rec_diastaz(call: CallbackQuery):
-    await call.message.edit_text("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         "Дай подробное научное руководство по диастазу после родов. "
@@ -2542,7 +2552,7 @@ async def handle_photo(message: Message, state: FSMContext):
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
 
     import aiohttp
-    await message.answer("⏳ Анализирую фото...")
+    await show_typing(message.chat.id)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -4038,7 +4048,7 @@ async def vaccines_info(call: CallbackQuery):
     await call.message.answer("Выбери прививку чтобы узнать подробнее 👇", reply_markup=kb)
 
 async def vaccine_detail(call, vaccine_name, description):
-    await call.message.answer("⏳ Подбираю информацию...")
+    await show_typing(call.message.chat.id)
     answer = await ask_gpt(
         EXPERT_BASE,
         f"Дай подробное научное объяснение прививки {vaccine_name} для родителей. "
