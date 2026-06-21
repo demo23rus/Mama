@@ -33,6 +33,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
+APP_VERSION = "10.0"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -731,6 +732,34 @@ def delete_pending_payment(payment_id):
 def save_review(user_id, username, first_name, review_text):
     with db_connect() as conn: conn.execute("INSERT INTO reviews (user_id, username, first_name, review, created_at) VALUES (?,?,?,?,?)", (user_id, username or "", first_name or "", review_text, datetime.now().isoformat()))
 
+
+def add_psycho_message(user_id, role, content):
+    """Сохраняет сообщение поддерживающего диалога."""
+    clean_role = role if role in {"user", "assistant", "system"} else "user"
+    clean_content = (content or "").strip()
+    if not clean_content:
+        return
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO psycho_history (user_id, role, content, created_at) VALUES (?,?,?,?)",
+            (user_id, clean_role, clean_content, datetime.now().isoformat()),
+        )
+
+def get_psycho_history(user_id, limit=15):
+    """Возвращает последние сообщения в хронологическом порядке."""
+    safe_limit = max(1, min(int(limit or 15), 50))
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM psycho_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (user_id, safe_limit),
+        ).fetchall()
+    return list(reversed(rows))
+
+def clear_psycho_history(user_id):
+    """Очищает историю поддерживающего диалога пользователя."""
+    with db_connect() as conn:
+        conn.execute("DELETE FROM psycho_history WHERE user_id=?", (user_id,))
+
 def add_months(value, months):
     month = value.month - 1 + months
     year = value.year + month // 12
@@ -1368,6 +1397,11 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
                 )
         except Exception as e:
             logging.exception("Ошибка психолога: %s", e)
+            await send_message(
+                chat_id,
+                "Не удалось подготовить ответ. Попробуйте ещё раз — сообщение в лимит не засчитано.",
+                psycho_buttons(),
+            )
             await send_message(chat_id, "Что-то пошло не так 💕")
         return
 

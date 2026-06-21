@@ -17,6 +17,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 
+APP_VERSION = "10.0"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
