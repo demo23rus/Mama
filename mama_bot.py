@@ -4,7 +4,7 @@ import sqlite3
 import os
 from datetime import datetime, date, timedelta
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject, BufferedInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -58,6 +58,9 @@ logging.basicConfig(level=logging.INFO)
 
 DB_PATH = "/root/mama.db"
 FREE_REQUESTS = 10
+CHANNEL_VISUALS_ENABLED = _env.get("CHANNEL_VISUALS_ENABLED", "1") == "1"
+OPENAI_IMAGE_MODEL = _env.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
+CHANNEL_IMAGE_SIZE = _env.get("CHANNEL_IMAGE_SIZE", "1024x1024")
 
 
 # ─── FSM СОСТОЯНИЯ ───────────────────────────────────────────
@@ -606,6 +609,89 @@ async def ask_gpt(system_prompt, user_prompt):
         return clean_text(response.choices[0].message.content)
     except Exception as e:
         return f"Ошибка GPT: {e}"
+
+
+
+def channel_visual_subject(theme="", title="", body="", format_name=""):
+    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+    mapping = [
+        (("сон", "недосып", "засып", "пробуж"), "сон малыша, спокойный вечерний или дневной семейный ритм"),
+        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "кормление малыша или спокойный семейный момент за столом"),
+        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "заботливый семейный момент о здоровье ребёнка без медицинской драмы"),
+        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "мама или папа занимаются с ребёнком по возрасту"),
+        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "спокойная эмоциональная поддержка мамы в домашней обстановке"),
+        (("отношен", "муж", "пап", "семь", "партн", "близост", "бабуш"), "тёплая семейная сцена с мамой, папой и ребёнком"),
+        (("беремен", "род", "восстанов", "срок"), "беременность или мягкое восстановление мамы после родов"),
+    ]
+    for keywords, subject in mapping:
+        if any(word in text for word in keywords):
+            return subject
+    return "тёплая современная семейная сцена с мамой и ребёнком"
+
+
+def build_channel_image_prompt(slot, theme, title, body, format_name):
+    subject = channel_visual_subject(theme, title, body, format_name)
+    if slot == "morning":
+        scene = "Утренний lifestyle-кадр, мягкий естественный свет, спокойная поддерживающая атмосфера"
+    elif slot == "afternoon":
+        scene = "Чистый редакционный lifestyle-кадр, понятная практическая сцена, аккуратная композиция"
+    elif slot == "evening":
+        scene = "Тёплый эмоциональный вечерний кадр, ощущение семьи, поддержки и узнаваемой жизни"
+    else:
+        scene = "Тёплый редакционный кадр для семейного канала"
+
+    return (
+        f"Создай вертикальное изображение для семейного канала о материнстве и детях. "
+        f"Сюжет: {subject}. {scene}. "
+        f"Стиль: реалистичная современная editorial lifestyle photography, мягкие нейтральные цвета, "
+        f"естественные люди, доверительная атмосфера, без глянцевой искусственности. "
+        f"Без текста, без логотипов, без водяных знаков, без коллажа. "
+        f"Тема поста для ориентира: {theme}. Заголовок: {title}."
+    )
+
+
+async def generate_channel_image_bytes(slot, theme, title, body, format_name):
+    if not CHANNEL_VISUALS_ENABLED:
+        return None
+    prompt = build_channel_image_prompt(slot, theme, title, body, format_name)
+    try:
+        resp = await client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size=CHANNEL_IMAGE_SIZE,
+        )
+        image_data = resp.data[0]
+        b64_json = getattr(image_data, "b64_json", None)
+        image_url = getattr(image_data, "url", None)
+        if not b64_json and isinstance(image_data, dict):
+            b64_json = image_data.get("b64_json")
+            image_url = image_data.get("url")
+        if b64_json:
+            return base64.b64decode(b64_json)
+        if image_url:
+            import httpx
+            async with httpx.AsyncClient(timeout=60) as http_client:
+                r = await http_client.get(image_url)
+                if r.is_success:
+                    return r.content
+        logging.warning("Канал TG: OpenAI вернул изображение без b64_json/url")
+        return None
+    except Exception as e:
+        logging.error(f"Канал TG: не удалось сгенерировать изображение: {e}")
+        return None
+
+
+async def send_channel_image_tg(slot, title, image_bytes):
+    if not image_bytes:
+        return False
+    try:
+        photo = BufferedInputFile(image_bytes, filename=f"channel_{slot}_{uuid.uuid4().hex[:8]}.png")
+        caption = (title or "").strip()[:1024] or None
+        await bot.send_photo(CHANNEL_ID, photo=photo, caption=caption)
+        return True
+    except Exception as e:
+        logging.error(f"Канал TG: ошибка отправки изображения: {e}")
+        return False
 
 # ─── ПЕРСОНАЛЬНАЯ АНАЛИТИКА И ДОСТУП ────────────────────────
 PREMIUM_CALLBACKS = {
@@ -2661,26 +2747,67 @@ async def generate_channel_post(slot, theme, format_name, instruction, max_chars
     return None, None
 
 
-def channel_post_markup(button_text="Открыть Мамин помощник"):
+def channel_funnel_for_post(theme="", title="", body="", format_name=""):
+    """Подбирает тематический мостик и CTA для каждого поста канала."""
+    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+
+    rules = [
+        (("сон", "недосып", "засып", "пробуж"),
+         "🌙 Хотите увидеть картину сна именно вашего ребёнка? Отмечайте засыпания и пробуждения в помощнике.",
+         "🌙 Записать сон ребёнка"),
+        (("корм", "гв", "груд", "прикорм", "питан", "смесь"),
+         "🍼 Не держите в голове время и детали кормлений — сохраните их в помощнике.",
+         "🍼 Открыть дневник кормлений"),
+        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"),
+         "🩺 Зафиксируйте наблюдения и подготовьте вопросы, чтобы на приёме ничего не забыть.",
+         "🩺 Подготовиться к врачу"),
+        (("развит", "возраст", "игр", "заняти", "навык", "речь"),
+         "👶 Получите подсказку с учётом возраста именно вашего ребёнка.",
+         "👶 Что важно сегодня"),
+        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"),
+         "🤍 Когда всё накопилось, опишите ситуацию помощнику — он поможет спокойно разложить её по шагам.",
+         "🤍 Получить поддержку"),
+        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"),
+         "👨‍👩‍👧 Сохраните семейную ситуацию и получите спокойный план следующего разговора.",
+         "👨‍👩‍👧 Разобрать ситуацию"),
+        (("беремен", "род", "восстанов", "срок"),
+         "🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
+         "🤰 Открыть помощника"),
+    ]
+    for keywords, bridge, button in rules:
+        if any(word in text for word in keywords):
+            return bridge, button
+
+    return (
+        "✨ В «Мамином помощнике» можно получить подсказку именно для вашей ситуации и возраста ребёнка.",
+        "✨ Открыть помощника на сегодня",
+    )
+
+
+def channel_post_markup(button_text="✨ Открыть помощника на сегодня"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=button_text, url=BOT_PUBLIC_URL)]
     ])
 
 
-async def publish_channel_post(slot, theme, format_name, title, body, with_button=False, button_text="Открыть Мамин помощник"):
+async def publish_channel_post(slot, theme, format_name, title, body, with_button=True, button_text=None):
     if not title or not body:
         logging.warning(f"Канал: публикация {slot} пропущена — не удалось получить уникальный текст")
         return
-    final_text = f"{title}\n\n{body}".strip()
+
+    bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
+    final_button_text = button_text or thematic_button
+    final_text = f"{title}\n\n{body}\n\n{bridge_text}\n{BOT_PUBLIC_URL}".strip()
+
     try:
         await bot.send_message(
             CHANNEL_ID,
             final_text,
-            reply_markup=channel_post_markup(button_text) if with_button else None,
+            reply_markup=channel_post_markup(final_button_text),
             disable_web_page_preview=True,
         )
         save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title}")
+        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={final_button_text}")
     except Exception as e:
         logging.error(f"Канал: ошибка публикации {slot}: {e}")
 
@@ -2711,12 +2838,9 @@ async def post_afternoon():
         "Создай главный полезный материал дня на 1000–1800 знаков. Дай конкретный алгоритм, чек-лист или разбор ситуации. "
         "Материал должен хотеться сохранить или переслать. Не перегружай теорией.",
         1900,
-        with_bot_bridge=True,
+        with_bot_bridge=False,
     )
-    await publish_channel_post(
-        "afternoon", theme, format_name, title, body,
-        with_button=True, button_text="Получить персональную помощь"
-    )
+    await publish_channel_post("afternoon", theme, format_name, title, body)
 
 
 async def post_evening_poll():
@@ -2737,12 +2861,21 @@ async def post_evening_poll():
         return
     question, options = poll_data
     try:
+        poll_bridge, poll_button = channel_funnel_for_post(
+            WEEKLY_EDITORIAL[today.weekday()], question, " ".join(options), "опрос"
+        )
         await bot.send_poll(
             CHANNEL_ID,
             question=question,
             options=options,
             is_anonymous=True,
             allows_multiple_answers=False,
+            reply_markup=channel_post_markup(poll_button),
+        )
+        await bot.send_message(
+            CHANNEL_ID,
+            f"{poll_bridge}\n{BOT_PUBLIC_URL}",
+            disable_web_page_preview=True,
         )
         save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(options))
         logging.info(f"Канал: опубликован опрос | {question}")
@@ -2758,8 +2891,6 @@ async def post_evening():
 
     theme = WEEKLY_EDITORIAL[today.weekday()]
     format_name = EVENING_FORMATS[(today.toordinal() * 3) % len(EVENING_FORMATS)]
-    # Мягкая демонстрация продукта только три вечера в неделю.
-    with_bridge = today.weekday() in (0, 3, 4)
     title, body = await generate_channel_post(
         "20:00",
         theme,
@@ -2767,13 +2898,9 @@ async def post_evening():
         "Создай вечерний пост на 550–1000 знаков. Он должен вызывать узнавание, реакцию или желание ответить себе на вопрос. "
         "Не повторяй дневной материал и не пиши длинную лекцию.",
         1100,
-        with_bot_bridge=with_bridge,
+        with_bot_bridge=False,
     )
-    await publish_channel_post(
-        "evening", theme, format_name, title, body,
-        with_button=with_bridge,
-        button_text="Попробовать в боте",
-    )
+    await publish_channel_post("evening", theme, format_name, title, body)
 
 
 async def channel_weekly_editorial_report():

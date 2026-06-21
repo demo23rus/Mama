@@ -8,6 +8,7 @@ import httpx
 import calendar
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qs
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
@@ -25,6 +26,9 @@ SUPPORT_URL = "https://t.me/demo23rus"
 MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
 MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
 MAX_BOT_CHANNEL_LINK = MAX_BOT_PUBLIC_URL
+CHANNEL_VISUALS_ENABLED = os.getenv("CHANNEL_VISUALS_ENABLED", "1") == "1"
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+CHANNEL_IMAGE_SIZE = os.getenv("CHANNEL_IMAGE_SIZE", "1024x1024")
 
 # Лимиты
 FREE_REQUESTS = 15
@@ -601,6 +605,109 @@ async def generate_with_history(system, history, new_message):
         model="gpt-4o-mini", messages=messages, max_tokens=1500
     )
     return response.choices[0].message.content
+
+
+
+def channel_visual_subject(theme="", title="", body="", format_name=""):
+    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+    mapping = [
+        (("сон", "недосып", "засып", "пробуж"), "сон малыша, спокойный семейный ритм, уютный домашний вечер или дневной отдых"),
+        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "кормление малыша или спокойный семейный момент за столом"),
+        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "заботливый семейный момент о здоровье ребёнка без драматизации"),
+        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "мама или папа занимаются с ребёнком по возрасту"),
+        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "эмоциональная поддержка мамы в тёплой домашней обстановке"),
+        (("отношен", "муж", "пап", "семь", "партн", "близост", "бабуш"), "тёплая семейная сцена с мамой, папой и ребёнком"),
+        (("беремен", "род", "восстанов", "срок"), "беременность или мягкое восстановление мамы после родов"),
+    ]
+    for keywords, subject in mapping:
+        if any(word in text for word in keywords):
+            return subject
+    return "тёплая современная семейная сцена с мамой и ребёнком"
+
+
+def build_channel_image_prompt(slot, theme, title, body, format_name):
+    subject = channel_visual_subject(theme, title, body, format_name)
+    if slot == "morning":
+        scene = "Утренний lifestyle-кадр, мягкий естественный свет, поддерживающая спокойная атмосфера"
+    elif slot == "afternoon":
+        scene = "Чистый редакционный lifestyle-кадр, практичная и понятная жизненная сцена"
+    elif slot == "evening":
+        scene = "Тёплый эмоциональный вечерний кадр, ощущение поддержки, семьи и узнаваемой жизни"
+    else:
+        scene = "Тёплый редакционный кадр для семейного канала"
+
+    return (
+        f"Создай вертикальное изображение для семейного канала о материнстве и детях. "
+        f"Сюжет: {subject}. {scene}. "
+        f"Стиль: реалистичная современная editorial lifestyle photography, мягкие нейтральные цвета, "
+        f"естественные люди, доверительная атмосфера, без глянцевой искусственности. "
+        f"Без текста, без логотипов, без водяных знаков, без коллажа. "
+        f"Тема поста для ориентира: {theme}. Заголовок: {title}."
+    )
+
+
+async def generate_channel_image_bytes(slot, theme, title, body, format_name):
+    if not CHANNEL_VISUALS_ENABLED:
+        return None
+    prompt = build_channel_image_prompt(slot, theme, title, body, format_name)
+    try:
+        resp = await openai_client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size=CHANNEL_IMAGE_SIZE,
+        )
+        image_data = resp.data[0]
+        b64_json = getattr(image_data, "b64_json", None)
+        image_url = getattr(image_data, "url", None)
+        if not b64_json and isinstance(image_data, dict):
+            b64_json = image_data.get("b64_json")
+            image_url = image_data.get("url")
+        if b64_json:
+            return base64.b64decode(b64_json)
+        if image_url:
+            async with httpx.AsyncClient(timeout=60) as http_client:
+                r = await http_client.get(image_url)
+                if r.is_success:
+                    return r.content
+        logging.warning("Канал MAX: OpenAI вернул изображение без b64_json/url")
+        return None
+    except Exception as exc:
+        logging.error("Канал MAX: не удалось сгенерировать изображение: %s", exc)
+        return None
+
+
+async def upload_channel_image_to_max(image_bytes, filename="channel.png"):
+    if not image_bytes:
+        return None
+    headers = {"Authorization": MAX_TOKEN}
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            init_resp = await client.post(f"{MAX_API}/uploads?type=image", headers=headers)
+            if not init_resp.is_success:
+                logging.error("MAX upload init error %s %s", init_resp.status_code, init_resp.text[:300])
+                return None
+            upload_url = init_resp.json().get("url")
+            if not upload_url:
+                logging.error("MAX upload init: в ответе нет url")
+                return None
+            upload_resp = await client.post(upload_url, files={"data": (filename, image_bytes, "image/png")})
+            if not upload_resp.is_success:
+                logging.error("MAX image upload error %s %s", upload_resp.status_code, upload_resp.text[:300])
+                return None
+            payload = upload_resp.json()
+            token = payload.get("token")
+            if not token:
+                try:
+                    token = parse_qs(urlparse(upload_url).query).get("token", [None])[0]
+                except Exception:
+                    token = None
+            if not token:
+                logging.error("MAX image upload: не удалось получить token")
+                return None
+            return {"token": token}
+    except Exception as exc:
+        logging.exception("MAX image upload exception: %s", exc)
+        return None
 
 # ========== ОПЛАТА ==========
 async def create_payment(user_id, plan):
@@ -2135,52 +2242,116 @@ async def generate_channel_post(slot, theme, format_name, instruction, max_chars
     return None, None
 
 
-def channel_open_button(text="Открыть Мамин Помощник"):
+def channel_funnel_for_post(theme="", title="", body="", format_name=""):
+    """Подбирает тематический мостик и CTA для каждого поста MAX-канала."""
+    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+    rules = [
+        (("сон", "недосып", "засып", "пробуж"),
+         "🌙 Хотите увидеть картину сна именно вашего ребёнка? Отмечайте засыпания и пробуждения в помощнике.",
+         "🌙 Записать сон ребёнка"),
+        (("корм", "гв", "груд", "прикорм", "питан", "смесь"),
+         "🍼 Не держите в голове время и детали кормлений — сохраните их в помощнике.",
+         "🍼 Открыть дневник кормлений"),
+        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"),
+         "🩺 Зафиксируйте наблюдения и подготовьте вопросы, чтобы на приёме ничего не забыть.",
+         "🩺 Подготовиться к врачу"),
+        (("развит", "возраст", "игр", "заняти", "навык", "речь"),
+         "👶 Получите подсказку с учётом возраста именно вашего ребёнка.",
+         "👶 Что важно сегодня"),
+        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"),
+         "🤍 Когда всё накопилось, опишите ситуацию помощнику — он поможет спокойно разложить её по шагам.",
+         "🤍 Получить поддержку"),
+        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"),
+         "👨‍👩‍👧 Сохраните семейную ситуацию и получите спокойный план следующего разговора.",
+         "👨‍👩‍👧 Разобрать ситуацию"),
+        (("беремен", "род", "восстанов", "срок"),
+         "🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
+         "🤰 Открыть помощника"),
+    ]
+    for keywords, bridge, button in rules:
+        if any(word in text for word in keywords):
+            return bridge, button
+    return (
+        "✨ В «Мамином помощнике» можно получить подсказку именно для вашей ситуации и возраста ребёнка.",
+        "✨ Открыть помощника на сегодня",
+    )
+
+
+def channel_open_button(text="✨ Открыть помощника на сегодня"):
     if not MAX_BOT_CHANNEL_LINK:
         logging.error("Кнопка перехода в бот не добавлена: не задан MAX_BOT_CHANNEL_LINK")
         return None
     return [[{"type": "link", "text": text, "url": MAX_BOT_CHANNEL_LINK}]]
 
 
-async def send_to_channel(text, buttons=None):
+async def send_to_channel(text, buttons=None, bot_button_text="✨ Открыть помощника на сегодня", image_payload=None):
+    """Отправляет пост с обязательной кликабельной кнопкой и резервной ссылкой, при наличии — с изображением."""
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
-    payload = {"text": text[:MAX_TEXT_LIMIT], "format": "markdown"}
-    if buttons:
-        payload["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]
+    link_suffix = f"\n\n{MAX_BOT_CHANNEL_LINK}" if MAX_BOT_CHANNEL_LINK else ""
+    raw_text = (text or "").strip()
+    allowed_body = max(0, MAX_TEXT_LIMIT - len(link_suffix))
+    final_text = raw_text[:allowed_body].rstrip() + link_suffix
+
+    final_buttons = [list(row) for row in (buttons or [])]
+    has_bot_link_button = any(
+        button.get("type") == "link" and button.get("url") == MAX_BOT_CHANNEL_LINK
+        for row in final_buttons
+        for button in row
+        if isinstance(button, dict)
+    )
+    if MAX_BOT_CHANNEL_LINK and not has_bot_link_button:
+        final_buttons.append([
+            {"type": "link", "text": bot_button_text, "url": MAX_BOT_CHANNEL_LINK}
+        ])
+
+    attachments = []
+    if image_payload:
+        attachments.append({"type": "image", "payload": image_payload})
+    if final_buttons:
+        attachments.append({"type": "inline_keyboard", "payload": {"buttons": final_buttons}})
+
+    payload = {"text": final_text, "format": "markdown"}
+    if attachments:
+        payload["attachments"] = attachments
+
+    delays = [0, 2, 4]
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{MAX_API}/messages?chat_id={CHANNEL_ID}", json=payload, headers=headers)
-            if not r.is_success:
-                logging.error("Канал MAX: ошибка %s %s", r.status_code, r.text[:500])
+            for attempt, delay in enumerate(delays, start=1):
+                if delay:
+                    await asyncio.sleep(delay)
+                r = await client.post(f"{MAX_API}/messages?chat_id={CHANNEL_ID}", json=payload, headers=headers)
+                if r.is_success:
+                    logging.info("Канал MAX: публикация отправлена status=%s CTA=%s image=%s", r.status_code, bot_button_text, 'yes' if image_payload else 'no')
+                    return True
+                body = r.text[:500]
+                if "attachment.not.ready" in body and attempt < len(delays):
+                    next_delay = delays[attempt] if attempt < len(delays) else 0
+                    logging.warning("Канал MAX: вложение ещё не готово, повтор через %s сек.", next_delay)
+                    continue
+                logging.error("Канал MAX: ошибка %s %s", r.status_code, body)
                 return False
-            logging.info("Канал MAX: публикация отправлена status=%s", r.status_code)
-            return True
     except Exception as exc:
         logging.exception("Канал MAX: ошибка отправки: %s", exc)
         return False
 
 
-async def publish_channel_post(slot, theme, format_name, title, body, with_button=False, button_text="Открыть Мамин Помощник"):
+async def publish_channel_post(slot, theme, format_name, title, body, with_button=True, button_text=None):
     if not title or not body:
         logging.warning("Канал: публикация %s пропущена — не удалось получить уникальный текст", slot)
         return
 
-    final_text = f"{title}\n\n{body}".strip()
-    buttons = None
+    bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
+    final_button_text = button_text or thematic_button
+    final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
 
-    # Дублируем переход двумя официально поддерживаемыми способами:
-    # Markdown-ссылкой в тексте и link-кнопкой.
-    if with_button:
-        if MAX_BOT_CHANNEL_LINK:
-            final_text += f"\n\n🤍 Открыть бота: {MAX_BOT_CHANNEL_LINK}"
-            buttons = channel_open_button(button_text)
-        else:
-            logging.error("Канал: публикация без перехода — публичная ссылка бота не определена")
-
-    ok = await send_to_channel(final_text, buttons)
+    image_bytes = await generate_channel_image_bytes(slot, theme, title, body, format_name)
+    image_payload = await upload_channel_image_to_max(image_bytes, filename=f"channel_{slot}.png") if image_bytes else None
+    ok = await send_to_channel(final_text, None, final_button_text, image_payload=image_payload)
     if ok:
-        save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info("Канал: опубликовано %s | %s | %s", slot, format_name, title)
+        saved_text = f"{final_text}\n\n{MAX_BOT_CHANNEL_LINK}" if MAX_BOT_CHANNEL_LINK else final_text
+        save_channel_post(slot, theme, format_name, title, saved_text)
+        logging.info("Канал: опубликовано %s | %s | %s | CTA=%s | image=%s", slot, format_name, title, final_button_text, 'yes' if image_payload else 'no')
 
 
 async def post_morning():
@@ -2202,9 +2373,9 @@ async def post_afternoon():
     title, body = await generate_channel_post(
         "13:00", theme, format_name,
         "Создай главный полезный материал дня на 1000–1800 знаков. Дай конкретный алгоритм, чек-лист или разбор ситуации. Материал должен хотеться сохранить или переслать. Не перегружай теорией.",
-        1900, with_bot_bridge=True,
+        1900, with_bot_bridge=False,
     )
-    await publish_channel_post("afternoon", theme, format_name, title, body, True, "Получить персональную помощь")
+    await publish_channel_post("afternoon", theme, format_name, title, body)
 
 
 async def post_evening_poll():
@@ -2226,10 +2397,20 @@ async def post_evening_poll():
     poll_key_base, question, options = poll_data
     poll_key = f"{poll_key_base}{today.strftime('%y%m%d')}"
     buttons = [[{"type": "callback", "text": label, "payload": f"channel_poll_{poll_key}_{key}"}] for key, label in options]
-    ok = await send_to_channel(f"📊 {question}\n\nВыберите один вариант — ответ сохранится анонимно для других участников.", buttons)
+    poll_bridge, poll_button = channel_funnel_for_post(
+        WEEKLY_EDITORIAL[today.weekday()], question, " ".join(label for _, label in options), "опрос"
+    )
+    image_bytes = await generate_channel_image_bytes("evening_poll", WEEKLY_EDITORIAL[today.weekday()], question, " ".join(label for _, label in options), "опрос")
+    image_payload = await upload_channel_image_to_max(image_bytes, filename="channel_evening_poll.png") if image_bytes else None
+    ok = await send_to_channel(
+        f"📊 {question}\n\nВыберите один вариант — ответ сохранится анонимно для других участников.\n\n{poll_bridge}",
+        buttons,
+        poll_button,
+        image_payload=image_payload,
+    )
     if ok:
         save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(label for _, label in options))
-        logging.info("Канал: опубликован опрос | %s", question)
+        logging.info("Канал: опубликован опрос | %s | image=%s", question, "yes" if image_payload else "no")
 
 
 async def post_evening():
@@ -2239,13 +2420,12 @@ async def post_evening():
         return
     theme = WEEKLY_EDITORIAL[today.weekday()]
     format_name = EVENING_FORMATS[(today.date().toordinal() * 3) % len(EVENING_FORMATS)]
-    with_bridge = today.weekday() in (0, 3, 4)
     title, body = await generate_channel_post(
         "20:00", theme, format_name,
         "Создай вечерний пост на 550–1000 знаков. Он должен вызывать узнавание, реакцию или желание ответить себе на вопрос. Не повторяй дневной материал и не пиши длинную лекцию.",
-        1100, with_bot_bridge=with_bridge,
+        1100, with_bot_bridge=False,
     )
-    await publish_channel_post("evening", theme, format_name, title, body, with_bridge, "Попробовать в боте")
+    await publish_channel_post("evening", theme, format_name, title, body)
 
 
 async def channel_weekly_editorial_report():
