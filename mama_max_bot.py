@@ -25,6 +25,7 @@ OWNER_ID = int(os.getenv("MAX_OWNER_ID", "549639607"))
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
 MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
+MAX_CHANNEL_PUBLIC_URL = os.getenv("MAX_CHANNEL_PUBLIC_URL", "")
 MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
 MAX_BOT_CHANNEL_LINK = MAX_BOT_PUBLIC_URL
 CHANNEL_VISUALS_ENABLED = os.getenv("CHANNEL_VISUALS_ENABLED", "1") == "1"
@@ -294,6 +295,20 @@ async def refresh_max_bot_identity():
 
 
 # ========== КНОПКИ ==========
+def start_buttons():
+    buttons = [
+        [{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"}],
+        [{"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}],
+    ]
+    if MAX_CHANNEL_PUBLIC_URL:
+        buttons.append([{"type": "link", "text": "📢 Наш канал", "url": MAX_CHANNEL_PUBLIC_URL}])
+    buttons.append([
+        {"type": "callback", "text": "💎 Тарифы", "payload": "pay_premium"},
+        {"type": "callback", "text": "🆘 Поддержка", "payload": "support_menu"},
+    ])
+    return buttons
+
+
 def pregnant_menu_buttons():
     return [
         [{"type":"callback","text":"✨ Сегодня","payload":"today_brief"}],
@@ -1105,23 +1120,14 @@ PSYCHO_SYSTEM = (
     "Опираешься на КПТ, ACT, теорию привязанности Петрановской. Никогда не осуждаешь."
 )
 
-WELCOME_TEXT = """Привет, {name}! 🤍
+WELCOME_TEXT = """👋 Привет, {name}!
 
-Я Мамин Помощник — твой личный ИИ-ассистент для мам.
+Я Мамин Помощник — личный AI-помощник для беременности, ребёнка и поддержки мамы.
 
-Что я умею:
-🤰 Поддержка при беременности — развитие малыша, чек-листы, подготовка к родам
-👶 Советы по возрасту — развитие, питание, сон, здоровье
-🤱 Грудное вскармливание и восстановление после родов
-🧠 Детская психология — истерики, поведение, эмоции
-💊 Здоровье — симптомы, лекарства, прививки
-📏 Трекеры — рост, вес, симптомы, кормления, сон
-🧠 Мамин психолог — личный психолог который тебя помнит
-💰 Пособия и выплаты
+Подскажу по возрасту, помогу вести трекеры, подготовиться к врачу и разобраться в сложной ситуации.
 
-Все советы основаны на рекомендациях ВОЗ, AAP и ведущих педиатров мира.
+Расскажи, кто ты 👇"""
 
-Сначала укажи кто ты 👇"""
 
 def calc_child_age(birth_str):
     try:
@@ -1237,8 +1243,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
             await send_message(chat_id, f"Привет, {name}! 🤍\n\nЧем могу помочь?", main_menu_buttons())
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
-                [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-                  {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+                start_buttons())
         return
 
     # Психолог
@@ -1495,8 +1500,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
     # Если режим не выбран
     if not birth_date:
         await send_message(chat_id, WELCOME_TEXT.format(name=name),
-            [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-              {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+            start_buttons())
         return
 
     menu = pregnant_menu_buttons() if birth_date.startswith("pdr:") else main_menu_buttons()
@@ -1534,7 +1538,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "channel_open_bot":
         await send_message(user_id,
             "🤍 Ты пришла из канала «Я МАМА». Здесь можно получить персональный план, вести трекеры и задать вопрос с учётом возраста ребёнка.",
-            pregnant_menu_buttons() if birth_date.startswith("pdr:") else main_menu_buttons() if birth_date else [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"}, {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+            pregnant_menu_buttons() if birth_date.startswith("pdr:") else main_menu_buttons() if birth_date else start_buttons())
         return
 
     if payload.startswith("channel_poll_"):
@@ -1565,8 +1569,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons())
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
-                [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-                  {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+                start_buttons())
         return
 
     if payload == "main_menu":
@@ -1577,8 +1580,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons())
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
-                [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-                  {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+                start_buttons())
         return
 
     if payload == "cat_child":
@@ -1677,8 +1679,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         conn.commit()
         conn.close()
         await send_message(chat_id, "Выбери свой статус 👇",
-            [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-              {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+            start_buttons())
         return
 
     if payload == "set_mama":

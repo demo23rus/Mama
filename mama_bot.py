@@ -1016,7 +1016,7 @@ def kb_start():
         [InlineKeyboardButton(text="🤰 Я беременна", callback_data="mode_pregnant")],
         [InlineKeyboardButton(text="👩 Я уже мама", callback_data="mode_mama")],
         [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/yamama_ai")],
-        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")]
     ])
 
@@ -1251,10 +1251,10 @@ async def show_start(message: Message, name: str, state: FSMContext):
     await state.set_state(RegStates.choosing_mode)
     await message.answer(
         f"👋 Привет, {name}!\n\n"
-        f"Я Мамин помощник 🤱 — твой личный ИИ-помощник.\n\n"
-        f"Я буду давать советы, отвечать на вопросы и помогать — "
-        f"всё строго под твою ситуацию.\n\n"
-        f"Расскажи мне о себе 👇",
+        f"Я Мамин Помощник — личный AI-помощник для беременности, ребёнка и поддержки мамы.\n\n"
+        f"Подскажу по возрасту, помогу вести трекеры, подготовиться к врачу "
+        f"и разобраться в сложной ситуации.\n\n"
+        f"Расскажи, кто ты 👇",
         
         reply_markup=kb_start()
     )
