@@ -5,13 +5,14 @@ import os
 from datetime import datetime, date, timedelta
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject, BufferedInputFile
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import uuid
+import base64
 import gspread
 from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
@@ -35,7 +36,8 @@ _env = load_env()
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
 BOT_TOKEN  = "8769245157:AAH2EbEFpGj8MzuHUMiBKeLB7eJztyxfC1s"
 SUPPORT_USERNAME = "@demo23rus"
-CHANNEL_REPORT_CHAT_ID = _env.get("CHANNEL_REPORT_CHAT_ID", SUPPORT_USERNAME)
+OWNER_ID = int(_env.get("TG_OWNER_ID", "0") or 0)
+CHANNEL_REPORT_CHAT_ID = _env.get("CHANNEL_REPORT_CHAT_ID", str(OWNER_ID) if OWNER_ID else SUPPORT_USERNAME)
 BOT_NAME = "Мамин помощник"
 OPENAI_KEY = "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"
 
@@ -61,6 +63,22 @@ FREE_REQUESTS = 10
 CHANNEL_VISUALS_ENABLED = _env.get("CHANNEL_VISUALS_ENABLED", "1") == "1"
 OPENAI_IMAGE_MODEL = _env.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
 CHANNEL_IMAGE_SIZE = _env.get("CHANNEL_IMAGE_SIZE", "1024x1024")
+
+PLAN_CATALOG = {
+    "free": {"name": "Бесплатный", "amount": "0.00", "days": 0, "type": "subscription"},
+    "start": {"name": "Старт", "amount": "190.00", "days": 30, "type": "subscription"},
+    "pro": {"name": "Про", "amount": "390.00", "days": 30, "type": "subscription"},
+    "pro_year": {"name": "Про на год", "amount": "2990.00", "days": 365, "type": "subscription"},
+}
+ONE_TIME_PRODUCTS = {
+    "doctor_report": {"name": "Сводка к педиатру", "amount": "149.00", "credit": "doctor_report"},
+    "sleep_report": {"name": "Разбор сна за 7 дней", "amount": "199.00", "credit": "sleep_report"},
+    "feeding_report": {"name": "Разбор кормлений", "amount": "149.00", "credit": "feeding_report"},
+    "weekly_report": {"name": "Недельный семейный отчёт", "amount": "199.00", "credit": "weekly_report"},
+    "photo_analysis": {"name": "Один анализ фото", "amount": "99.00", "credit": "photo_analysis"},
+}
+PAID_PLANS = {"start", "pro", "pro_year"}
+PRO_PLANS = {"pro", "pro_year"}
 
 
 # ─── FSM СОСТОЯНИЯ ───────────────────────────────────────────
@@ -305,6 +323,40 @@ def init_db():
             created_at TEXT
         )
     """)
+    c.execute("""CREATE TABLE IF NOT EXISTS payments (
+        payment_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, platform TEXT NOT NULL,
+        product_type TEXT NOT NULL, product_code TEXT NOT NULL, amount TEXT NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'RUB', status TEXT NOT NULL DEFAULT 'created',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL, raw_status TEXT DEFAULT ''
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS processed_payments (
+        payment_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, product_code TEXT NOT NULL, processed_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS subscription_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, payment_id TEXT UNIQUE, user_id INTEGER NOT NULL,
+        plan TEXT NOT NULL, started_at TEXT NOT NULL, ends_at TEXT NOT NULL, created_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS purchases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, payment_id TEXT UNIQUE, user_id INTEGER NOT NULL,
+        product_code TEXT NOT NULL, amount TEXT NOT NULL, created_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS user_credits (
+        user_id INTEGER NOT NULL, product_code TEXT NOT NULL, credits INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL, PRIMARY KEY(user_id, product_code)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sales_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, payment_id TEXT UNIQUE, created_at TEXT NOT NULL,
+        platform TEXT NOT NULL, user_id INTEGER NOT NULL, product_code TEXT NOT NULL,
+        amount TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'RUB', ends_at TEXT DEFAULT ''
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_sales_user_date ON sales_events(user_id, created_at)")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_counters (user_id INTEGER NOT NULL, counter TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,counter))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS marketing_offers (
+        user_id INTEGER NOT NULL, offer_type TEXT NOT NULL, last_shown_at TEXT NOT NULL,
+        show_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(user_id, offer_type)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_marketing_offers_user_date ON marketing_offers(user_id, last_shown_at)")
     c.execute("""
         CREATE TABLE IF NOT EXISTS requests_count (
             user_id INTEGER PRIMARY KEY,
@@ -426,75 +478,222 @@ def get_sleep_log(user_id):
     conn.close()
     return rows
 
-def get_subscription(user_id):
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("SELECT plan, sub_end FROM subscriptions WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return "", None
-    return row[0], row[1]
+def _normalize_plan(plan):
+    return "pro" if plan == "mama_premium" else plan if plan in PLAN_CATALOG else "free"
 
-def set_subscription(user_id, plan, days):
-    conn = db_connect()
-    row = conn.execute("SELECT sub_end FROM subscriptions WHERE user_id=?", (user_id,)).fetchone()
-    start = datetime.now()
-    if row and row[0]:
-        try:
-            current_end = datetime.fromisoformat(row[0])
-            if current_end > start:
-                start = current_end
-        except ValueError:
-            pass
-    end = (start + timedelta(days=days)).isoformat()
-    conn.execute("INSERT OR REPLACE INTO subscriptions (user_id, plan, sub_end) VALUES (?,?,?)",
-                 (user_id, plan, end))
-    conn.commit()
-    conn.close()
+def get_subscription(user_id):
+    conn=db_connect(); row=conn.execute("SELECT plan, sub_end FROM subscriptions WHERE user_id=?",(user_id,)).fetchone()
+    if not row or not row[1]: conn.close(); return "free", None
+    plan=_normalize_plan(row[0])
+    try: end=datetime.fromisoformat(row[1])
+    except (TypeError,ValueError):
+        conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?, 'free','')",(user_id,)); conn.commit(); conn.close(); return "free",None
+    if end<=datetime.now():
+        conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?, 'free','')",(user_id,)); conn.commit(); conn.close(); return "free",None
+    if plan!=row[0]: conn.execute("UPDATE subscriptions SET plan=? WHERE user_id=?",(plan,user_id)); conn.commit()
+    conn.close(); return plan,end
+
+def set_subscription(user_id,plan,days):
+    plan=_normalize_plan(plan)
+    if plan not in PAID_PLANS: raise ValueError(f"Недопустимый тариф: {plan}")
+    now=datetime.now(); _,current_end=get_subscription(user_id); start=current_end if current_end and current_end>now else now; end=start+timedelta(days=days)
+    with db_connect() as conn: conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)",(user_id,plan,end.isoformat()))
+    return end
 
 def is_premium(user_id):
-    plan, sub_end = get_subscription(user_id)
-    if plan == "mama_premium" and sub_end:
-        if datetime.fromisoformat(sub_end) > datetime.now():
-            return True
-    return False
+    plan,end=get_subscription(user_id); return plan in PAID_PLANS and end is not None
 
 def get_request_count(user_id):
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("SELECT count FROM requests_count WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
+    conn=db_connect(); row=conn.execute("SELECT count FROM requests_count WHERE user_id=?",(user_id,)).fetchone(); conn.close(); return row[0] if row else 0
 
 def increment_request_count(user_id):
-    conn = db_connect()
-    conn.execute("INSERT OR REPLACE INTO requests_count (user_id, count) VALUES (?, COALESCE((SELECT count FROM requests_count WHERE user_id=?), 0) + 1)",
-                 (user_id, user_id))
-    conn.commit()
-    conn.close()
+    with db_connect() as conn: conn.execute("INSERT OR REPLACE INTO requests_count(user_id,count) VALUES (?,COALESCE((SELECT count FROM requests_count WHERE user_id=?),0)+1)",(user_id,user_id))
 
-def save_pending_payment(payment_id, user_id, plan):
-    conn = db_connect()
-    conn.execute("INSERT INTO pending_payments (payment_id, user_id, plan, created_at) VALUES (?,?,?,?)",
-                 (payment_id, user_id, plan, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+def save_pending_payment(payment_id,user_id,plan,amount=None):
+    plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now().isoformat(); amount=amount or info["amount"]
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO pending_payments(payment_id,user_id,plan,created_at) VALUES (?,?,?,?)",(payment_id,user_id,plan,now))
+        conn.execute("INSERT OR IGNORE INTO payments(payment_id,user_id,platform,product_type,product_code,amount,currency,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",(payment_id,user_id,"telegram","subscription",plan,amount,"RUB","pending",now,now))
 
 def get_pending_payments():
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("SELECT payment_id, user_id, plan FROM pending_payments")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    conn=db_connect(); rows=conn.execute("SELECT payment_id,user_id,plan FROM pending_payments").fetchall(); conn.close(); return rows
+
+def mark_payment_canceled(payment_id):
+    now=datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute("UPDATE payments SET status='canceled',raw_status='canceled',updated_at=? WHERE payment_id=?",(now,payment_id)); conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+
+def process_subscription_payment(payment_id,user_id,plan):
+    plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now(); conn=db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM processed_payments WHERE payment_id=?",(payment_id,)).fetchone(): conn.rollback(); return False,None
+        row=conn.execute("SELECT sub_end FROM subscriptions WHERE user_id=?",(user_id,)).fetchone(); start=now
+        if row and row[0]:
+            try:
+                old=datetime.fromisoformat(row[0]); start=old if old>now else now
+            except ValueError: pass
+        end=start+timedelta(days=info["days"]); now_iso=now.isoformat()
+        conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)",(user_id,plan,end.isoformat()))
+        conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)",(payment_id,user_id,plan,now_iso))
+        conn.execute("INSERT INTO subscription_history(payment_id,user_id,plan,started_at,ends_at,created_at) VALUES (?,?,?,?,?,?)",(payment_id,user_id,plan,start.isoformat(),end.isoformat(),now_iso))
+        conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?",(now_iso,payment_id))
+        conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",(payment_id,now_iso,"telegram",user_id,plan,info["amount"],"RUB",end.isoformat()))
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,)); conn.commit(); return True,end
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
 
 def delete_pending_payment(payment_id):
+    with db_connect() as conn: conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+
+
+
+def get_user_plan(user_id):
+    plan, end = get_subscription(user_id)
+    return plan if end else "free"
+
+
+def plan_rank(plan):
+    return {"free": 0, "start": 1, "pro": 2, "pro_year": 2}.get(plan, 0)
+
+
+def has_plan_access(user_id, minimum="start"):
+    return plan_rank(get_user_plan(user_id)) >= plan_rank(minimum)
+
+
+def get_credit(user_id, product_code):
     conn = db_connect()
-    conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
-    conn.commit()
+    row = conn.execute(
+        "SELECT credits FROM user_credits WHERE user_id=? AND product_code=?",
+        (user_id, product_code),
+    ).fetchone()
     conn.close()
+    return int(row[0]) if row else 0
+
+
+def add_credit(user_id, product_code, amount=1, conn=None):
+    own_conn = conn is None
+    conn = conn or db_connect()
+    now = datetime.now().isoformat()
+    conn.execute(
+        "INSERT INTO user_credits(user_id,product_code,credits,updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id,product_code) DO UPDATE SET credits=credits+excluded.credits, updated_at=excluded.updated_at",
+        (user_id, product_code, amount, now),
+    )
+    if own_conn:
+        conn.commit(); conn.close()
+
+
+def consume_credit(user_id, product_code):
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT credits FROM user_credits WHERE user_id=? AND product_code=?",
+            (user_id, product_code),
+        ).fetchone()
+        if not row or int(row[0]) <= 0:
+            conn.rollback(); return False
+        conn.execute(
+            "UPDATE user_credits SET credits=credits-1,updated_at=? WHERE user_id=? AND product_code=?",
+            (datetime.now().isoformat(), user_id, product_code),
+        )
+        conn.commit(); return True
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def can_use_product(user_id, product_code):
+    return get_user_plan(user_id) in PRO_PLANS or get_credit(user_id, product_code) > 0
+
+
+def question_limit_for(user_id):
+    return {"free": 5, "start": 30, "pro": None, "pro_year": None}.get(get_user_plan(user_id), 5)
+
+
+def psycho_limit_for(user_id):
+    return {"free": 15, "start": 50, "pro": None, "pro_year": None}.get(get_user_plan(user_id), 15)
+
+
+def get_usage_counter(user_id, counter):
+    conn = db_connect()
+    row = conn.execute("SELECT value FROM usage_counters WHERE user_id=? AND counter=?", (user_id, counter)).fetchone()
+    conn.close()
+    return int(row[0]) if row else 0
+
+
+def increment_usage_counter(user_id, counter):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO usage_counters(user_id,counter,value,updated_at) VALUES (?,?,1,?) "
+            "ON CONFLICT(user_id,counter) DO UPDATE SET value=value+1,updated_at=excluded.updated_at",
+            (user_id, counter, datetime.now().isoformat()),
+        )
+
+
+def can_show_marketing_offer(user_id, offer_type, global_hours=24, repeat_hours=72):
+    if get_user_plan(user_id) in PRO_PLANS:
+        return False
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT offer_type,last_shown_at FROM marketing_offers WHERE user_id=? ORDER BY last_shown_at DESC",
+            (user_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    now = datetime.now()
+    for old_type, shown_at in rows:
+        try:
+            shown = datetime.fromisoformat(shown_at)
+        except (TypeError, ValueError):
+            continue
+        hours = (now - shown).total_seconds() / 3600
+        if hours < global_hours:
+            return False
+        if old_type == offer_type and hours < repeat_hours:
+            return False
+    return True
+
+
+def record_marketing_offer(user_id, offer_type):
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO marketing_offers(user_id,offer_type,last_shown_at,show_count) VALUES (?,?,?,1) "
+            "ON CONFLICT(user_id,offer_type) DO UPDATE SET last_shown_at=excluded.last_shown_at,show_count=show_count+1",
+            (user_id, offer_type, now),
+        )
+
+
+def offer_markup(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def maybe_send_marketing_offer(chat_id, user_id, offer_type, text, rows):
+    if not can_show_marketing_offer(user_id, offer_type):
+        return False
+    try:
+        await bot.send_message(chat_id, text, reply_markup=offer_markup(rows), disable_web_page_preview=True)
+        record_marketing_offer(user_id, offer_type)
+        return True
+    except Exception as exc:
+        logging.error(f"Не удалось показать мягкий оффер {offer_type}: {exc}")
+        return False
+
+
+def callback_feature(payload):
+    if payload in {"doctor_prep"}: return ("product", "doctor_report")
+    if payload in {"weekly_report"}: return ("product", "weekly_report")
+    if payload in {"sleep_analyze"}: return ("product", "sleep_report")
+    if payload in {"feed_stats"}: return ("product", "feeding_report")
+    if payload in {"photo_menu", "photo_analysis", "photo_uzi", "photo_med_preg", "photo_skin", "photo_stool", "photo_food", "photo_package"}: return ("product", "photo_analysis")
+    if payload in {"tracker_growth", "growth_add", "growth_analyze", "tracker_symptoms", "symptom_add", "symptom_analyze", "tracker_feeding", "feed_left", "feed_right", "feed_bottle", "tracker_sleep", "sleep_start", "sleep_end", "tracker_vaccines", "vaccines_create", "vaccines_done", "vaccines_info", "benefits_menu", "ben_birth", "ben_15", "ben_3", "ben_matcap", "ben_decree", "ben_multi", "ben_personal"} or payload.startswith("vac_"):
+        return ("plan", "start")
+    return None
 
 def save_vaccination(user_id, vaccine, scheduled_date):
     conn = db_connect()
@@ -585,6 +784,7 @@ def clean_text(text):
 
 async def send_long_message(chat_id, text, reply_markup=None):
     """Разбиваем длинные сообщения на части по 4000 символов"""
+    text = clean_text(str(text))
     max_len = 4000
     if len(text) <= max_len:
         await bot.send_message(chat_id, text, reply_markup=reply_markup)
@@ -595,6 +795,22 @@ async def send_long_message(chat_id, text, reply_markup=None):
             await bot.send_message(chat_id, part, reply_markup=reply_markup)
         else:
             await bot.send_message(chat_id, part)
+
+_LAST_OWNER_ERRORS = {}
+
+async def notify_owner_tg(text, key="general", cooldown_minutes=30):
+    target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+    if not target:
+        return
+    now = datetime.now()
+    last = _LAST_OWNER_ERRORS.get(key)
+    if last and (now - last).total_seconds() < cooldown_minutes * 60:
+        return
+    _LAST_OWNER_ERRORS[key] = now
+    try:
+        await bot.send_message(target, clean_text(text)[:3900])
+    except Exception as exc:
+        logging.error(f"Owner notify TG error: {exc}")
 
 async def ask_gpt(system_prompt, user_prompt):
     try:
@@ -608,8 +824,9 @@ async def ask_gpt(system_prompt, user_prompt):
         )
         return clean_text(response.choices[0].message.content)
     except Exception as e:
-        return f"Ошибка GPT: {e}"
-
+        logging.exception("Ошибка AI Telegram")
+        await notify_owner_tg(f"⚠️ Ошибка AI Telegram\n\n{type(e).__name__}: {e}", key=f"ai_{type(e).__name__}")
+        return "Сейчас помощник временно не смог подготовить ответ. Попробуй ещё раз немного позже. Если вопрос срочный и касается здоровья, обратись к врачу или звони 112."
 
 
 def channel_visual_subject(theme="", title="", body="", format_name=""):
@@ -709,16 +926,17 @@ PREMIUM_CALLBACKS = {
 class PremiumCallbackMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: TelegramObject, data: dict):
         if isinstance(event, CallbackQuery):
-            payload = event.data or ""
-            protected = payload in PREMIUM_CALLBACKS or payload.startswith("vac_done_")
-            if protected and not is_premium(event.from_user.id):
-                await event.answer("Функция доступна в Премиум", show_alert=True)
-                await event.message.answer(
-                    "🔒 Эта функция доступна в Премиум 💎\n\n"
-                    "Трекеры, фото, психолог, отчёты и безлимитные вопросы — 299 руб/месяц.",
-                    reply_markup=kb_premium()
-                )
-                return
+            rule = callback_feature(event.data or "")
+            if rule:
+                kind, value = rule
+                allowed = has_plan_access(event.from_user.id, value) if kind == "plan" else can_use_product(event.from_user.id, value)
+                if not allowed:
+                    await event.answer("Нужен тариф или разовая покупка", show_alert=True)
+                    await event.message.answer(
+                        "🔒 Эта функция не входит в ваш текущий доступ.\n\nВыберите подписку или купите один конкретный результат.",
+                        reply_markup=kb_premium(),
+                    )
+                    return
         return await handler(event, data)
 
 
@@ -804,56 +1022,142 @@ def kb_start():
 
 def kb_pregnant_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Сегодня для меня", callback_data="today_brief")],
-        [InlineKeyboardButton(text="📊 Мой срок", callback_data="preg_week")],
-        [InlineKeyboardButton(text="👶 Развитие малыша", callback_data="preg_baby")],
-        [InlineKeyboardButton(text="✅ Чек-лист", callback_data="preg_checklist")],
-        [InlineKeyboardButton(text="🛍 Список покупок", callback_data="preg_shop")],
-        [InlineKeyboardButton(text="📸 Анализ фото 🔒", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="✨ Сегодня", callback_data="today_brief")],
+        [InlineKeyboardButton(text="🤰 Беременность", callback_data="cat_pregnancy"),
+         InlineKeyboardButton(text="🩺 Здоровье", callback_data="cat_preg_health")],
+        [InlineKeyboardButton(text="🧠 Для мамы", callback_data="cat_mom_preg"),
+         InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
-        [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
-        [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
     ])
+
 
 def kb_mama_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✨ Сегодня для нас", callback_data="today_brief")],
-        [InlineKeyboardButton(text="🚨 Ребёнку плохо", callback_data="emergency"),
-         InlineKeyboardButton(text="🩺 К врачу 🔒", callback_data="doctor_prep")],
-        [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
-        [InlineKeyboardButton(text="💉 Прививки 🔒", callback_data="check_premium_vaccines"),
-         InlineKeyboardButton(text="📏 Рост и вес 🔒", callback_data="check_premium_growth")],
-        [InlineKeyboardButton(text="🌡 Трекер симптомов 🔒", callback_data="check_premium_symptoms"),
-         InlineKeyboardButton(text="🤱 Трекер кормлений 🔒", callback_data="check_premium_feeding")],
-        [InlineKeyboardButton(text="🌙 Дневник сна 🔒", callback_data="check_premium_sleep"),
-         InlineKeyboardButton(text="💰 Пособия и выплаты 🔒", callback_data="check_premium_benefits")],
-        [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
-        [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
-        [InlineKeyboardButton(text="📊 Развитие по возрасту", callback_data="mama_dev"),
-         InlineKeyboardButton(text="🎮 Игры и занятия", callback_data="mama_games")],
-        [InlineKeyboardButton(text="📚 Что читать", callback_data="mama_books"),
-         InlineKeyboardButton(text="🌡 Здоровье", callback_data="mama_health")],
-        [InlineKeyboardButton(text="💊 Лекарства", callback_data="mama_meds"),
-         InlineKeyboardButton(text="🦷 Зубки", callback_data="mama_teeth")],
+        [InlineKeyboardButton(text="✨ Сегодня", callback_data="today_brief")],
+        [InlineKeyboardButton(text="👶 Ребёнок", callback_data="cat_child"),
+         InlineKeyboardButton(text="🩺 Здоровье", callback_data="cat_health")],
+        [InlineKeyboardButton(text="📊 Трекеры", callback_data="cat_trackers"),
+         InlineKeyboardButton(text="🧠 Для мамы", callback_data="cat_mom")],
+        [InlineKeyboardButton(text="👨‍👩‍👧 Семья", callback_data="cat_family"),
+         InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
+        [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
+        [InlineKeyboardButton(text="💎 Тарифы", callback_data="pay_premium"),
+         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
+        [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
+    ])
+
+
+def kb_cat_child():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Развитие по возрасту", callback_data="mama_dev")],
+        [InlineKeyboardButton(text="🎮 Игры и занятия", callback_data="mama_games"),
+         InlineKeyboardButton(text="📚 Что читать", callback_data="mama_books")],
         [InlineKeyboardButton(text="🍼 Питание и прикорм", callback_data="mama_food"),
          InlineKeyboardButton(text="🥣 Рецепты", callback_data="mama_recipes")],
         [InlineKeyboardButton(text="🌙 Режим дня", callback_data="mama_routine"),
          InlineKeyboardButton(text="😴 Проблемы со сном", callback_data="mama_sleep")],
-        [InlineKeyboardButton(text="😢 Истерики и капризы", callback_data="mama_tantrums"),
-         InlineKeyboardButton(text="👨‍👩‍👧 Отношения в семье", callback_data="mama_family")],
-        [InlineKeyboardButton(text="🧠 Эмоции мамы", callback_data="mama_emotions"),
-         InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
-        [InlineKeyboardButton(text="🧠 Мамин психолог 🔒", callback_data="psycho_start"),
-         InlineKeyboardButton(text="📸 Анализ фото 🔒", callback_data="photo_menu")],
-        [InlineKeyboardButton(text="📈 Отчёт за 7 дней 🔒", callback_data="weekly_report")],
-        [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
-         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
-        [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")],
-        [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
+        [InlineKeyboardButton(text="😢 Истерики и капризы", callback_data="mama_tantrums")],
+        [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
+
+
+def kb_cat_health():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚨 Ребёнку плохо", callback_data="emergency")],
+        [InlineKeyboardButton(text="🩺 Подготовиться к врачу", callback_data="doctor_prep")],
+        [InlineKeyboardButton(text="🌡 Здоровье", callback_data="mama_health"),
+         InlineKeyboardButton(text="💊 Лекарства", callback_data="mama_meds")],
+        [InlineKeyboardButton(text="🦷 Зубки", callback_data="mama_teeth"),
+         InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="💉 Прививки", callback_data="check_premium_vaccines")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
+    ])
+
+
+def kb_cat_trackers():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📏 Рост и вес", callback_data="check_premium_growth"),
+         InlineKeyboardButton(text="🌡 Симптомы", callback_data="check_premium_symptoms")],
+        [InlineKeyboardButton(text="🤱 Кормления", callback_data="check_premium_feeding"),
+         InlineKeyboardButton(text="🌙 Сон", callback_data="check_premium_sleep")],
+        [InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
+        [InlineKeyboardButton(text="📈 Отчёт за 7 дней", callback_data="weekly_report")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
+    ])
+
+
+def kb_cat_mom():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧠 Мамин психолог", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="🧠 Эмоции мамы", callback_data="mama_emotions")],
+        [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
+        [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
+        [InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="check_premium_benefits")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
+    ])
+
+
+def kb_cat_family():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👨‍👩‍👧 Отношения в семье", callback_data="mama_family")],
+        [InlineKeyboardButton(text="📈 Недельный семейный отчёт", callback_data="weekly_report")],
+        [InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
+    ])
+
+
+def kb_cat_pregnancy():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Мой срок", callback_data="preg_week")],
+        [InlineKeyboardButton(text="👶 Развитие малыша", callback_data="preg_baby")],
+        [InlineKeyboardButton(text="✅ Чек-лист", callback_data="preg_checklist")],
+        [InlineKeyboardButton(text="🛍 Список покупок", callback_data="preg_shop")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
+    ])
+
+
+def kb_cat_preg_health():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📸 Анализы и УЗИ", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
+    ])
+
+
+def kb_cat_mom_preg():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧠 Мамин психолог", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="🧠 Эмоциональная поддержка", callback_data="mama_emotions")],
+        [InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="check_premium_benefits")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
+    ])
+
+
+def profile_text(user_id):
+    user = get_user(user_id)
+    if not user:
+        return "📓 Профиль пока не заполнен."
+    mode, date_value, name = user
+    plan, sub_end = get_subscription(user_id)
+    labels = {"free": "Бесплатный", "start": "Старт", "pro": "Про", "pro_year": "Про на год", "": "Бесплатный"}
+    plan_name = labels.get(plan or "", plan or "Бесплатный")
+    end_text = ""
+    if sub_end:
+        try:
+            end_text = f"\nДоступ до: {datetime.fromisoformat(sub_end).strftime('%d.%m.%Y')}"
+        except Exception:
+            pass
+    if mode == "pregnant":
+        weeks, days = calc_pregnancy_weeks(date_value)
+        stage = f"Беременность: {weeks} недель {days} дней" if weeks is not None else "Беременность"
+    else:
+        months, _ = calc_child_age(date_value)
+        stage = f"Ребёнку: {age_label(months)}" if months is not None else "Профиль малыша"
+    return f"📓 Мой профиль\n\nИмя: {name or 'не указано'}\n{stage}\nТариф: {plan_name}{end_text}\nИспользовано AI-вопросов: {get_request_count(user_id)}"
 
 def kb_firstdays():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -899,8 +1203,12 @@ def kb_back_to_menu(mode):
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    parts = (message.text or "").split(maxsplit=1)
+    start_payload = parts[1].strip() if len(parts) > 1 else ""
     user = get_user(message.from_user.id)
     name = message.from_user.first_name or "мамочка"
+    if start_payload.startswith("channel_"):
+        await state.update_data(channel_start_payload=start_payload)
 
     if user:
         mode, date_value, saved_name = user
@@ -914,6 +1222,8 @@ async def cmd_start(message: Message, state: FSMContext):
                     
                     reply_markup=kb_pregnant_menu()
                 )
+                if start_payload.startswith("channel_"):
+                    await open_channel_destination_tg(message, start_payload)
             else:
                 await show_start(message, name, state)
         else:
@@ -926,6 +1236,8 @@ async def cmd_start(message: Message, state: FSMContext):
                     
                     reply_markup=kb_mama_menu()
                 )
+                if start_payload.startswith("channel_"):
+                    await open_channel_destination_tg(message, start_payload)
             else:
                 await show_start(message, name, state)
     else:
@@ -980,6 +1292,8 @@ async def enter_pdr(message: Message, state: FSMContext):
         return
 
     name = message.from_user.first_name or ""
+    pending_data = await state.get_data()
+    pending_payload = pending_data.get("channel_start_payload", "")
     save_user(message.from_user.id, "pregnant", text, name)
     await state.clear()
     await message.answer(
@@ -989,6 +1303,8 @@ async def enter_pdr(message: Message, state: FSMContext):
         
         reply_markup=kb_pregnant_menu()
     )
+    if pending_payload:
+        await open_channel_destination_tg(message, pending_payload)
 
 # ─── ВВОД ДАТЫ РОЖДЕНИЯ ──────────────────────────────────────
 @dp.message(RegStates.entering_birthdate, F.text)
@@ -1003,6 +1319,8 @@ async def enter_birthdate(message: Message, state: FSMContext):
         return
 
     name = message.from_user.first_name or ""
+    pending_data = await state.get_data()
+    pending_payload = pending_data.get("channel_start_payload", "")
     save_user(message.from_user.id, "mama", text, name)
     await state.clear()
     await message.answer(
@@ -1012,6 +1330,8 @@ async def enter_birthdate(message: Message, state: FSMContext):
         
         reply_markup=kb_mama_menu()
     )
+    if pending_payload:
+        await open_channel_destination_tg(message, pending_payload)
 
 # ─── ГЛАВНОЕ МЕНЮ ────────────────────────────────────────────
 @dp.callback_query(F.data == "main_menu")
@@ -1071,6 +1391,44 @@ async def change_data(call: CallbackQuery, state: FSMContext):
         "Выбери свой статус 👇",
         reply_markup=kb_start()
     )
+
+@dp.callback_query(F.data == "cat_child")
+async def cat_child(call: CallbackQuery):
+    await call.message.edit_text("👶 Ребёнок\n\nРазвитие, питание, сон и занятия по возрасту.", reply_markup=kb_cat_child())
+
+@dp.callback_query(F.data == "cat_health")
+async def cat_health(call: CallbackQuery):
+    await call.message.edit_text("🩺 Здоровье\n\nБезопасная навигация, подготовка к врачу и медицинские наблюдения.", reply_markup=kb_cat_health())
+
+@dp.callback_query(F.data == "cat_trackers")
+async def cat_trackers(call: CallbackQuery):
+    await call.message.edit_text("📊 Трекеры\n\nСохраняйте данные — со временем они превращаются в полезную динамику.", reply_markup=kb_cat_trackers())
+
+@dp.callback_query(F.data == "cat_mom")
+async def cat_mom(call: CallbackQuery):
+    await call.message.edit_text("🧠 Для мамы\n\nПоддержка, восстановление и забота о вашем состоянии.", reply_markup=kb_cat_mom())
+
+@dp.callback_query(F.data == "cat_family")
+async def cat_family(call: CallbackQuery):
+    await call.message.edit_text("👨‍👩‍👧 Семья\n\nОтношения, общая история и недельные итоги.", reply_markup=kb_cat_family())
+
+@dp.callback_query(F.data == "cat_pregnancy")
+async def cat_pregnancy(call: CallbackQuery):
+    await call.message.edit_text("🤰 Беременность\n\nСрок, развитие малыша и подготовка к родам.", reply_markup=kb_cat_pregnancy())
+
+@dp.callback_query(F.data == "cat_preg_health")
+async def cat_preg_health(call: CallbackQuery):
+    await call.message.edit_text("🩺 Здоровье при беременности\n\nАнализы, УЗИ и персональные вопросы.", reply_markup=kb_cat_preg_health())
+
+@dp.callback_query(F.data == "cat_mom_preg")
+async def cat_mom_preg(call: CallbackQuery):
+    await call.message.edit_text("🧠 Для мамы\n\nЭмоциональная и практическая поддержка во время беременности.", reply_markup=kb_cat_mom_preg())
+
+@dp.callback_query(F.data == "profile")
+async def profile_view(call: CallbackQuery):
+    user = get_user(call.from_user.id)
+    mode = user[0] if user else "mama"
+    await call.message.edit_text(profile_text(call.from_user.id), reply_markup=kb_back_to_menu(mode))
 
 # ─── ПЕРСОНАЛЬНЫЕ И КОММЕРЧЕСКИЕ ФУНКЦИИ ─────────────────
 @dp.callback_query(F.data == "today_brief")
@@ -1173,6 +1531,8 @@ async def doctor_prep(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
     ])
     await send_long_message(call.message.chat.id, "🩺 Сводка к педиатру\n\n" + answer, reply_markup=kb)
+    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+        consume_credit(call.from_user.id, "doctor_report")
 
 @dp.callback_query(F.data == "weekly_report")
 async def weekly_report(call: CallbackQuery):
@@ -1196,6 +1556,8 @@ async def weekly_report(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
     ])
     await send_long_message(call.message.chat.id, "📈 Ваши 7 дней\n\n" + answer, reply_markup=kb)
+    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+        consume_credit(call.from_user.id, "weekly_report")
 
 # ─── БЕРЕМЕННОСТЬ — РАЗДЕЛЫ ──────────────────────────────────
 EXPERT_PREG = (
@@ -1645,12 +2007,13 @@ async def handle_question(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     await state.clear()
     # Проверка лимита запросов
-    if not is_premium(message.from_user.id):
+    limit = question_limit_for(message.from_user.id)
+    if limit is not None:
         count = get_request_count(message.from_user.id)
-        if count >= FREE_REQUESTS:
+        if count >= limit:
             await message.answer(
                 "❓ Ты использовала все бесплатные вопросы\n\n"
-                "Для продолжения оформи Премиум — 299 руб/месяц\n"
+                "Для продолжения оформи Про — 390 руб/месяц\n"
                 "Безлимитные вопросы + все функции бота!",
                 reply_markup=kb_premium()
             )
@@ -1678,6 +2041,27 @@ async def handle_question(message: Message, state: FSMContext):
     )
     kb = kb_mama_menu() if user and user[0] == "mama" else kb_pregnant_menu() if user else kb_start()
     await message.answer(answer, reply_markup=kb)
+    plan = get_user_plan(message.from_user.id)
+    used = get_request_count(message.from_user.id)
+    if plan == "free" and used >= 3:
+        await maybe_send_marketing_offer(
+            message.chat.id,
+            message.from_user.id,
+            "questions_upgrade",
+            f"🤍 У тебя осталось {max(0, 5-used)} бесплатных вопроса. В Старт доступно 30 вопросов, а в Про — полный доступ ко всем функциям.",
+            [
+                [InlineKeyboardButton(text="🌱 Старт — 190 ₽", callback_data="pay_plan_start")],
+                [InlineKeyboardButton(text="💎 Посмотреть все тарифы", callback_data="pay_premium")],
+            ],
+        )
+    elif plan == "start" and used >= 24:
+        await maybe_send_marketing_offer(
+            message.chat.id,
+            message.from_user.id,
+            "questions_pro",
+            f"✨ В тарифе Старт использовано {used} из 30 вопросов. Про снимает лимит и открывает фото, отчёты и сводку к врачу.",
+            [[InlineKeyboardButton(text="💎 Перейти на Про — 390 ₽", callback_data="pay_plan_pro")]],
+        )
 
 # ─── ПЕРВЫЕ ДНИ С МАЛЫШОМ ───────────────────────────────────
 @dp.callback_query(F.data == "mama_firstdays")
@@ -2027,8 +2411,8 @@ def kb_photo_pregnant_menu():
 
 @dp.callback_query(F.data == "photo_menu")
 async def photo_menu(call: CallbackQuery):
-    if not is_premium(call.from_user.id):
-        await call.message.answer("🔒 Анализ фото доступен в Премиум 💎", reply_markup=kb_premium())
+    if not can_use_product(call.from_user.id, "photo_analysis"):
+        await call.message.answer("🔒 Анализ фото доступен в Про или разово за 99 ₽", reply_markup=kb_premium())
         return
     user = get_user(call.from_user.id)
     if user and user[0] == "pregnant":
@@ -2123,6 +2507,7 @@ async def handle_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     photo_type = data.get("photo_type", "skin")
     user = get_user(message.from_user.id)
+    use_photo_credit = get_user_plan(message.from_user.id) not in PRO_PLANS
     await state.clear()
 
     # Получаем фото
@@ -2267,6 +2652,8 @@ async def handle_photo(message: Message, state: FSMContext):
         user = get_user(message.from_user.id)
         kb = kb_photo_pregnant_menu() if user and user[0] == "pregnant" else kb_photo_menu()
         await message.answer(answer, reply_markup=kb)
+        if use_photo_credit:
+            consume_credit(message.from_user.id, "photo_analysis")
 
     except Exception as e:
         logging.error(f"Ошибка анализа фото: {e}")
@@ -2283,8 +2670,8 @@ async def photo_wrong_input(message: Message, state: FSMContext):
 async def handle_voice(message: Message, state: FSMContext):
     # Сбрасываем любое текущее состояние — голос имеет приоритет
     await state.clear()
-    if not is_premium(message.from_user.id):
-        await message.answer("🔒 Голосовые сообщения доступны в Премиум 💎", reply_markup=kb_premium())
+    if get_user_plan(message.from_user.id) not in PRO_PLANS:
+        await message.answer("🔒 Голосовые сообщения доступны в Про 💎", reply_markup=kb_premium())
         return
     user = get_user(message.from_user.id)
     await message.answer("🎤 Слушаю тебя...")
@@ -2341,184 +2728,290 @@ async def handle_voice(message: Message, state: FSMContext):
 # ─── ПРЕМИУМ ПРОВЕРКИ ────────────────────────────────────────
 @dp.callback_query(F.data == "check_premium_vaccines")
 async def check_prem_vaccines(call: CallbackQuery):
-    if is_premium(call.from_user.id):
+    if has_plan_access(call.from_user.id, "start"):
         await tracker_vaccines(call)
     else:
         await call.message.answer("🔒 Прививочный календарь доступен в Премиум 💎", reply_markup=kb_premium())
 
 @dp.callback_query(F.data == "check_premium_growth")
 async def check_prem_growth(call: CallbackQuery):
-    if is_premium(call.from_user.id):
+    if has_plan_access(call.from_user.id, "start"):
         await tracker_growth(call)
     else:
         await call.message.answer("🔒 Трекер роста и веса доступен в Премиум 💎", reply_markup=kb_premium())
 
 @dp.callback_query(F.data == "check_premium_symptoms")
 async def check_prem_symptoms(call: CallbackQuery):
-    if is_premium(call.from_user.id):
+    if has_plan_access(call.from_user.id, "start"):
         await tracker_symptoms(call)
     else:
         await call.message.answer("🔒 Трекер симптомов доступен в Премиум 💎", reply_markup=kb_premium())
 
 @dp.callback_query(F.data == "check_premium_feeding")
 async def check_prem_feeding(call: CallbackQuery):
-    if is_premium(call.from_user.id):
+    if has_plan_access(call.from_user.id, "start"):
         await tracker_feeding(call)
     else:
         await call.message.answer("🔒 Трекер кормлений доступен в Премиум 💎", reply_markup=kb_premium())
 
 @dp.callback_query(F.data == "check_premium_sleep")
 async def check_prem_sleep(call: CallbackQuery):
-    if is_premium(call.from_user.id):
+    if has_plan_access(call.from_user.id, "start"):
         await tracker_sleep(call)
     else:
         await call.message.answer("🔒 Дневник сна доступен в Премиум 💎", reply_markup=kb_premium())
 
 @dp.callback_query(F.data == "check_premium_benefits")
 async def check_prem_benefits(call: CallbackQuery):
-    if is_premium(call.from_user.id):
+    if has_plan_access(call.from_user.id, "start"):
         await benefits_menu(call)
     else:
         await call.message.answer("🔒 Пособия и выплаты доступны в Премиум 💎", reply_markup=kb_premium())
 
 # ─── GOOGLE SHEETS ───────────────────────────────────────────
-def sheets_add_user(user_id, username, first_name, mode=""):
+TG_USER_SHEET = "МамаБот Telegram"
+SALES_SHEET = "Продажи МамаБот"
+TG_USER_HEADERS = [
+    "Последнее посещение", "user_id", "Имя", "Username",
+    "AI-запросы", "Тариф", "Дата окончания", "Отзыв"
+]
+SALES_HEADERS = [
+    "Дата", "Платформа", "user_id", "Имя", "Username", "Продукт",
+    "Тип", "Сумма", "Payment ID", "Дата окончания", "Статус"
+]
+
+def _sheets_book():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+    return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+
+def _worksheet(book, title, headers):
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        try:
-            sheet = spreadsheet.worksheet("МамаБот")
-        except:
-            sheet = spreadsheet.add_worksheet(title="МамаБот", rows=1000, cols=10)
-            sheet.append_row(["ID", "Username", "Имя", "Режим", "Подписка", "Дата регистрации"])
-        data = sheet.get_all_values()
-        ids = [row[0] for row in data[1:]]
-        if str(user_id) not in ids:
-            sheet.append_row([str(user_id), username or "", first_name or "", mode, "Бесплатно", datetime.now().strftime("%d.%m.%Y %H:%M")])
+        ws = book.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = book.add_worksheet(title=title, rows=2000, cols=max(12, len(headers)))
+        ws.append_row(headers)
+    current = ws.row_values(1)
+    if current != headers:
+        ws.update('A1', [headers])
+    return ws
+
+def sheets_upsert_user(user_id, username="", first_name="", mode="", source="", last_action="", review=None):
+    """Компактная карточка: одна строка на пользователя."""
+    try:
+        book = _sheets_book()
+        ws = _worksheet(book, TG_USER_SHEET, TG_USER_HEADERS)
+        uid = str(user_id)
+        ids = ws.col_values(2)
+        row_num = next((i + 1 for i, value in enumerate(ids) if value == uid), None)
+        user = get_user(user_id)
+        plan, sub_end = get_subscription(user_id)
+        plan_name = PLAN_CATALOG.get(plan, {}).get("name", "Бесплатный") if plan else "Бесплатный"
+        end_text = ""
+        if sub_end:
+            try:
+                end_text = datetime.fromisoformat(str(sub_end)).strftime("%d.%m.%Y")
+            except Exception:
+                end_text = str(sub_end)
+        values = [
+            datetime.now().strftime("%d.%m.%Y %H:%M"),
+            uid,
+            first_name or (user[2] if user else ""),
+            username or "",
+            get_request_count(user_id),
+            plan_name,
+            end_text,
+            review if review is not None else "",
+        ]
+        if row_num:
+            old = ws.row_values(row_num)
+            while len(old) < len(TG_USER_HEADERS):
+                old.append("")
+            if not first_name:
+                values[2] = old[2]
+            if not username:
+                values[3] = old[3]
+            if review is None:
+                values[7] = old[7]
+            ws.update(f"A{row_num}:H{row_num}", [values])
+        else:
+            ws.append_row(values)
     except Exception as e:
-        logging.error(f"Sheets add_user error: {e}")
+        logging.error(f"Sheets upsert user TG: {e}")
+
+def sheets_add_user(user_id, username, first_name, mode=""):
+    sheets_upsert_user(user_id, username, first_name, mode=mode, last_action="Регистрация/вход")
 
 def sheets_add_review(user_id, username, text, sheet_name="Отзывы МамаБот"):
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        try:
-            sheet = spreadsheet.worksheet(sheet_name)
-        except:
-            sheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=5)
-            sheet.append_row(["ID", "Username", "Текст", "Дата"])
-        sheet.append_row([str(user_id), username or "", text, datetime.now().strftime("%d.%m.%Y %H:%M")])
+        user = get_user(user_id)
+        sheets_upsert_user(user_id, username or "", user[2] if user else "", review=text, last_action="Отзыв")
     except Exception as e:
-        logging.error(f"Sheets add_review error: {e}")
+        logging.error(f"Sheets review TG: {e}")
 
 def sheets_update_subscription(user_id, plan):
+    user = get_user(user_id)
+    sheets_upsert_user(user_id, "", user[2] if user else "", last_action=f"Оплата {plan}")
+
+def sheets_log_sale(user_id, product_code, amount, payment_id, ends_at="", status="Успешно"):
     try:
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet("МамаБот")
-        data = sheet.get_all_values()
-        for i, row in enumerate(data):
-            if row[0] == str(user_id):
-                sheet.update_cell(i + 1, 5, "💎 Премиум")
-                break
+        book = _sheets_book()
+        ws = _worksheet(book, SALES_SHEET, SALES_HEADERS)
+        user = get_user(user_id)
+        name = user[2] if user else ""
+        info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS.get(product_code, {})
+        product_type = "Подписка" if product_code in PLAN_CATALOG else "Разовая покупка"
+        end_text = ""
+        if ends_at:
+            try: end_text = datetime.fromisoformat(str(ends_at)).strftime("%d.%m.%Y")
+            except Exception: end_text = str(ends_at)
+        ws.append_row([
+            datetime.now().strftime("%d.%m.%Y %H:%M"), "Telegram", str(user_id), name, "",
+            info.get("name", product_code), product_type, str(amount), payment_id, end_text, status
+        ])
     except Exception as e:
-        logging.error(f"Sheets update_sub error: {e}")
+        logging.error(f"Sheets sale TG: {e}")
 
 # ─── ЮКАССА ПЛАТЕЖИ ──────────────────────────────────────────
 def kb_premium():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 Оформить Премиум — 299 руб/мес", callback_data="pay_premium")],
-        [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🌱 Старт — 190 ₽ / 30 дней", callback_data="pay_plan_start")],
+        [InlineKeyboardButton(text="💎 Про — 390 ₽ / 30 дней", callback_data="pay_plan_pro")],
+        [InlineKeyboardButton(text="⭐ Про на год — 2 990 ₽", callback_data="pay_plan_pro_year")],
+        [InlineKeyboardButton(text="🩺 Сводка врачу — 149 ₽", callback_data="buy_doctor_report")],
+        [InlineKeyboardButton(text="🌙 Разбор сна — 199 ₽", callback_data="buy_sleep_report")],
+        [InlineKeyboardButton(text="🤱 Разбор кормлений — 149 ₽", callback_data="buy_feeding_report")],
+        [InlineKeyboardButton(text="📈 Недельный отчёт — 199 ₽", callback_data="buy_weekly_report")],
+        [InlineKeyboardButton(text="📸 Анализ фото — 99 ₽", callback_data="buy_photo_analysis")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")],
     ])
 
-async def create_payment_mama(user_id):
-    payment = Payment.create({
-        "amount": {"value": "299.00", "currency": "RUB"},
+
+async def create_payment_mama(user_id, product_code):
+    if product_code in PLAN_CATALOG:
+        info = PLAN_CATALOG[product_code]; product_type = "subscription"; days = info["days"]
+    else:
+        info = ONE_TIME_PRODUCTS[product_code]; product_type = "one_time"; days = 0
+    return Payment.create({
+        "amount": {"value": info["amount"], "currency": "RUB"},
         "confirmation": {"type": "redirect", "return_url": "https://t.me/MaminPomoshnikAI_bot"},
         "capture": True,
-        "description": f"Мамин помощник Премиум 30 дней — {user_id}",
-        "receipt": {
-            "customer": {"email": "client@maminpomoshnik.ru"},
-            "items": [{
-                "description": "Мамин помощник Премиум 30 дней",
-                "quantity": "1.00",
-                "amount": {"value": "299.00", "currency": "RUB"},
-                "vat_code": 1,
-                "payment_subject": "service",
-                "payment_mode": "full_payment"
-            }]
-        },
-        "metadata": {"user_id": user_id, "plan": "mama_premium"}
+        "description": f"Мамин помощник — {info['name']} — {user_id}",
+        "receipt": {"customer": {"email": "client@maminpomoshnik.ru"}, "items": [{
+            "description": f"Мамин помощник — {info['name']}", "quantity": "1.00",
+            "amount": {"value": info["amount"], "currency": "RUB"}, "vat_code": 1,
+            "payment_subject": "service", "payment_mode": "full_payment"
+        }]},
+        "metadata": {"user_id": user_id, "product_code": product_code, "product_type": product_type, "days": days}
     }, str(uuid.uuid4()))
-    return payment
+
+
+def save_commercial_payment(payment_id, user_id, product_code):
+    info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
+    product_type = "subscription" if product_code in PLAN_CATALOG else "one_time"
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO pending_payments(payment_id,user_id,plan,created_at) VALUES (?,?,?,?)", (payment_id,user_id,product_code,now))
+        conn.execute("INSERT OR IGNORE INTO payments(payment_id,user_id,platform,product_type,product_code,amount,currency,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (payment_id,user_id,"telegram",product_type,product_code,info["amount"],"RUB","pending",now,now))
+
+
+def process_commercial_payment(payment_id, user_id, product_code):
+    now = datetime.now(); now_iso = now.isoformat(); conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM processed_payments WHERE payment_id=?", (payment_id,)).fetchone():
+            conn.rollback(); return False, None, None
+        if product_code in PLAN_CATALOG:
+            info = PLAN_CATALOG[product_code]
+            row = conn.execute("SELECT sub_end FROM subscriptions WHERE user_id=?", (user_id,)).fetchone(); start = now
+            if row and row[0]:
+                try:
+                    old = datetime.fromisoformat(row[0]); start = old if old > now else now
+                except ValueError: pass
+            end = start + timedelta(days=info["days"])
+            conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)", (user_id,product_code,end.isoformat()))
+            conn.execute("INSERT INTO subscription_history(payment_id,user_id,plan,started_at,ends_at,created_at) VALUES (?,?,?,?,?,?)", (payment_id,user_id,product_code,start.isoformat(),end.isoformat(),now_iso))
+            ends_at = end.isoformat(); result_end = end; product_type = "subscription"
+        else:
+            info = ONE_TIME_PRODUCTS[product_code]
+            add_credit(user_id, info["credit"], 1, conn=conn)
+            conn.execute("INSERT INTO purchases(payment_id,user_id,product_code,amount,created_at) VALUES (?,?,?,?,?)", (payment_id,user_id,product_code,info["amount"],now_iso))
+            ends_at = ""; result_end = None; product_type = "one_time"
+        conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)", (payment_id,user_id,product_code,now_iso))
+        conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?", (now_iso,payment_id))
+        conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)", (payment_id,now_iso,"telegram",user_id,product_code,info["amount"],"RUB",ends_at))
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+        conn.commit(); return True, result_end, product_type
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
 
 async def check_payments_loop():
     while True:
         await asyncio.sleep(15)
         try:
-            pending = get_pending_payments()
-            for payment_id, user_id, plan in pending:
+            for payment_id,user_id,product_code in get_pending_payments():
                 try:
                     payment = Payment.find_one(payment_id)
                     if payment.status == "succeeded":
-                        set_subscription(user_id, plan, 30)
-                        delete_pending_payment(payment_id)
-                        import asyncio as aio
-                        aio.create_task(aio.to_thread(sheets_update_subscription, user_id, plan))
-                        await bot.send_message(
-                            user_id,
-                            "✅ Оплата прошла успешно!\n\n"
-                            "💎 Премиум активирован на 30 дней.\n\n"
-                            "Все функции разблокированы — пользуйся на здоровье! 🤍",
-                            reply_markup=kb_mama_menu() if get_user(user_id) and get_user(user_id)[0] == "mama" else kb_pregnant_menu()
-                        )
-                    elif payment.status == "canceled":
-                        delete_pending_payment(payment_id)
-                except Exception as e:
-                    logging.error(f"Ошибка проверки платежа {payment_id}: {e}")
-        except Exception as e:
-            logging.error(f"Ошибка check_payments_loop: {e}")
+                        processed,end,product_type = process_commercial_payment(payment_id,user_id,product_code)
+                        if not processed: continue
+                        info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
+                        if product_type == "subscription":
+                            asyncio.create_task(asyncio.to_thread(sheets_update_subscription,user_id,product_code))
+                            text = f"✅ Оплата прошла!\n\nТариф {info['name']} активирован до {end.strftime('%d.%m.%Y')}."
+                            sale_end = end.isoformat()
+                        else:
+                            text = f"✅ Оплата прошла!\n\nПокупка «{info['name']}» начислена. Кредит спишется только после успешного результата."
+                            sale_end = ""
+                        asyncio.create_task(asyncio.to_thread(sheets_log_sale,user_id,product_code,info['amount'],payment_id,sale_end,"Успешно"))
+                        await bot.send_message(user_id, text, reply_markup=kb_mama_menu() if get_user(user_id) and get_user(user_id)[0]=="mama" else kb_pregnant_menu())
+                        owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+                        try: await bot.send_message(owner_target, f"💳 Новая продажа Telegram\n\nUser ID: {user_id}\nПродукт: {info['name']}\nСумма: {info['amount']} ₽\nPayment ID: {payment_id}")
+                        except Exception as exc: logging.error(f"Ошибка уведомления владельца TG: {exc}")
+                    elif payment.status == "canceled": mark_payment_canceled(payment_id)
+                except Exception as exc: logging.error(f"Ошибка проверки платежа {payment_id}: {exc}")
+        except Exception as exc: logging.error(f"Ошибка check_payments_loop: {exc}")
+
+
+async def start_product_payment(call, product_code):
+    try:
+        info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
+        payment = await create_payment_mama(call.from_user.id, product_code)
+        save_commercial_payment(payment.id, call.from_user.id, product_code)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {int(float(info['amount']))} ₽", url=payment.confirmation.confirmation_url)],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="show_premium")],
+        ])
+        await call.message.answer(f"{info['name']}\n\nСтоимость: {int(float(info['amount']))} ₽.\nПосле оплаты доступ активируется автоматически.", reply_markup=kb)
+    except Exception as exc:
+        logging.error(f"Ошибка создания платежа TG: {exc}")
+        await call.message.answer("Не удалось создать платёж. Попробуй позже или напиши в поддержку.", reply_markup=kb_premium())
+
 
 @dp.callback_query(F.data == "pay_premium")
-async def pay_premium(call: CallbackQuery):
-    user_id = call.from_user.id
-    try:
-        payment = await create_payment_mama(user_id)
-        save_pending_payment(payment.id, user_id, "mama_premium")
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Оплатить 299 руб", url=payment.confirmation.confirmation_url)],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="main_menu")]
-        ])
-        await call.message.answer(
-            "💎 Премиум подписка — 299 руб/месяц\n\n"
-            "Что открывается:\n"
-            "🎤 Голосовые сообщения\n"
-            "📸 Анализ фото\n"
-            "📏 Все трекеры\n"
-            "💉 Прививочный календарь\n"
-            "💰 Подбор пособий\n"
-            "❓ Безлимитные вопросы GPT\n\n"
-            "После оплаты всё активируется автоматически!",
-            reply_markup=kb
-        )
-    except Exception as e:
-        logging.error(f"Ошибка создания платежа: {e}")
-        await call.message.answer("Ошибка при создании платежа. Напиши в поддержку " + SUPPORT_USERNAME)
-
 @dp.callback_query(F.data == "show_premium")
 async def show_premium(call: CallbackQuery):
     await call.message.answer(
-        "🔒 Эта функция доступна в Премиум\n\n"
-        "💎 Премиум — 299 руб/месяц\n"
-        "Открывает все функции бота без ограничений.",
-        reply_markup=kb_premium()
+        "💎 Доступ к Маминому помощнику\n\n"
+        "Старт — основные трекеры, 30 AI-вопросов и 50 сообщений поддержки.\n"
+        "Про — все функции, отчёты и анализ фото.\n"
+        "Про на год — полный доступ на 365 дней.\n\n"
+        "Можно купить и один конкретный результат без подписки.",
+        reply_markup=kb_premium(),
     )
+
+
+@dp.callback_query(F.data.startswith("pay_plan_"))
+async def pay_plan_selected(call: CallbackQuery):
+    await start_product_payment(call, call.data.replace("pay_plan_", "", 1))
+
+
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy_product_selected(call: CallbackQuery):
+    await start_product_payment(call, call.data.replace("buy_", "", 1))
 
 # ─── ПОДДЕРЖКА И ОТЗЫВЫ ──────────────────────────────────────
 class SupportStates(StatesGroup):
@@ -2550,22 +3043,32 @@ async def support_write(call: CallbackQuery, state: FSMContext):
 
 @dp.message(SupportStates.waiting_support, F.text)
 async def support_send(message: Message, state: FSMContext):
+    current_state = await state.get_state()
     await state.clear()
     username = message.from_user.username or "нет"
     name = message.from_user.first_name or ""
+    plan, sub_end = get_subscription(message.from_user.id)
+    plan_name = PLAN_CATALOG.get(plan, {}).get("name", "Бесплатный") if plan else "Бесплатный"
+    end_text = ""
+    if sub_end:
+        try: end_text = datetime.fromisoformat(str(sub_end)).strftime("%d.%m.%Y")
+        except Exception: end_text = str(sub_end)
+    target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+    support_text = (
+        f"🆘 Поддержка Мамин Помощник Telegram\n\n"
+        f"Платформа: Telegram\nИмя: {name or 'без имени'}\nUsername: @{username}\n"
+        f"ID: {message.from_user.id}\nТариф: {plan_name}\nОкончание: {end_text or '—'}\n"
+        f"Текущий шаг: {current_state or 'не определён'}\n\nСообщение:\n{message.text}"
+    )
     try:
-        await bot.send_message(
-            SUPPORT_USERNAME,
-            f"🆘 Обращение в поддержку\n"
-            f"Бот: {BOT_NAME}\n"
-            f"От: {name} (@{username}, ID: {message.from_user.id})\n\n"
-            f"{message.text}"
-        )
+        await bot.send_message(target, support_text[:3900])
     except Exception as e:
         logging.error(f"Support send error: {e}")
+    import threading
+    threading.Thread(target=sheets_upsert_user, args=(message.from_user.id, message.from_user.username or "", name), kwargs={"last_action":"Обращение в поддержку"}).start()
     await message.answer(
         "✅ Сообщение отправлено! Мы ответим в ближайшее время.\n\n"
-        f"Или напиши напрямую: {SUPPORT_USERNAME}",
+        f"Резервный контакт: {SUPPORT_USERNAME}",
         reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start()
     )
 
@@ -2597,10 +3100,61 @@ async def suggestion_send(message: Message, state: FSMContext):
     )).start()
     await message.answer("💡 Спасибо за идею! Мы обязательно рассмотрим её 🤍", reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start())
 
+@dp.message(Command("myid"))
+async def myid_tg(message: Message):
+    await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
+@dp.message(Command("reset_me"))
+async def reset_me_tg(message: Message, state: FSMContext):
+    """Полностью сбрасывает личные тестовые данные пользователя, но сохраняет журнал продаж."""
+    user_id = message.from_user.id
+    await state.clear()
+    tables = [
+        "diary", "growth", "symptoms", "feeding", "sleep_log", "psycho_history",
+        "vaccinations", "subscriptions", "requests_count", "user_credits",
+        "marketing_offers", "pending_payments", "users"
+    ]
+    conn = db_connect()
+    try:
+        for table in tables:
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+    finally:
+        conn.close()
+    await message.answer("✅ Ваш профиль и тестовые данные сброшены. Нажмите /start для новой регистрации.")
+
+
+@dp.message(Command("publish_channel_intro"))
+async def publish_channel_intro_tg(message: Message):
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("Команда доступна только владельцу. Сначала задайте TG_OWNER_ID.")
+        return
+    text = (
+        "🤍 Я МАМА — пространство без чувства вины и гонки за идеальностью.\n\n"
+        "Здесь каждый день выходят три коротких и полезных материала: поддержка утром, "
+        "практический разбор днём и спокойный вечерний разговор.\n\n"
+        "А в «Мамином помощнике» можно получить персональный план, вести сон и кормления, "
+        "собрать сводку к врачу и задать вопрос с учётом возраста ребёнка или срока беременности.\n\n"
+        "Медицинские материалы носят информационный характер и не заменяют врача. "
+        "Резервный контакт поддержки указан в описании канала."
+    )
+    await bot.send_message(
+        CHANNEL_ID, text,
+        reply_markup=channel_post_markup("✨ Открыть Маминого помощника", "channel_today"),
+        disable_web_page_preview=True,
+    )
+    await message.answer("✅ Приветственный пост опубликован. Закрепи его в канале вручную.")
+
+
 # ─── АВТОПОСТИНГ В КАНАЛ ─────────────────────────────────────
 
 CHANNEL_ID = "@yamama_ai"
-BOT_PUBLIC_URL = "https://t.me/MaminPomoshnikAI_bot?start=channel"
+BOT_BASE_URL = "https://t.me/MaminPomoshnikAI_bot"
+BOT_PUBLIC_URL = f"{BOT_BASE_URL}?start=channel"
 
 # Три сильных публикации в день вместо пяти однотипных статей.
 # Форматы вращаются по дням и сохраняются в БД, чтобы канал не повторялся.
@@ -2701,6 +3255,40 @@ def is_channel_post_too_similar(title, text, threshold=0.66):
     return False
 
 
+def fallback_channel_post(slot, theme, format_name):
+    """Резервный пост, чтобы канал не останавливался при недоступности AI."""
+    theme_low = (theme or "").lower()
+    if "сон" in theme_low:
+        subject = "сон ребёнка"
+        action = "Сегодня отметьте время засыпания и пробуждения — даже две записи уже полезнее, чем попытка вспомнить всё вечером."
+    elif any(x in theme_low for x in ("питан", "корм", "гв", "прикорм")):
+        subject = "питание и кормления"
+        action = "Сегодня запишите хотя бы одно кормление: время, продолжительность и то, как чувствовал себя малыш."
+    elif any(x in theme_low for x in ("здоров", "симптом", "врач")):
+        subject = "здоровье ребёнка"
+        action = "Если что-то настораживает, запишите время появления симптома, температуру и изменения в поведении — это поможет врачу увидеть картину точнее."
+    elif any(x in theme_low for x in ("эмоц", "устал", "тревог", "мам")):
+        subject = "состояние мамы"
+        action = "Выберите сегодня одно действие, которое действительно уменьшит нагрузку: попросить о помощи, перенести необязательное дело или отдохнуть 15 минут без чувства вины."
+    elif any(x in theme_low for x in ("развит", "игр", "речь")):
+        subject = "развитие ребёнка"
+        action = "Проведите десять спокойных минут без телефона: поговорите, назовите предметы вокруг или повторите любимую игру малыша."
+    else:
+        subject = "спокойный день с ребёнком"
+        action = "Не пытайтесь сделать всё идеально. Выберите одно важное дело для ребёнка и одно маленькое действие для себя."
+
+    if slot in ("08:00", "morning"):
+        return "Один спокойный шаг на сегодня", f"Сегодняшняя тема — {subject}.\n\n{action}\n\nМаленькие повторяющиеся действия дают больше пользы, чем редкие идеальные дни."
+    if slot in ("13:00", "afternoon"):
+        return "Практичный ориентир для мамы", f"Когда дел много, полезно опираться не на память, а на простую систему.\n\nТема дня: {subject}.\n\n1. Зафиксируйте один важный факт.\n2. Отметьте, что изменилось по сравнению со вчера.\n3. Запишите один вопрос, который стоит обсудить со специалистом или близкими.\n4. Не делайте выводов по одному эпизоду — смотрите на динамику.\n\n{action}"
+    return "День не обязан быть идеальным", f"Сегодня мы говорили про {subject}.\n\nВечером достаточно ответить себе на два вопроса: что сегодня получилось и что можно упростить завтра.\n\nЗабота о семье начинается не с идеальности, а с устойчивости."
+
+
+def is_ai_error_text(text):
+    value = (text or "").lower()
+    return value.startswith("ошибка gpt:") or "invalid_api_key" in value or "incorrect api key" in value or "error code: 401" in value
+
+
 def parse_generated_channel_post(raw):
     raw = clean_text(raw or "").strip()
     title = "Полезное для мамы"
@@ -2737,14 +3325,27 @@ async def generate_channel_post(slot, theme, format_name, instruction, max_chars
         "Недавние публикации, которые нельзя повторять:\n"
         f"{history}"
     )
+    last_error = None
     for _ in range(3):
         raw = await ask_gpt(CHANNEL_SYSTEM_PROMPT, prompt)
+        if is_ai_error_text(raw):
+            last_error = raw
+            break
         title, body = parse_generated_channel_post(raw)
         body = body[:max_chars].rstrip()
         if body and not is_channel_post_too_similar(title, body):
             return title, body
         prompt += "\nПредыдущий вариант оказался слишком похож на старые публикации. Выбери совершенно другой угол и примеры."
-    return None, None
+
+    title, body = fallback_channel_post(slot, theme, format_name)
+    logging.error("Канал TG: AI-текст недоступен, опубликован резервный пост. Причина: %s", last_error or "нет уникального ответа")
+    try:
+        owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+        if owner_target:
+            await bot.send_message(owner_target, f"⚠️ Канал TG: AI-генерация недоступна. Для слота {slot} будет опубликован резервный пост.")
+    except Exception as exc:
+        logging.error("Канал TG: не удалось уведомить владельца об ошибке AI: %s", exc)
+    return title, body[:max_chars].rstrip()
 
 
 def channel_funnel_for_post(theme="", title="", body="", format_name=""):
@@ -2784,10 +3385,57 @@ def channel_funnel_for_post(theme="", title="", body="", format_name=""):
     )
 
 
-def channel_post_markup(button_text="✨ Открыть помощника на сегодня"):
+
+def channel_start_payload(theme="", title="", body="", format_name=""):
+    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+    rules = [
+        (("сон", "недосып", "засып", "пробуж"), "channel_sleep"),
+        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "channel_feeding"),
+        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "channel_doctor"),
+        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "channel_psycho"),
+        (("беремен", "род", "восстанов", "срок"), "channel_pregnancy"),
+        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "channel_child"),
+        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"), "channel_family"),
+    ]
+    for keywords, payload in rules:
+        if any(word in text for word in keywords):
+            return payload
+    return "channel_today"
+
+
+def channel_deeplink(payload="channel"):
+    return f"{BOT_BASE_URL}?start={payload}"
+
+
+def channel_post_markup(button_text="✨ Открыть помощника на сегодня", payload="channel_today"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=button_text, url=BOT_PUBLIC_URL)]
+        [InlineKeyboardButton(text=button_text, url=channel_deeplink(payload))]
     ])
+
+
+async def open_channel_destination_tg(message: Message, payload: str):
+    user = get_user(message.from_user.id)
+    if not user:
+        return False
+    mode = user[0]
+    mapping = {
+        "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
+        "channel_sleep": ("🌙 Сон и режим", "tracker_sleep" if mode == "mama" else "today_brief"),
+        "channel_feeding": ("🤱 Кормления и питание", "tracker_feeding" if mode == "mama" else "preg_baby"),
+        "channel_doctor": ("🩺 Подготовка к врачу", "doctor_prep" if mode == "mama" else "photo_menu"),
+        "channel_psycho": ("🧠 Поддержка для мамы", "psycho_start"),
+        "channel_pregnancy": ("🤰 Беременность", "preg_week" if mode == "pregnant" else "mama_recovery"),
+        "channel_child": ("👶 Развитие ребёнка", "mama_dev" if mode == "mama" else "preg_baby"),
+        "channel_family": ("👨‍👩‍👧 Семья", "mama_family" if mode == "mama" else "psycho_start"),
+    }
+    title, callback_data = mapping.get(payload, mapping["channel_today"])
+    await message.answer(
+        f"🤍 Ты пришла из канала «Я МАМА».\n\n{title} — открою нужный раздел сразу.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=title, callback_data=callback_data)
+        ]])
+    )
+    return True
 
 
 async def publish_channel_post(slot, theme, format_name, title, body, with_button=True, button_text=None):
@@ -2797,17 +3445,22 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
 
     bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
     final_button_text = button_text or thematic_button
-    final_text = f"{title}\n\n{body}\n\n{bridge_text}\n{BOT_PUBLIC_URL}".strip()
+    start_payload = channel_start_payload(theme, title, body, format_name)
+    final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
 
     try:
+        if slot == "afternoon":
+            image_bytes = await generate_channel_image_bytes(slot, theme, title, body, format_name)
+            if image_bytes:
+                await send_channel_image_tg(slot, title, image_bytes)
         await bot.send_message(
             CHANNEL_ID,
             final_text,
-            reply_markup=channel_post_markup(final_button_text),
+            reply_markup=channel_post_markup(final_button_text, start_payload),
             disable_web_page_preview=True,
         )
         save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={final_button_text}")
+        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={final_button_text} | start={start_payload}")
     except Exception as e:
         logging.error(f"Канал: ошибка публикации {slot}: {e}")
 
@@ -2870,11 +3523,11 @@ async def post_evening_poll():
             options=options,
             is_anonymous=True,
             allows_multiple_answers=False,
-            reply_markup=channel_post_markup(poll_button),
+            reply_markup=channel_post_markup(poll_button, channel_start_payload(WEEKLY_EDITORIAL[today.weekday()], question, " ".join(options), "опрос")),
         )
         await bot.send_message(
             CHANNEL_ID,
-            f"{poll_bridge}\n{BOT_PUBLIC_URL}",
+            poll_bridge,
             disable_web_page_preview=True,
         )
         save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(options))
@@ -3076,6 +3729,17 @@ async def save_symptom_entry(message: Message, state: FSMContext):
     save_symptom(message.from_user.id, message.text)
     await state.clear()
     await message.answer("✅ Симптом записан!", reply_markup=kb_mama_menu())
+    if len(get_symptoms(message.from_user.id)) >= 2:
+        await maybe_send_marketing_offer(
+            message.chat.id,
+            message.from_user.id,
+            "doctor_report_ready",
+            "🩺 Уже накопилось несколько наблюдений. Их можно собрать в аккуратную сводку для педиатра, чтобы на приёме ничего не забыть.",
+            [
+                [InlineKeyboardButton(text="🩺 Сводка к врачу — 149 ₽", callback_data="buy_doctor_report")],
+                [InlineKeyboardButton(text="💎 Все отчёты в Про", callback_data="pay_plan_pro")],
+            ],
+        )
 
 @dp.callback_query(F.data == "symptom_analyze")
 async def symptom_analyze(call: CallbackQuery):
@@ -3143,6 +3807,17 @@ async def feed_duration(message: Message, state: FSMContext):
         save_feeding(message.from_user.id, data["side"], dur)
         await state.clear()
         await message.answer(f"✅ Кормление записано! {data['side']}, {dur} мин 🤱", reply_markup=kb_mama_menu())
+        if len(get_feedings(message.from_user.id)) >= 4:
+            await maybe_send_marketing_offer(
+                message.chat.id,
+                message.from_user.id,
+                "feeding_report_ready",
+                "🍼 Уже есть данные для первичного разбора кормлений: интервалы, частота и продолжительность.",
+                [
+                    [InlineKeyboardButton(text="📊 Разбор кормлений — 149 ₽", callback_data="buy_feeding_report")],
+                    [InlineKeyboardButton(text="💎 Все разборы в Про", callback_data="pay_plan_pro")],
+                ],
+            )
     except:
         await message.answer("❌ Введи число минут, например: 15")
 
@@ -3167,6 +3842,8 @@ async def feed_stats(call: CallbackQuery):
         f"Дай практические рекомендации."
     )
     await call.message.answer(answer, reply_markup=kb_mama_menu())
+    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+        consume_credit(call.from_user.id, "feeding_report")
 
 # ─── ДНЕВНИК СНА ─────────────────────────────────────────────
 @dp.callback_query(F.data == "tracker_sleep")
@@ -3192,11 +3869,33 @@ async def tracker_sleep(call: CallbackQuery):
 async def sleep_start(call: CallbackQuery):
     save_sleep(call.from_user.id, "уснул")
     await call.message.answer("😴 Записала — малыш уснул!", reply_markup=kb_mama_menu())
+    if len(get_sleep_log(call.from_user.id)) >= 4:
+        await maybe_send_marketing_offer(
+            call.message.chat.id,
+            call.from_user.id,
+            "sleep_report_ready",
+            "🌙 Картина сна уже начинает формироваться. Разбор покажет интервалы, возможные закономерности и что стоит отслеживать дальше.",
+            [
+                [InlineKeyboardButton(text="🌙 Разбор сна — 199 ₽", callback_data="buy_sleep_report")],
+                [InlineKeyboardButton(text="💎 Все отчёты в Про", callback_data="pay_plan_pro")],
+            ],
+        )
 
 @dp.callback_query(F.data == "sleep_end")
 async def sleep_end(call: CallbackQuery):
     save_sleep(call.from_user.id, "проснулся")
     await call.message.answer("🌅 Записала — малыш проснулся!", reply_markup=kb_mama_menu())
+    if len(get_sleep_log(call.from_user.id)) >= 4:
+        await maybe_send_marketing_offer(
+            call.message.chat.id,
+            call.from_user.id,
+            "sleep_report_ready",
+            "🌙 Картина сна уже начинает формироваться. Разбор покажет интервалы, возможные закономерности и что стоит отслеживать дальше.",
+            [
+                [InlineKeyboardButton(text="🌙 Разбор сна — 199 ₽", callback_data="buy_sleep_report")],
+                [InlineKeyboardButton(text="💎 Все отчёты в Про", callback_data="pay_plan_pro")],
+            ],
+        )
 
 @dp.callback_query(F.data == "sleep_analyze")
 async def sleep_analyze(call: CallbackQuery):
@@ -3219,6 +3918,8 @@ async def sleep_analyze(call: CallbackQuery):
         f"есть ли проблемы и как их решить. Конкретные рекомендации."
     )
     await call.message.answer(answer, reply_markup=kb_mama_menu())
+    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+        consume_credit(call.from_user.id, "sleep_report")
 
 # ─── ПРИВИВОЧНЫЙ КАЛЕНДАРЬ ───────────────────────────────────
 @dp.callback_query(F.data == "tracker_vaccines")
@@ -3463,20 +4164,10 @@ PSYCHO_SYSTEM = """Ты Мамин психолог — тёплый, внима
 
 @dp.callback_query(F.data == "check_premium_psycho")
 async def check_prem_psycho(call: CallbackQuery, state: FSMContext):
-    if not is_premium(call.from_user.id):
-        await call.message.answer(
-            "🧠 Мамин психолог доступен в Премиум 💎\n\n"
-            "Персональный психолог который помнит тебя и твою историю.",
-            reply_markup=kb_premium()
-        )
-        return
     await psycho_start(call, state)
 
 @dp.callback_query(F.data == "psycho_start")
 async def psycho_start(call: CallbackQuery, state: FSMContext):
-    if not is_premium(call.from_user.id):
-        await call.message.answer("🔒 Мамин психолог доступен в Премиум 💎", reply_markup=kb_premium())
-        return
     await state.set_state(PsychoStates.in_session)
     history = get_psycho_history(call.from_user.id)
     user = get_user(call.from_user.id)
@@ -3518,6 +4209,11 @@ async def psycho_exit(call: CallbackQuery, state: FSMContext):
 
 @dp.message(PsychoStates.in_session, F.text)
 async def psycho_message(message: Message, state: FSMContext):
+    psycho_limit = psycho_limit_for(message.from_user.id)
+    if psycho_limit is not None and get_usage_counter(message.from_user.id, "psycho_messages") >= psycho_limit:
+        await message.answer(f"Лимит поддерживающего диалога ({psycho_limit} сообщений) исчерпан. Выбери Старт или Про.", reply_markup=kb_premium())
+        return
+    increment_usage_counter(message.from_user.id, "psycho_messages")
     user_id = message.from_user.id
     user = get_user(user_id)
 
@@ -3562,6 +4258,17 @@ async def psycho_message(message: Message, state: FSMContext):
              InlineKeyboardButton(text="🏠 Выйти", callback_data="psycho_exit")]
         ])
         await message.answer(answer, reply_markup=kb)
+        used = get_usage_counter(user_id, "psycho_messages")
+        plan = get_user_plan(user_id)
+        threshold = 10 if plan == "free" else 40 if plan == "start" else None
+        if threshold is not None and used >= threshold:
+            await maybe_send_marketing_offer(
+                message.chat.id,
+                user_id,
+                "psycho_upgrade",
+                "🤍 Я сохраняю контекст нашего разговора. В Про можно продолжать без лимита и не объяснять ситуацию заново.",
+                [[InlineKeyboardButton(text="💎 Про — 390 ₽ / 30 дней", callback_data="pay_plan_pro")]],
+            )
 
     except Exception as e:
         logging.error(f"Psycho GPT error: {e}")
@@ -3570,8 +4277,8 @@ async def psycho_message(message: Message, state: FSMContext):
 @dp.message(PsychoStates.in_session, F.voice)
 async def psycho_voice(message: Message, state: FSMContext):
     """Голос тоже работает в сеансе психолога"""
-    if not is_premium(message.from_user.id):
-        await message.answer("🔒 Голосовые сообщения доступны в Премиум 💎", reply_markup=kb_premium())
+    if get_user_plan(message.from_user.id) not in PRO_PLANS:
+        await message.answer("🔒 Голосовые сообщения доступны в Про 💎", reply_markup=kb_premium())
         return
     try:
         file = await bot.get_file(message.voice.file_id)
@@ -3640,6 +4347,8 @@ async def check_vaccine_reminders():
 # ─── ЗАПУСК ──────────────────────────────────────────────────
 async def main():
     init_db()
+    if not OWNER_ID:
+        logging.warning("TG_OWNER_ID не задан: коммерческие уведомления будут отправляться в CHANNEL_REPORT_CHAT_ID")
     dp.callback_query.outer_middleware(PremiumCallbackMiddleware())
     # Напоминания о прививках — каждый день в 9:00
     scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0, id="vaccine_reminders", replace_existing=True, coalesce=True, max_instances=1)
