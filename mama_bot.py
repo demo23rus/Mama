@@ -61,7 +61,6 @@ scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 logging.basicConfig(level=logging.INFO)
 
 DB_PATH = "/root/mama.db"
-FREE_REQUESTS = 10
 CHANNEL_VISUALS_ENABLED = _env.get("CHANNEL_VISUALS_ENABLED", "1") == "1"
 OPENAI_IMAGE_MODEL = _env.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
 CHANNEL_IMAGE_SIZE = _env.get("CHANNEL_IMAGE_SIZE", "1024x1024")
@@ -81,6 +80,15 @@ ONE_TIME_PRODUCTS = {
 }
 PAID_PLANS = {"start", "pro", "pro_year"}
 PRO_PLANS = {"pro", "pro_year"}
+
+PLAN_LIMITS = {
+    "free": {"questions": 5, "psycho_messages": 15},
+    "start": {"questions": 30, "psycho_messages": 50},
+    "pro": {"questions": None, "psycho_messages": None},
+    "pro_year": {"questions": None, "psycho_messages": None},
+}
+AI_FAILURE_MESSAGE = "Сейчас помощник временно не смог подготовить ответ. Попробуй ещё раз немного позже. Если вопрос срочный и касается здоровья, обратись к врачу или звони 112."
+
 
 
 # ─── FSM СОСТОЯНИЯ ───────────────────────────────────────────
@@ -354,6 +362,19 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_sales_user_date ON sales_events(user_id, created_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_counters (user_id INTEGER NOT NULL, counter TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,counter))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_periods (
+        user_id INTEGER PRIMARY KEY, plan TEXT NOT NULL DEFAULT 'free',
+        period_started_at TEXT NOT NULL, period_ends_at TEXT DEFAULT '',
+        questions_used INTEGER NOT NULL DEFAULT 0,
+        psycho_used INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS analytics_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+        platform TEXT NOT NULL, user_id INTEGER DEFAULT 0,
+        event_name TEXT NOT NULL, source TEXT DEFAULT '', details TEXT DEFAULT ''
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event_date ON analytics_events(event_name, created_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS marketing_offers (
         user_id INTEGER NOT NULL, offer_type TEXT NOT NULL, last_shown_at TEXT NOT NULL,
         show_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(user_id, offer_type)
@@ -505,11 +526,74 @@ def set_subscription(user_id,plan,days):
 def is_premium(user_id):
     plan,end=get_subscription(user_id); return plan in PAID_PLANS and end is not None
 
+def _usage_period_row(user_id, conn=None):
+    own = conn is None
+    conn = conn or db_connect()
+    plan = get_user_plan(user_id)
+    now = datetime.now()
+    row = conn.execute(
+        "SELECT plan,period_started_at,period_ends_at,questions_used,psycho_used FROM usage_periods WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    expired = False
+    if row and row[2]:
+        try:
+            expired = datetime.fromisoformat(row[2]) <= now
+        except ValueError:
+            expired = True
+    if not row or row[0] != plan or (plan == "start" and expired):
+        legacy_q = 0
+        legacy_p = 0
+        if not row and plan == "free":
+            old_q = conn.execute("SELECT count FROM requests_count WHERE user_id=?", (user_id,)).fetchone()
+            legacy_q = int(old_q[0]) if old_q else 0
+            old_p = conn.execute("SELECT value FROM usage_counters WHERE user_id=? AND counter='psycho_messages'", (user_id,)).fetchone()
+            legacy_p = int(old_p[0]) if old_p else 0
+        period_end = (now + timedelta(days=30)).isoformat() if plan == "start" else ""
+        conn.execute(
+            "INSERT OR REPLACE INTO usage_periods(user_id,plan,period_started_at,period_ends_at,questions_used,psycho_used,updated_at) VALUES (?,?,?,?,?,?,?)",
+            (user_id, plan, now.isoformat(), period_end, legacy_q, legacy_p, now.isoformat()),
+        )
+        row = (plan, now.isoformat(), period_end, legacy_q, legacy_p)
+        if own:
+            conn.commit()
+    if own:
+        conn.close()
+    return row
+
+
+def reset_usage_period(user_id, plan, conn=None):
+    own = conn is None
+    conn = conn or db_connect()
+    now = datetime.now()
+    period_end = (now + timedelta(days=30)).isoformat() if plan == "start" else ""
+    conn.execute(
+        "INSERT OR REPLACE INTO usage_periods(user_id,plan,period_started_at,period_ends_at,questions_used,psycho_used,updated_at) VALUES (?,?,?,?,0,0,?)",
+        (user_id, plan, now.isoformat(), period_end, now.isoformat()),
+    )
+    if own:
+        conn.commit(); conn.close()
+
+
 def get_request_count(user_id):
-    conn=db_connect(); row=conn.execute("SELECT count FROM requests_count WHERE user_id=?",(user_id,)).fetchone(); conn.close(); return row[0] if row else 0
+    return int(_usage_period_row(user_id)[3])
+
 
 def increment_request_count(user_id):
-    with db_connect() as conn: conn.execute("INSERT OR REPLACE INTO requests_count(user_id,count) VALUES (?,COALESCE((SELECT count FROM requests_count WHERE user_id=?),0)+1)",(user_id,user_id))
+    _usage_period_row(user_id)
+    with db_connect() as conn:
+        conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(), user_id))
+
+
+def log_analytics_event(event_name, user_id=0, source="", details=""):
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO analytics_events(created_at,platform,user_id,event_name,source,details) VALUES (?,?,?,?,?,?)",
+                (datetime.now().isoformat(), "telegram", int(user_id or 0), event_name, source or "", str(details or "")[:1000]),
+            )
+    except Exception as exc:
+        logging.error(f"Analytics TG error: {exc}")
 
 def save_pending_payment(payment_id,user_id,plan,amount=None):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now().isoformat(); amount=amount or info["amount"]
@@ -539,6 +623,7 @@ def process_subscription_payment(payment_id,user_id,plan):
         conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)",(user_id,plan,end.isoformat()))
         conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)",(payment_id,user_id,plan,now_iso))
         conn.execute("INSERT INTO subscription_history(payment_id,user_id,plan,started_at,ends_at,created_at) VALUES (?,?,?,?,?,?)",(payment_id,user_id,plan,start.isoformat(),end.isoformat(),now_iso))
+        reset_usage_period(user_id, plan, conn=conn)
         conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?",(now_iso,payment_id))
         conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",(payment_id,now_iso,"telegram",user_id,plan,info["amount"],"RUB",end.isoformat()))
         conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,)); conn.commit(); return True,end
@@ -613,14 +698,16 @@ def can_use_product(user_id, product_code):
 
 
 def question_limit_for(user_id):
-    return {"free": 5, "start": 30, "pro": None, "pro_year": None}.get(get_user_plan(user_id), 5)
+    return PLAN_LIMITS[get_user_plan(user_id)]["questions"]
 
 
 def psycho_limit_for(user_id):
-    return {"free": 15, "start": 50, "pro": None, "pro_year": None}.get(get_user_plan(user_id), 15)
+    return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
 
 
 def get_usage_counter(user_id, counter):
+    if counter == "psycho_messages":
+        return int(_usage_period_row(user_id)[4])
     conn = db_connect()
     row = conn.execute("SELECT value FROM usage_counters WHERE user_id=? AND counter=?", (user_id, counter)).fetchone()
     conn.close()
@@ -628,6 +715,11 @@ def get_usage_counter(user_id, counter):
 
 
 def increment_usage_counter(user_id, counter):
+    if counter == "psycho_messages":
+        _usage_period_row(user_id)
+        with db_connect() as conn:
+            conn.execute("UPDATE usage_periods SET psycho_used=psycho_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(), user_id))
+        return
     with db_connect() as conn:
         conn.execute(
             "INSERT INTO usage_counters(user_id,counter,value,updated_at) VALUES (?,?,1,?) "
@@ -836,7 +928,11 @@ async def ask_gpt(system_prompt, user_prompt):
     except Exception as e:
         logging.exception("Ошибка AI Telegram")
         await notify_owner_tg(f"⚠️ Ошибка AI Telegram\n\n{type(e).__name__}: {e}", key=f"ai_{type(e).__name__}")
-        return "Сейчас помощник временно не смог подготовить ответ. Попробуй ещё раз немного позже. Если вопрос срочный и касается здоровья, обратись к врачу или звони 112."
+        return AI_FAILURE_MESSAGE
+
+
+def ai_answer_success(answer):
+    return bool(answer and answer != AI_FAILURE_MESSAGE)
 
 
 def channel_visual_subject(theme="", title="", body="", format_name=""):
@@ -1034,7 +1130,7 @@ def kb_pregnant_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✨ Сегодня", callback_data="today_brief")],
         [InlineKeyboardButton(text="🤰 Беременность", callback_data="cat_pregnancy"),
-         InlineKeyboardButton(text="🩺 Здоровье", callback_data="cat_preg_health")],
+         InlineKeyboardButton(text="❤️ Здоровье", callback_data="cat_preg_health")],
         [InlineKeyboardButton(text="🧠 Для мамы", callback_data="cat_mom_preg"),
          InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
@@ -1048,7 +1144,7 @@ def kb_mama_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✨ Сегодня", callback_data="today_brief")],
         [InlineKeyboardButton(text="👶 Ребёнок", callback_data="cat_child"),
-         InlineKeyboardButton(text="🩺 Здоровье", callback_data="cat_health")],
+         InlineKeyboardButton(text="❤️ Здоровье", callback_data="cat_health")],
         [InlineKeyboardButton(text="📊 Трекеры", callback_data="cat_trackers"),
          InlineKeyboardButton(text="🧠 Для мамы", callback_data="cat_mom")],
         [InlineKeyboardButton(text="👨‍👩‍👧 Семья", callback_data="cat_family"),
@@ -1118,7 +1214,7 @@ def kb_cat_mom():
         [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
         [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
         [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="🧠 Мамин психолог · Про", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог · 15 бесплатно", callback_data="psycho_start")],
         [InlineKeyboardButton(text="💰 Пособия и выплаты · Старт", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
@@ -1161,7 +1257,7 @@ def kb_cat_mom_preg():
         [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="🧠 Эмоциональная поддержка", callback_data="mama_emotions")],
         [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="🧠 Мамин психолог · Про", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог · 15 бесплатно", callback_data="psycho_start")],
         [InlineKeyboardButton(text="💰 Пособия и выплаты · Старт", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
     ])
@@ -1239,6 +1335,7 @@ async def cmd_start(message: Message, state: FSMContext):
     name = message.from_user.first_name or "мамочка"
     if start_payload.startswith("channel_"):
         await state.update_data(channel_start_payload=start_payload)
+        log_analytics_event("channel_click", message.from_user.id, start_payload)
 
     if user:
         mode, date_value, saved_name = user
@@ -1434,7 +1531,7 @@ async def cat_child(call: CallbackQuery):
 
 @dp.callback_query(F.data == "cat_health")
 async def cat_health(call: CallbackQuery):
-    await call.message.edit_text("🩺 Здоровье\n\nБезопасная навигация, подготовка к врачу и медицинские наблюдения.", reply_markup=kb_cat_health())
+    await call.message.edit_text("❤️ Здоровье\n\nБезопасная навигация, подготовка к врачу и медицинские наблюдения.", reply_markup=kb_cat_health())
 
 @dp.callback_query(F.data == "cat_trackers")
 async def cat_trackers(call: CallbackQuery):
@@ -1454,7 +1551,7 @@ async def cat_pregnancy(call: CallbackQuery):
 
 @dp.callback_query(F.data == "cat_preg_health")
 async def cat_preg_health(call: CallbackQuery):
-    await call.message.edit_text("🩺 Здоровье при беременности\n\nАнализы, УЗИ и персональные вопросы.", reply_markup=kb_cat_preg_health())
+    await call.message.edit_text("❤️ Здоровье при беременности\n\nАнализы, УЗИ и персональные вопросы.", reply_markup=kb_cat_preg_health())
 
 @dp.callback_query(F.data == "cat_mom_preg")
 async def cat_mom_preg(call: CallbackQuery):
@@ -1567,7 +1664,7 @@ async def doctor_prep(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
     ])
     await send_long_message(call.message.chat.id, "🩺 Сводка к педиатру\n\n" + answer, reply_markup=kb)
-    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
         consume_credit(call.from_user.id, "doctor_report")
 
 @dp.callback_query(F.data == "weekly_report")
@@ -1592,7 +1689,7 @@ async def weekly_report(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
     ])
     await send_long_message(call.message.chat.id, "📈 Ваши 7 дней\n\n" + answer, reply_markup=kb)
-    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
         consume_credit(call.from_user.id, "weekly_report")
 
 # ─── БЕРЕМЕННОСТЬ — РАЗДЕЛЫ ──────────────────────────────────
@@ -2054,7 +2151,6 @@ async def handle_question(message: Message, state: FSMContext):
                 reply_markup=kb_premium()
             )
             return
-        increment_request_count(message.from_user.id)
 
     if user:
         mode, date_value, name = user
@@ -2077,6 +2173,8 @@ async def handle_question(message: Message, state: FSMContext):
     )
     kb = kb_mama_menu() if user and user[0] == "mama" else kb_pregnant_menu() if user else kb_start()
     await message.answer(answer, reply_markup=kb)
+    if ai_answer_success(answer) and limit is not None:
+        increment_request_count(message.from_user.id)
     plan = get_user_plan(message.from_user.id)
     used = get_request_count(message.from_user.id)
     if plan == "free" and used >= 3:
@@ -2967,6 +3065,7 @@ def process_commercial_payment(payment_id, user_id, product_code):
             end = start + timedelta(days=info["days"])
             conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)", (user_id,product_code,end.isoformat()))
             conn.execute("INSERT INTO subscription_history(payment_id,user_id,plan,started_at,ends_at,created_at) VALUES (?,?,?,?,?,?)", (payment_id,user_id,product_code,start.isoformat(),end.isoformat(),now_iso))
+            reset_usage_period(user_id, product_code, conn=conn)
             ends_at = end.isoformat(); result_end = end; product_type = "subscription"
         else:
             info = ONE_TIME_PRODUCTS[product_code]
@@ -3003,6 +3102,7 @@ async def check_payments_loop():
                             text = f"✅ Оплата прошла!\n\nПокупка «{info['name']}» начислена. Кредит спишется только после успешного результата."
                             sale_end = ""
                         asyncio.create_task(asyncio.to_thread(sheets_log_sale,user_id,product_code,info['amount'],payment_id,sale_end,"Успешно"))
+                        log_analytics_event("payment_succeeded", user_id, product_code, payment_id)
                         await bot.send_message(user_id, text, reply_markup=kb_mama_menu() if get_user(user_id) and get_user(user_id)[0]=="mama" else kb_pregnant_menu())
                         owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
                         try: await bot.send_message(owner_target, f"💳 Новая продажа Telegram\n\nUser ID: {user_id}\nПродукт: {info['name']}\nСумма: {info['amount']} ₽\nPayment ID: {payment_id}")
@@ -3017,6 +3117,7 @@ async def start_product_payment(call, product_code):
         info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
         payment = await create_payment_mama(call.from_user.id, product_code)
         save_commercial_payment(payment.id, call.from_user.id, product_code)
+        log_analytics_event("payment_created", call.from_user.id, product_code, payment.id)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 Оплатить {int(float(info['amount']))} ₽", url=payment.confirmation.confirmation_url)],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="show_premium")],
@@ -3878,7 +3979,7 @@ async def feed_stats(call: CallbackQuery):
         f"Дай практические рекомендации."
     )
     await call.message.answer(answer, reply_markup=kb_mama_menu())
-    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
         consume_credit(call.from_user.id, "feeding_report")
 
 # ─── ДНЕВНИК СНА ─────────────────────────────────────────────
@@ -3954,7 +4055,7 @@ async def sleep_analyze(call: CallbackQuery):
         f"есть ли проблемы и как их решить. Конкретные рекомендации."
     )
     await call.message.answer(answer, reply_markup=kb_mama_menu())
-    if get_user_plan(call.from_user.id) not in PRO_PLANS:
+    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
         consume_credit(call.from_user.id, "sleep_report")
 
 # ─── ПРИВИВОЧНЫЙ КАЛЕНДАРЬ ───────────────────────────────────
@@ -4249,7 +4350,6 @@ async def psycho_message(message: Message, state: FSMContext):
     if psycho_limit is not None and get_usage_counter(message.from_user.id, "psycho_messages") >= psycho_limit:
         await message.answer(f"Лимит поддерживающего диалога ({psycho_limit} сообщений) исчерпан. Выбери Старт или Про.", reply_markup=kb_premium())
         return
-    increment_usage_counter(message.from_user.id, "psycho_messages")
     user_id = message.from_user.id
     user = get_user(user_id)
 
@@ -4294,6 +4394,7 @@ async def psycho_message(message: Message, state: FSMContext):
              InlineKeyboardButton(text="🏠 Выйти", callback_data="psycho_exit")]
         ])
         await message.answer(answer, reply_markup=kb)
+        increment_usage_counter(user_id, "psycho_messages")
         used = get_usage_counter(user_id, "psycho_messages")
         plan = get_user_plan(user_id)
         threshold = 10 if plan == "free" else 40 if plan == "start" else None

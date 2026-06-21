@@ -39,16 +39,16 @@ MAX_API = "https://platform-api.max.ru"
 OPENAI_KEY = _ENV.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
 if not OPENAI_KEY:
     logging.warning("OPENAI_API_KEY не задан: AI-функции будут недоступны")
-OWNER_ID = int(os.getenv("MAX_OWNER_ID", "549639607"))
+OWNER_ID = int(_ENV.get("MAX_OWNER_ID") or os.getenv("MAX_OWNER_ID") or "214128371")
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"
 MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
 MAX_CHANNEL_PUBLIC_URL = os.getenv("MAX_CHANNEL_PUBLIC_URL", "")
 MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
 MAX_BOT_CHANNEL_LINK = MAX_BOT_PUBLIC_URL
-CHANNEL_VISUALS_ENABLED = os.getenv("CHANNEL_VISUALS_ENABLED", "1") == "1"
-OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-CHANNEL_IMAGE_SIZE = os.getenv("CHANNEL_IMAGE_SIZE", "1024x1024")
+CHANNEL_VISUALS_ENABLED = (_ENV.get("CHANNEL_VISUALS_ENABLED") or os.getenv("CHANNEL_VISUALS_ENABLED") or "1") == "1"
+OPENAI_IMAGE_MODEL = _ENV.get("OPENAI_IMAGE_MODEL") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1"
+CHANNEL_IMAGE_SIZE = _ENV.get("CHANNEL_IMAGE_SIZE") or os.getenv("CHANNEL_IMAGE_SIZE") or "1024x1024"
 
 PLAN_CATALOG = {
     "free": {"name": "Бесплатный", "amount": "0.00", "days": 0},
@@ -66,12 +66,16 @@ ONE_TIME_PRODUCTS = {
 PAID_PLANS = {"start", "pro", "pro_year"}
 PRO_PLANS = {"pro", "pro_year"}
 
+PLAN_LIMITS = {
+    "free": {"questions": 5, "psycho_messages": 15},
+    "start": {"questions": 30, "psycho_messages": 50},
+    "pro": {"questions": None, "psycho_messages": None},
+    "pro_year": {"questions": None, "psycho_messages": None},
+}
+AI_FAILURE_MESSAGE = "Сейчас помощник временно не смог подготовить ответ. Попробуй ещё раз немного позже. Если вопрос срочный и касается здоровья, обратись к врачу или звони 112."
+
 
 # Лимиты
-FREE_REQUESTS = 15
-FREE_PSYCHO = 30
-START_PSYCHO = 100
-START_PHOTO = 5
 
 # ЮКасса
 YOOKASSA_SHOP_ID = "1363324"
@@ -197,21 +201,6 @@ def get_symptoms_list(user_id):
     rows = conn.execute("SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (user_id,)).fetchall()
     conn.close()
     return rows
-
-def get_request_count(user_id):
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("SELECT count FROM requests_count WHERE user_id=?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-def increment_request_count(user_id):
-    conn = db_connect()
-    conn.execute("INSERT OR REPLACE INTO requests_count (user_id, count) VALUES (?, COALESCE((SELECT count FROM requests_count WHERE user_id=?),0)+1)",
-                 (user_id, user_id))
-    conn.commit()
-    conn.close()
 
 # ========== ЛОГИ ==========
 logging.basicConfig(level=logging.INFO)
@@ -402,7 +391,7 @@ def mom_category_buttons():
         [{"type":"callback","text":"🤱 Грудное вскармливание","payload":"breastfeeding"}],
         [{"type":"callback","text":"🏥 Восстановление мамы","payload":"recovery"}],
         [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"🧠 Мамин психолог · Про","payload":"psycho"}],
+        [{"type":"callback","text":"🧠 Мамин психолог · 15 бесплатно","payload":"psycho"}],
         [{"type":"callback","text":"💰 Пособия и выплаты · Старт","payload":"benefits"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
@@ -445,7 +434,7 @@ def preg_mom_category_buttons():
         [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"🧠 Эмоциональная поддержка","payload":"emotions"}],
         [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"🧠 Мамин психолог · Про","payload":"psycho"}],
+        [{"type":"callback","text":"🧠 Мамин психолог · 15 бесплатно","payload":"psycho"}],
         [{"type":"callback","text":"💰 Пособия и выплаты · Старт","payload":"benefits"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
@@ -564,6 +553,18 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_sales_user_date ON sales_events(user_id, created_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_counters (user_id INTEGER NOT NULL, counter TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,counter))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS usage_periods (
+        user_id INTEGER PRIMARY KEY, plan TEXT NOT NULL DEFAULT 'free',
+        period_started_at TEXT NOT NULL, period_ends_at TEXT DEFAULT '',
+        questions_used INTEGER NOT NULL DEFAULT 0, psycho_used INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS analytics_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL,
+        platform TEXT NOT NULL, user_id INTEGER DEFAULT 0,
+        event_name TEXT NOT NULL, source TEXT DEFAULT '', details TEXT DEFAULT ''
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_analytics_event_date ON analytics_events(event_name, created_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS marketing_offers (
         user_id INTEGER NOT NULL, offer_type TEXT NOT NULL, last_shown_at TEXT NOT NULL,
         show_count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(user_id, offer_type)
@@ -638,11 +639,47 @@ def set_subscription(user_id,plan,days):
 def is_premium(user_id):
     plan,end=get_subscription(user_id); return plan in PAID_PLANS and end is not None
 
-def get_request_count(user_id):
-    conn=db_connect(); row=conn.execute("SELECT count FROM requests_count WHERE user_id=?",(user_id,)).fetchone(); conn.close(); return row[0] if row else 0
+def _usage_period_row(user_id, conn=None):
+    own = conn is None
+    conn = conn or db_connect()
+    plan = get_user_plan(user_id)
+    now = datetime.now()
+    row = conn.execute("SELECT plan,period_started_at,period_ends_at,questions_used,psycho_used FROM usage_periods WHERE user_id=?", (user_id,)).fetchone()
+    expired = False
+    if row and row[2]:
+        try: expired = datetime.fromisoformat(row[2]) <= now
+        except ValueError: expired = True
+    if not row or row[0] != plan or (plan == "start" and expired):
+        legacy_q = legacy_p = 0
+        if not row and plan == "free":
+            old = conn.execute("SELECT requests,psycho_messages FROM limits WHERE user_id=?", (user_id,)).fetchone()
+            if old: legacy_q, legacy_p = int(old[0] or 0), int(old[1] or 0)
+        period_end = (now + timedelta(days=30)).isoformat() if plan == "start" else ""
+        conn.execute("INSERT OR REPLACE INTO usage_periods(user_id,plan,period_started_at,period_ends_at,questions_used,psycho_used,updated_at) VALUES (?,?,?,?,?,?,?)", (user_id,plan,now.isoformat(),period_end,legacy_q,legacy_p,now.isoformat()))
+        row=(plan,now.isoformat(),period_end,legacy_q,legacy_p)
+        if own: conn.commit()
+    if own: conn.close()
+    return row
 
+
+def reset_usage_period(user_id, plan, conn=None):
+    own = conn is None
+    conn = conn or db_connect()
+    now=datetime.now(); period_end=(now+timedelta(days=30)).isoformat() if plan=="start" else ""
+    conn.execute("INSERT OR REPLACE INTO usage_periods(user_id,plan,period_started_at,period_ends_at,questions_used,psycho_used,updated_at) VALUES (?,?,?,?,0,0,?)", (user_id,plan,now.isoformat(),period_end,now.isoformat()))
+    if own: conn.commit(); conn.close()
+
+
+def get_request_count(user_id): return int(_usage_period_row(user_id)[3])
 def increment_request_count(user_id):
-    with db_connect() as conn: conn.execute("INSERT OR REPLACE INTO requests_count(user_id,count) VALUES (?,COALESCE((SELECT count FROM requests_count WHERE user_id=?),0)+1)",(user_id,user_id))
+    _usage_period_row(user_id)
+    with db_connect() as conn: conn.execute("UPDATE usage_periods SET questions_used=questions_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(),user_id))
+
+
+def log_analytics_event(event_name,user_id=0,source="",details=""):
+    try:
+        with db_connect() as conn: conn.execute("INSERT INTO analytics_events(created_at,platform,user_id,event_name,source,details) VALUES (?,?,?,?,?,?)", (datetime.now().isoformat(),"max",int(user_id or 0),event_name,source or "",str(details or "")[:1000]))
+    except Exception as exc: logging.error("Analytics MAX error: %s", exc)
 
 def save_pending_payment(payment_id,user_id,plan,amount=None):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now().isoformat(); amount=amount or info["amount"]
@@ -672,6 +709,7 @@ def process_subscription_payment(payment_id,user_id,plan):
         conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)",(user_id,plan,end.isoformat()))
         conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)",(payment_id,user_id,plan,now_iso))
         conn.execute("INSERT INTO subscription_history(payment_id,user_id,plan,started_at,ends_at,created_at) VALUES (?,?,?,?,?,?)",(payment_id,user_id,plan,start.isoformat(),end.isoformat(),now_iso))
+        reset_usage_period(user_id, plan, conn=conn)
         conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?",(now_iso,payment_id))
         conn.execute("INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",(payment_id,now_iso,"max",user_id,plan,info["amount"],"RUB",end.isoformat()))
         conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,)); conn.commit(); return True,end
@@ -747,19 +785,18 @@ def can_use_product(user_id, product_code):
     return get_user_plan(user_id) in PRO_PLANS or get_credit(user_id,product_code)>0
 
 
-def question_limit_for(user_id):
-    return {"free":5,"start":30,"pro":None,"pro_year":None}.get(get_user_plan(user_id),5)
-
-
-def psycho_limit_for(user_id):
-    return {"free":15,"start":50,"pro":None,"pro_year":None}.get(get_user_plan(user_id),15)
-
+def question_limit_for(user_id): return PLAN_LIMITS[get_user_plan(user_id)]["questions"]
+def psycho_limit_for(user_id): return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
 
 def get_usage_counter(user_id,counter):
+    if counter == "psycho_messages": return int(_usage_period_row(user_id)[4])
     conn=db_connect(); row=conn.execute("SELECT value FROM usage_counters WHERE user_id=? AND counter=?",(user_id,counter)).fetchone(); conn.close(); return int(row[0]) if row else 0
 
-
 def increment_usage_counter(user_id,counter):
+    if counter == "psycho_messages":
+        _usage_period_row(user_id)
+        with db_connect() as conn: conn.execute("UPDATE usage_periods SET psycho_used=psycho_used+1,updated_at=? WHERE user_id=?", (datetime.now().isoformat(),user_id))
+        return
     with db_connect() as conn:
         conn.execute("INSERT INTO usage_counters(user_id,counter,value,updated_at) VALUES (?,?,1,?) ON CONFLICT(user_id,counter) DO UPDATE SET value=value+1,updated_at=excluded.updated_at",(user_id,counter,datetime.now().isoformat()))
 
@@ -936,7 +973,11 @@ async def generate_text(system, prompt, model="gpt-4o-mini"):
     except Exception as exc:
         logging.exception("Ошибка AI MAX")
         await notify_owner_max(f"⚠️ Ошибка AI MAX\n\n{type(exc).__name__}: {exc}", key=f"ai_{type(exc).__name__}")
-        return "Сейчас помощник временно не смог подготовить ответ. Попробуй ещё раз немного позже. Если вопрос срочный и касается здоровья, обратись к врачу или звони 112."
+        return AI_FAILURE_MESSAGE
+
+def ai_answer_success(answer):
+    return bool(answer and answer != AI_FAILURE_MESSAGE)
+
 
 async def generate_with_history(system, history, new_message):
     messages = [{"role": "system", "content": system}]
@@ -1099,6 +1140,7 @@ def process_commercial_payment(payment_id,user_id,product_code):
             end=start+timedelta(days=info["days"])
             conn.execute("INSERT OR REPLACE INTO subscriptions(user_id,plan,sub_end) VALUES (?,?,?)",(user_id,product_code,end.isoformat()))
             conn.execute("INSERT INTO subscription_history(payment_id,user_id,plan,started_at,ends_at,created_at) VALUES (?,?,?,?,?,?)",(payment_id,user_id,product_code,start.isoformat(),end.isoformat(),now_iso))
+            reset_usage_period(user_id, product_code, conn=conn)
             ends_at=end.isoformat(); result_end=end; product_type="subscription"
         else:
             info=ONE_TIME_PRODUCTS[product_code]
@@ -1293,7 +1335,6 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
             set_step(user_id, "idle")
             await send_message(chat_id, f"Лимит поддерживающего диалога ({psycho_limit} сообщений) исчерпан. Выберите Старт или Про.", upgrade_buttons())
             return
-        increment_usage_counter(user_id, "psycho_messages")
         add_psycho_message(user_id, "user", text)
         history = get_psycho_history(user_id)
         context = f"Ребёнку {m_label}." if months is not None else f"Беременная {m_label}." if weeks_preg else ""
@@ -1307,6 +1348,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
             answer = resp.choices[0].message.content.replace("**", "").strip()
             add_psycho_message(user_id, "assistant", answer)
             await send_message(chat_id, answer, psycho_buttons())
+            increment_usage_counter(user_id, "psycho_messages")
             used = get_usage_counter(user_id, "psycho_messages")
             plan_now = get_user_plan(user_id)
             threshold = 10 if plan_now == "free" else 40 if plan_now == "start" else None
@@ -1351,12 +1393,12 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         if limit is not None and get_request_count(user_id) >= limit:
             await send_message(chat_id, f"Использован лимит вопросов: {limit}. Выберите Старт или Про.", upgrade_buttons())
             return
-        if limit is not None:
-            increment_request_count(user_id)
         context = f"Ребёнку {m_label}." if months is not None else f"Беременная {m_label}." if weeks_preg else ""
         await send_message(chat_id, "⏳ Думаю...")
         answer = await generate_text(f"{EXPERT_BASE} {context}", text)
         await send_message(chat_id, answer, back_button())
+        if ai_answer_success(answer) and limit is not None:
+            increment_request_count(user_id)
         plan_now = get_user_plan(user_id)
         used = get_request_count(user_id)
         if plan_now == "free" and used >= 3:
@@ -1839,7 +1881,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         await send_message(chat_id, "🩺 Сводка к педиатру\n\n" + answer,
             [[{"type": "callback", "text": "📈 Отчёт за 7 дней", "payload": "weekly_report"}],
              [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
-        if get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "doctor_report")
+        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "doctor_report")
         return
 
     if payload == "weekly_report":
@@ -1864,7 +1906,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         await send_message(chat_id, "📈 Ваши 7 дней\n\n" + answer,
             [[{"type": "callback", "text": "🩺 Подготовить к врачу", "payload": "doctor_prep"}],
              [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
-        if get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "weekly_report")
+        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "weekly_report")
         return
 
     # ─── БЕРЕМЕННЫЙ РАЗДЕЛ ───────────────────────────────────
@@ -2313,7 +2355,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             f"Ребёнку {m_label}. Журнал кормлений:\n{data_str}\n\n"
             f"Проанализируй: достаточно ли кормлений по нормам ВОЗ, правильные ли интервалы, достаточная ли продолжительность. Дай практические рекомендации.")
         await send_message(chat_id, answer, back_button())
-        if get_user_plan(user_id) not in PRO_PLANS:
+        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS:
             consume_credit(user_id, "feeding_report")
         return
 
@@ -2368,7 +2410,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             f"сколько часов спит суммарно, правильные ли интервалы бодрствования, "
             f"есть ли проблемы и как их решить. Конкретные рекомендации.")
         await send_message(chat_id, answer, back_button())
-        if get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "sleep_report")
+        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "sleep_report")
         return
 
     if payload == "sleep_start":
@@ -3154,7 +3196,7 @@ async def startup():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(f"{MAX_API}/subscriptions",
-                json={"url": WEBHOOK_URL}, headers=headers)
+                json={"url": WEBHOOK_URL, "update_types": ["message_created", "message_callback", "bot_started", "bot_stopped"]}, headers=headers)
             logging.info(f"Webhook регистрация: {r.json()}")
     except Exception as e:
         logging.error(f"Ошибка регистрации webhook: {e}")
