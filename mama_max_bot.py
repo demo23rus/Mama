@@ -330,7 +330,7 @@ def start_buttons():
 def pregnant_menu_buttons():
     return [
         [{"type":"callback","text":"✨ Сегодня","payload":"today_brief"}],
-        [{"type":"callback","text":"🤰 Беременность","payload":"cat_pregnancy"}, {"type":"callback","text":"🩺 Здоровье","payload":"cat_preg_health"}],
+        [{"type":"callback","text":"🤰 Беременность","payload":"cat_pregnancy"}, {"type":"callback","text":"❤️ Здоровье","payload":"cat_preg_health"}],
         [{"type":"callback","text":"🧠 Для мамы","payload":"cat_mom_preg"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
         [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
@@ -341,7 +341,7 @@ def pregnant_menu_buttons():
 def main_menu_buttons():
     return [
         [{"type":"callback","text":"✨ Сегодня","payload":"today_brief"}],
-        [{"type":"callback","text":"👶 Ребёнок","payload":"cat_child"}, {"type":"callback","text":"🩺 Здоровье","payload":"cat_health"}],
+        [{"type":"callback","text":"👶 Ребёнок","payload":"cat_child"}, {"type":"callback","text":"❤️ Здоровье","payload":"cat_health"}],
         [{"type":"callback","text":"📊 Трекеры","payload":"cat_trackers"}, {"type":"callback","text":"🧠 Для мамы","payload":"cat_mom"}],
         [{"type":"callback","text":"👨‍👩‍👧 Семья","payload":"cat_family"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
@@ -1421,7 +1421,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
                 "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
                 "channel_sleep": ("✨ План и режим на сегодня", "today_brief"),
                 "channel_feeding": ("👶 Развитие малыша", "preg_baby"),
-                "channel_doctor": ("🩺 Здоровье при беременности", "cat_preg_health"),
+                "channel_doctor": ("❤️ Здоровье при беременности", "cat_preg_health"),
                 "channel_psycho": ("🧠 Поддержка для мамы", "psycho"),
                 "channel_pregnancy": ("🤰 Мой срок", "preg_week"),
                 "channel_child": ("👶 Развитие малыша", "preg_baby"),
@@ -1634,7 +1634,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "cat_health":
         await send_message(
             chat_id,
-            "🩺 Здоровье\n\nБезопасная навигация, подготовка к врачу и медицинские наблюдения.",
+            "❤️ Здоровье\n\nБезопасная навигация, подготовка к врачу и медицинские наблюдения.",
             health_category_buttons(),
         )
         return
@@ -1674,7 +1674,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "cat_preg_health":
         await send_message(
             chat_id,
-            "🩺 Здоровье при беременности\n\nАнализы, УЗИ и персональные вопросы.",
+            "❤️ Здоровье при беременности\n\nАнализы, УЗИ и персональные вопросы.",
             preg_health_category_buttons(),
         )
         return
@@ -3194,7 +3194,7 @@ async def webhook(request: Request):
                 "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
                 "channel_sleep": ("🌙 Сон и режим", "today_brief" if is_pregnant_profile else "sleep_log"),
                 "channel_feeding": ("🤱 Кормления и питание", "preg_baby" if is_pregnant_profile else "feeding"),
-                "channel_doctor": ("🩺 Здоровье и подготовка", "cat_preg_health" if is_pregnant_profile else "doctor_prep"),
+                "channel_doctor": ("❤️ Здоровье и подготовка", "cat_preg_health" if is_pregnant_profile else "doctor_prep"),
                 "channel_psycho": ("🧠 Поддержка для мамы", "psycho"),
                 "channel_pregnancy": ("🤰 Беременность", "preg_week" if is_pregnant_profile else "recovery"),
                 "channel_child": ("👶 Развитие малыша", "preg_baby" if is_pregnant_profile else "development"),
