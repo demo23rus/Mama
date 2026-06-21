@@ -17,10 +17,28 @@ import uvicorn
 import gspread
 from google.oauth2.service_account import Credentials
 
+
+def load_env(path="/root/.env_mama"):
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and "=" in line and not line.startswith("#"):
+                    key, value = line.split("=", 1)
+                    env[key.strip()] = value.strip()
+    except Exception as exc:
+        logging.warning("Не удалось загрузить %s: %s", path, exc)
+    return env
+
+_ENV = load_env()
+
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
-OPENAI_KEY = "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"
+OPENAI_KEY = _ENV.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
+if not OPENAI_KEY:
+    logging.warning("OPENAI_API_KEY не задан: AI-функции будут недоступны")
 OWNER_ID = int(os.getenv("MAX_OWNER_ID", "549639607"))
 CHANNEL_ID = -75619101439475
 SUPPORT_URL = "https://t.me/demo23rus"

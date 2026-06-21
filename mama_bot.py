@@ -39,7 +39,9 @@ SUPPORT_USERNAME = "@demo23rus"
 OWNER_ID = int(_env.get("TG_OWNER_ID", "0") or 0)
 CHANNEL_REPORT_CHAT_ID = _env.get("CHANNEL_REPORT_CHAT_ID", str(OWNER_ID) if OWNER_ID else SUPPORT_USERNAME)
 BOT_NAME = "Мамин помощник"
-OPENAI_KEY = "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"
+OPENAI_KEY = _env.get("OPENAI_API_KEY", "").strip()
+if not OPENAI_KEY:
+    logging.warning("OPENAI_API_KEY не задан в /root/.env_mama: AI-функции будут недоступны")
 
 # ─── ЮКАССА ──────────────────────────────────────────────────
 YOOKASSA_SHOP_ID = "1363324"
