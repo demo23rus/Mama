@@ -321,7 +321,7 @@ def start_buttons():
     if MAX_CHANNEL_PUBLIC_URL:
         buttons.append([{"type": "link", "text": "📢 Наш канал", "url": MAX_CHANNEL_PUBLIC_URL}])
     buttons.append([
-        {"type": "callback", "text": "💎 Тарифы", "payload": "pay_premium"},
+        {"type": "callback", "text": "💎 Премиум", "payload": "pay_premium"},
         {"type": "callback", "text": "🆘 Поддержка", "payload": "support_menu"},
     ])
     return buttons
@@ -333,7 +333,7 @@ def pregnant_menu_buttons():
         [{"type":"callback","text":"🤰 Беременность","payload":"cat_pregnancy"}, {"type":"callback","text":"🩺 Здоровье","payload":"cat_preg_health"}],
         [{"type":"callback","text":"🧠 Для мамы","payload":"cat_mom_preg"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
-        [{"type":"callback","text":"💎 Тарифы","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
+        [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
         [{"type":"callback","text":"🔄 Изменить данные","payload":"change_data"}],
     ]
 
@@ -345,66 +345,83 @@ def main_menu_buttons():
         [{"type":"callback","text":"📊 Трекеры","payload":"cat_trackers"}, {"type":"callback","text":"🧠 Для мамы","payload":"cat_mom"}],
         [{"type":"callback","text":"👨‍👩‍👧 Семья","payload":"cat_family"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
-        [{"type":"callback","text":"💎 Тарифы","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
+        [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
         [{"type":"callback","text":"🔄 Изменить данные","payload":"change_data"}],
     ]
 
 
 def child_category_buttons():
     return [
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"📊 Развитие по возрасту","payload":"development"}],
         [{"type":"callback","text":"🎮 Игры и занятия","payload":"games"}, {"type":"callback","text":"📚 Что читать","payload":"books"}],
         [{"type":"callback","text":"🍼 Питание и прикорм","payload":"food"}, {"type":"callback","text":"🥣 Рецепты","payload":"recipes"}],
         [{"type":"callback","text":"🌙 Режим дня","payload":"routine"}, {"type":"callback","text":"😴 Проблемы со сном","payload":"sleep"}],
         [{"type":"callback","text":"😢 Истерики и капризы","payload":"tantrums"}],
         [{"type":"callback","text":"📋 Первые дни с малышом","payload":"firstdays"}],
+        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
+        [{"type":"callback","text":"🌙 Разбор сна · Про / 199 ₽","payload":"buy_sleep_report"}],
+        [{"type":"callback","text":"📈 Отчёт за неделю · Про / 199 ₽","payload":"buy_weekly_report"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
 
 def health_category_buttons():
     return [
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"🚨 Ребёнку плохо","payload":"emergency"}],
-        [{"type":"callback","text":"🩺 Подготовиться к врачу","payload":"doctor_prep"}],
         [{"type":"callback","text":"🌡 Здоровье","payload":"health"}, {"type":"callback","text":"💊 Лекарства","payload":"meds"}],
-        [{"type":"callback","text":"🦷 Зубки","payload":"teeth"}, {"type":"callback","text":"📸 Анализ фото","payload":"photo_menu"}],
-        [{"type":"callback","text":"💉 Прививки","payload":"vaccines"}],
+        [{"type":"callback","text":"🦷 Зубки","payload":"teeth"}],
+        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
+        [{"type":"callback","text":"🩺 Сводка врачу · Про / 149 ₽","payload":"doctor_prep"}],
+        [{"type":"callback","text":"📸 Анализ фото · Про / 99 ₽","payload":"photo_menu"}],
+        [{"type":"callback","text":"💉 Прививки · Старт","payload":"vaccines"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
 
 def tracker_category_buttons():
     return [
-        [{"type":"callback","text":"📏 Рост и вес","payload":"growth"}, {"type":"callback","text":"🌡 Симптомы","payload":"symptoms"}],
-        [{"type":"callback","text":"🤱 Кормления","payload":"feeding"}, {"type":"callback","text":"🌙 Сон","payload":"sleep_log"}],
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"📓 Дневник малыша","payload":"diary"}],
-        [{"type":"callback","text":"📈 Отчёт за 7 дней","payload":"weekly_report"}],
+        [{"type":"callback","text":"🌱 ДОСТУПНО СО СТАРТ","payload":"noop"}],
+        [{"type":"callback","text":"📏 Рост и вес · Старт","payload":"growth"}, {"type":"callback","text":"🌡 Симптомы · Старт","payload":"symptoms"}],
+        [{"type":"callback","text":"🤱 Кормления · Старт","payload":"feeding"}, {"type":"callback","text":"🌙 Сон · Старт","payload":"sleep_log"}],
+        [{"type":"callback","text":"💎 ГЛУБОКИЙ АНАЛИЗ","payload":"noop"}],
+        [{"type":"callback","text":"🤱 Разбор кормлений · Про / 149 ₽","payload":"buy_feeding_report"}],
+        [{"type":"callback","text":"🌙 Разбор сна · Про / 199 ₽","payload":"buy_sleep_report"}],
+        [{"type":"callback","text":"📈 Отчёт за 7 дней · Про / 199 ₽","payload":"weekly_report"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
 
 def mom_category_buttons():
     return [
-        [{"type":"callback","text":"🧠 Мамин психолог","payload":"psycho"}],
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"🧠 Эмоции мамы","payload":"emotions"}],
         [{"type":"callback","text":"🤱 Грудное вскармливание","payload":"breastfeeding"}],
         [{"type":"callback","text":"🏥 Восстановление мамы","payload":"recovery"}],
-        [{"type":"callback","text":"💰 Пособия и выплаты","payload":"benefits"}],
+        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
+        [{"type":"callback","text":"🧠 Мамин психолог · Про","payload":"psycho"}],
+        [{"type":"callback","text":"💰 Пособия и выплаты · Старт","payload":"benefits"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
 
 def family_category_buttons():
     return [
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"👨‍👩‍👧 Отношения в семье","payload":"family"}],
-        [{"type":"callback","text":"📈 Недельный семейный отчёт","payload":"weekly_report"}],
         [{"type":"callback","text":"📓 Дневник малыша","payload":"diary"}],
+        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
+        [{"type":"callback","text":"📈 Недельный отчёт · Про / 199 ₽","payload":"weekly_report"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
 
 def pregnancy_category_buttons():
     return [
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"📊 Мой срок","payload":"preg_week"}],
         [{"type":"callback","text":"👶 Развитие малыша","payload":"preg_baby"}],
         [{"type":"callback","text":"✅ Чек-лист","payload":"preg_checklist"}],
@@ -415,19 +432,24 @@ def pregnancy_category_buttons():
 
 def preg_health_category_buttons():
     return [
-        [{"type":"callback","text":"📸 Анализы и УЗИ","payload":"photo_menu"}],
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
+        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
+        [{"type":"callback","text":"📸 Анализы и УЗИ · Про / 99 ₽","payload":"photo_menu"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
 
 def preg_mom_category_buttons():
     return [
-        [{"type":"callback","text":"🧠 Мамин психолог","payload":"psycho"}],
+        [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"🧠 Эмоциональная поддержка","payload":"emotions"}],
-        [{"type":"callback","text":"💰 Пособия и выплаты","payload":"benefits"}],
+        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
+        [{"type":"callback","text":"🧠 Мамин психолог · Про","payload":"psycho"}],
+        [{"type":"callback","text":"💰 Пособия и выплаты · Старт","payload":"benefits"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
+
 
 def back_button():
     return [[{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]]
@@ -2534,11 +2556,13 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     if payload in {"pay_premium", "premium_info"}:
         await send_message(chat_id,
-            "💎 Доступ к Маминому помощнику\n\n"
-            "Старт — основные трекеры, 30 AI-вопросов и 50 сообщений поддержки.\n"
-            "Про — все функции, отчёты и анализ фото.\n"
-            "Про на год — полный доступ на 365 дней.\n\n"
-            "Можно купить один конкретный результат без подписки.",
+            "💎 Премиум-возможности\n\n"
+            "🌱 Старт\n"
+            "Трекеры роста, симптомов, кормлений и сна, прививки, пособия, 30 AI-вопросов и 50 сообщений поддержки.\n\n"
+            "💎 Про\n"
+            "Всё из Старт + Мамин психолог, анализ фото, сводка врачу, разбор сна и кормлений, недельный отчёт.\n\n"
+            "🛒 Отдельные решения без подписки:\n"
+            "Фото — 99 ₽ · Сводка врачу — 149 ₽ · Кормления — 149 ₽ · Сон — 199 ₽ · Отчёт — 199 ₽.",
             upgrade_buttons())
         return
 

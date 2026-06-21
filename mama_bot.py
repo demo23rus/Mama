@@ -1018,7 +1018,7 @@ def kb_start():
         [InlineKeyboardButton(text="🤰 Я беременна", callback_data="mode_pregnant")],
         [InlineKeyboardButton(text="👩 Я уже мама", callback_data="mode_mama")],
         [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/yamama_ai")],
-        [InlineKeyboardButton(text="💎 Тарифы", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")]
     ])
 
@@ -1030,7 +1030,7 @@ def kb_pregnant_menu():
         [InlineKeyboardButton(text="🧠 Для мамы", callback_data="cat_mom_preg"),
          InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 Тарифы", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
     ])
@@ -1046,7 +1046,7 @@ def kb_mama_menu():
         [InlineKeyboardButton(text="👨‍👩‍👧 Семья", callback_data="cat_family"),
          InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 Тарифы", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
     ])
@@ -1054,6 +1054,7 @@ def kb_mama_menu():
 
 def kb_cat_child():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="📊 Развитие по возрасту", callback_data="mama_dev")],
         [InlineKeyboardButton(text="🎮 Игры и занятия", callback_data="mama_games"),
          InlineKeyboardButton(text="📚 Что читать", callback_data="mama_books")],
@@ -1063,57 +1064,72 @@ def kb_cat_child():
          InlineKeyboardButton(text="😴 Проблемы со сном", callback_data="mama_sleep")],
         [InlineKeyboardButton(text="😢 Истерики и капризы", callback_data="mama_tantrums")],
         [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
+        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
+        [InlineKeyboardButton(text="🌙 Разбор сна · Про / 199 ₽", callback_data="buy_sleep_report")],
+        [InlineKeyboardButton(text="📈 Отчёт за неделю · Про / 199 ₽", callback_data="buy_weekly_report")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
 
 def kb_cat_health():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="🚨 Ребёнку плохо", callback_data="emergency")],
-        [InlineKeyboardButton(text="🩺 Подготовиться к врачу", callback_data="doctor_prep")],
         [InlineKeyboardButton(text="🌡 Здоровье", callback_data="mama_health"),
          InlineKeyboardButton(text="💊 Лекарства", callback_data="mama_meds")],
-        [InlineKeyboardButton(text="🦷 Зубки", callback_data="mama_teeth"),
-         InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
-        [InlineKeyboardButton(text="💉 Прививки", callback_data="check_premium_vaccines")],
+        [InlineKeyboardButton(text="🦷 Зубки", callback_data="mama_teeth")],
+        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
+        [InlineKeyboardButton(text="🩺 Сводка врачу · Про / 149 ₽", callback_data="doctor_prep")],
+        [InlineKeyboardButton(text="📸 Анализ фото · Про / 99 ₽", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="💉 Прививки · Старт", callback_data="check_premium_vaccines")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
 
 def kb_cat_trackers():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📏 Рост и вес", callback_data="check_premium_growth"),
-         InlineKeyboardButton(text="🌡 Симптомы", callback_data="check_premium_symptoms")],
-        [InlineKeyboardButton(text="🤱 Кормления", callback_data="check_premium_feeding"),
-         InlineKeyboardButton(text="🌙 Сон", callback_data="check_premium_sleep")],
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
-        [InlineKeyboardButton(text="📈 Отчёт за 7 дней", callback_data="weekly_report")],
+        [InlineKeyboardButton(text="🌱 ДОСТУПНО СО СТАРТ", callback_data="noop")],
+        [InlineKeyboardButton(text="📏 Рост и вес · Старт", callback_data="check_premium_growth"),
+         InlineKeyboardButton(text="🌡 Симптомы · Старт", callback_data="check_premium_symptoms")],
+        [InlineKeyboardButton(text="🤱 Кормления · Старт", callback_data="check_premium_feeding"),
+         InlineKeyboardButton(text="🌙 Сон · Старт", callback_data="check_premium_sleep")],
+        [InlineKeyboardButton(text="💎 ГЛУБОКИЙ АНАЛИЗ", callback_data="noop")],
+        [InlineKeyboardButton(text="🤱 Разбор кормлений · Про / 149 ₽", callback_data="buy_feeding_report")],
+        [InlineKeyboardButton(text="🌙 Разбор сна · Про / 199 ₽", callback_data="buy_sleep_report")],
+        [InlineKeyboardButton(text="📈 Отчёт за 7 дней · Про / 199 ₽", callback_data="weekly_report")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
 
 def kb_cat_mom():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧠 Мамин психолог", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="🧠 Эмоции мамы", callback_data="mama_emotions")],
         [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
         [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
-        [InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="check_premium_benefits")],
+        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог · Про", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="💰 Пособия и выплаты · Старт", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
 
 def kb_cat_family():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="👨‍👩‍👧 Отношения в семье", callback_data="mama_family")],
-        [InlineKeyboardButton(text="📈 Недельный семейный отчёт", callback_data="weekly_report")],
         [InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
+        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
+        [InlineKeyboardButton(text="📈 Недельный отчёт · Про / 199 ₽", callback_data="weekly_report")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
 
 def kb_cat_pregnancy():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="📊 Мой срок", callback_data="preg_week")],
         [InlineKeyboardButton(text="👶 Развитие малыша", callback_data="preg_baby")],
         [InlineKeyboardButton(text="✅ Чек-лист", callback_data="preg_checklist")],
@@ -1124,17 +1140,21 @@ def kb_cat_pregnancy():
 
 def kb_cat_preg_health():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Анализы и УЗИ", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
+        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
+        [InlineKeyboardButton(text="📸 Анализы и УЗИ · Про / 99 ₽", callback_data="photo_menu")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
     ])
 
 
 def kb_cat_mom_preg():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧠 Мамин психолог", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="🧠 Эмоциональная поддержка", callback_data="mama_emotions")],
-        [InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="check_premium_benefits")],
+        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог · Про", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="💰 Пособия и выплаты · Старт", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
     ])
 
@@ -1393,6 +1413,10 @@ async def change_data(call: CallbackQuery, state: FSMContext):
         "Выбери свой статус 👇",
         reply_markup=kb_start()
     )
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(call: CallbackQuery):
+    await call.answer("Это заголовок раздела")
 
 @dp.callback_query(F.data == "cat_child")
 async def cat_child(call: CallbackQuery):
