@@ -920,6 +920,61 @@ def question_limit_for(user_id):
     return None if base is None else int(base) + get_referral_bonus_questions(user_id)
 def psycho_limit_for(user_id): return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
 
+
+FUNNEL_QUESTION_PROMPTS = {
+    "funnel_sleep": "🌙 Опиши, что происходит со сном ребёнка: возраст, время подъёма, дневные сны, укладывание и что тревожит больше всего.",
+    "funnel_feeding": "🥣 Опиши вопрос о питании или кормлении: возраст ребёнка, тип питания и что именно вызывает сомнения.",
+    "funnel_development": "👶 Напиши возраст ребёнка и навык или поведение, которое хочешь проверить по возрасту.",
+    "funnel_tantrum": "🧠 Опиши последнюю истерику: возраст, что произошло перед ней и как ребёнок успокоился.",
+    "funnel_doctor": "🩺 Опиши симптомы и наблюдения. Я помогу собрать важное и подготовить вопросы врачу. Диагноз бот не ставит.",
+    "funnel_mom": "🤍 Расскажи, что сейчас даётся тяжелее всего. Я помогу спокойно разобрать ситуацию по шагам.",
+    "funnel_family": "👨‍👩‍👧 Опиши семейную ситуацию и чего ты хочешь добиться в следующем разговоре.",
+    "funnel_pregnancy": "🤰 Напиши срок беременности и вопрос, который сейчас волнует больше всего.",
+}
+
+
+def _question_next_action_max(question_text, pregnant=False):
+    text = (question_text or "").lower()
+    rules = [
+        (("сон", "засып", "просып", "режим"), "🌙 Ещё вопрос о сне", "funnel_sleep"),
+        (("корм", "питан", "прикорм", "смесь", "гв"), "🥣 Уточнить питание", "funnel_feeding"),
+        (("истер", "каприз", "плач", "поведен"), "🧠 Понять поведение", "funnel_tantrum"),
+        (("развит", "речь", "навык", "возраст"), "👶 Проверить развитие", "funnel_development"),
+        (("врач", "температур", "сып", "симптом", "болит", "лекар"), "🩺 Подготовить вопросы врачу", "funnel_doctor"),
+        (("муж", "пап", "отношен", "семь"), "👨‍👩‍👧 Разобрать семью", "funnel_family"),
+        (("устал", "тревог", "выгор", "тяжело", "одиноко"), "🤍 Разобрать мою ситуацию", "funnel_mom"),
+    ]
+    for words, label, callback in rules:
+        if any(w in text for w in words): return label, callback
+    return ("🤰 Ещё вопрос о беременности", "funnel_pregnancy") if pregnant else ("❓ Задать ещё вопрос", "ask")
+
+
+
+def build_question_funnel_max(user_id, question_text=""):
+    plan=get_user_plan(user_id); limit=question_limit_for(user_id); used=get_request_count(user_id)
+    remaining=None if limit is None else max(0,limit-used)
+    user=get_user(user_id); pregnant=user.get("birth_date","").startswith("pdr:")
+    next_label,next_payload=_question_next_action_max(question_text,pregnant)
+    if plan=="free":
+        if remaining==4:
+            text="🤍 Ответ готов. Бесплатных персональных разборов осталось: 4 из 5."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
+        elif remaining==3:
+            text="🤍 Осталось 3 бесплатных разбора. Можно продолжить со сном, питанием, развитием, здоровьем или семейной ситуацией."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
+        elif remaining==2:
+            text="🤍 Осталось 2 бесплатных разбора. В «Старт» доступно 30 вопросов на 30 дней и основные трекеры."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}],[{"type":"callback","text":"🌱 Старт — 190 ₽","payload":"pay_plan_start"}]]
+        elif remaining==1:
+            text="🤍 Остался 1 бесплатный разбор. Используй его для вопроса, который тревожит сильнее всего."; buttons=[[{"type":"callback","text":"❓ Задать последний вопрос","payload":next_payload}],[{"type":"callback","text":"💎 Посмотреть возможности","payload":"pay_premium"}]]
+        else:
+            text="🤍 Бесплатные разборы закончились. Продолжить можно с тарифа «Старт» за 190 ₽ или получить бонус за приглашение подруги."; buttons=[[{"type":"callback","text":"🌱 Продолжить — 190 ₽","payload":"pay_plan_start"}],[{"type":"callback","text":"💎 Выбрать тариф","payload":"pay_premium"}],[{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}]]
+    elif plan=="start":
+        text=f"✨ Использовано {used} из 30 вопросов тарифа «Старт»."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
+        if remaining is not None and remaining<=6:
+            text+=" В «Про» вопросы без лимита и доступны расширенные отчёты."; buttons.append([{"type":"callback","text":"💎 Перейти на Про — 390 ₽","payload":"pay_plan_pro"}])
+    else:
+        text="✨ Готово. Можно продолжить с ещё одним вопросом."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
+    if MAX_CHANNEL_PUBLIC_URL: buttons.append([{"type":"link","text":"📣 Вернуться в канал","url":MAX_CHANNEL_PUBLIC_URL}])
+    return text,buttons
+
 def get_usage_counter(user_id,counter):
     if counter == "psycho_messages": return int(_usage_period_row(user_id)[4])
     conn=db_connect(); row=conn.execute("SELECT value FROM usage_counters WHERE user_id=? AND counter=?",(user_id,counter)).fetchone(); conn.close(); return int(row[0]) if row else 0
@@ -1529,29 +1584,23 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         plan, _ = get_subscription(user_id)
         limit = question_limit_for(user_id)
         if limit is not None and get_request_count(user_id) >= limit:
-            await send_message(chat_id, f"Использован лимит вопросов: {limit}. Выберите Старт или Про.", upgrade_buttons())
+            log_analytics_event("paywall_seen", user_id, "questions_limit", f"used={get_request_count(user_id)};limit={limit}")
+            await send_message(chat_id, "🤍 Бесплатные персональные разборы закончились. Продолжить можно с тарифа «Старт» или получить бонус за приглашение подруги.", [[{"type":"callback","text":"🌱 Продолжить — 190 ₽","payload":"pay_plan_start"}],[{"type":"callback","text":"💎 Выбрать тариф","payload":"pay_premium"}],[{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}]])
             return
         context = f"Ребёнку {m_label}." if months is not None else f"Беременная {m_label}." if weeks_preg else ""
+        log_analytics_event("request_started", user_id, "personal_question", text[:300])
         await send_message(chat_id, "⏳ Думаю...")
         answer = await generate_text(f"{EXPERT_BASE} {context}", text)
-        await send_message(chat_id, answer, back_button())
-        if ai_answer_success(answer) and limit is not None:
-            increment_request_count(user_id)
-        plan_now = get_user_plan(user_id)
-        used = get_request_count(user_id)
-        if plan_now == "free" and used >= 3:
-            await maybe_send_marketing_offer(
-                chat_id, user_id, "questions_upgrade",
-                f"🤍 Осталось {max(0, 5-used)} бесплатных вопроса. В Старт доступно 30 вопросов, а в Про — полный доступ ко всем функциям.",
-                [[{"type": "callback", "text": "🌱 Старт — 190 ₽", "payload": "pay_plan_start"}],
-                 [{"type": "callback", "text": "💎 Все тарифы", "payload": "pay_premium"}]],
-            )
-        elif plan_now == "start" and used >= 24:
-            await maybe_send_marketing_offer(
-                chat_id, user_id, "questions_pro",
-                f"✨ В Старт использовано {used} из 30 вопросов. Про снимает лимит и открывает фото, отчёты и сводку к врачу.",
-                [[{"type": "callback", "text": "💎 Перейти на Про — 390 ₽", "payload": "pay_plan_pro"}]],
-            )
+        await send_message(chat_id, answer)
+        if ai_answer_success(answer):
+            if limit is not None:
+                increment_request_count(user_id)
+            log_analytics_event("request_completed", user_id, "personal_question", f"used={get_request_count(user_id)}")
+            funnel_text, funnel_buttons = build_question_funnel_max(user_id, text)
+            await send_message(chat_id, funnel_text, funnel_buttons)
+        else:
+            log_analytics_event("request_failed", user_id, "personal_question", "ai_answer_invalid")
+            await send_message(chat_id, "Лимит не списан. Попробуй ещё раз немного позже.", back_button())
         return
 
     # Ввод даты рождения малыша
@@ -1570,11 +1619,11 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         await send_message(chat_id, f"✅ Малышу {lbl}\n\nЧем могу помочь? 💕", main_menu_buttons())
         if pending_start:
             route = {
-                "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
+                "channel_today": ("❓ Получить персональный ответ", "ask"),
                 "channel_sleep": ("🌙 Сон и режим", "sleep_log"),
                 "channel_feeding": ("🤱 Кормления и питание", "feeding"),
                 "channel_doctor": ("🩺 Подготовка к врачу", "doctor_prep"),
-                "channel_psycho": ("🧠 Поддержка для мамы", "psycho"),
+                "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
                 "channel_pregnancy": ("🏥 Восстановление мамы", "recovery"),
                 "channel_child": ("👶 Развитие ребёнка", "development"),
                 "channel_family": ("👨‍👩‍👧 Семья", "family"),
@@ -1598,14 +1647,14 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         await send_message(chat_id, f"✅ Ты на {w} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
         if pending_start:
             route = {
-                "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
-                "channel_sleep": ("✨ План и режим на сегодня", "today_brief"),
-                "channel_feeding": ("👶 Развитие малыша", "preg_baby"),
-                "channel_doctor": ("❤️ Здоровье при беременности", "cat_preg_health"),
-                "channel_psycho": ("🧠 Поддержка для мамы", "psycho"),
-                "channel_pregnancy": ("🤰 Мой срок", "preg_week"),
-                "channel_child": ("👶 Развитие малыша", "preg_baby"),
-                "channel_family": ("🧠 Поддержка для мамы", "psycho"),
+                "channel_today": ("❓ Получить персональный ответ", "ask"),
+                "channel_sleep": ("🌙 Разобрать сон ребёнка", "funnel_sleep"),
+                "channel_feeding": ("🥣 Разобрать питание ребёнка", "funnel_feeding"),
+                "channel_doctor": ("🩺 Подготовить вопросы врачу", "funnel_doctor"),
+                "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
+                "channel_pregnancy": ("🤰 Задать вопрос по беременности", "funnel_pregnancy"),
+                "channel_child": ("👶 Проверить развитие", "funnel_development"),
+                "channel_family": ("👨‍👩‍👧 Подготовить разговор", "funnel_family"),
             }.get(pending_start)
             if route:
                 await send_message(chat_id, route[0], [[{"type": "callback", "text": route[0], "payload": route[1]}]])
@@ -1754,6 +1803,12 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         if not allowed:
             await send_message(chat_id, "🔒 Эта функция не входит в текущий доступ. Выберите подписку или разовую покупку.", upgrade_buttons())
             return
+
+    if payload in FUNNEL_QUESTION_PROMPTS:
+        set_step(user_id, "ask")
+        log_analytics_event("funnel_question_opened", user_id, payload)
+        await send_message(chat_id, FUNNEL_QUESTION_PROMPTS[payload])
+        return
 
     if payload == "channel_open_bot":
         await send_message(user_id,
@@ -3077,23 +3132,23 @@ def channel_funnel_for_post(theme="", title="", body="", format_name=""):
     text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
     rules = [
         (("сон", "недосып", "засып", "пробуж"),
-         "🌙 Хотите увидеть картину сна именно вашего ребёнка? Отмечайте засыпания и пробуждения в помощнике.",
-         "🌙 Записать сон ребёнка"),
+         "🌙 Общие нормы не учитывают возраст и ваш режим. Получите бесплатный персональный разбор сна.",
+         "🌙 Разобрать сон ребёнка"),
         (("корм", "гв", "груд", "прикорм", "питан", "смесь"),
-         "🍼 Не держите в голове время и детали кормлений — сохраните их в помощнике.",
-         "🍼 Открыть дневник кормлений"),
+         "🥣 Получите рекомендацию по кормлению с учётом возраста и вашей ситуации.",
+         "🥣 Разобрать питание ребёнка"),
         (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"),
-         "🩺 Зафиксируйте наблюдения и подготовьте вопросы, чтобы на приёме ничего не забыть.",
-         "🩺 Подготовиться к врачу"),
+         "🩺 Опишите наблюдения — помощник бесплатно соберёт важное и подготовит вопросы врачу.",
+         "🩺 Подготовить вопросы врачу"),
         (("развит", "возраст", "игр", "заняти", "навык", "речь"),
-         "👶 Получите подсказку с учётом возраста именно вашего ребёнка.",
-         "👶 Что важно сегодня"),
+         "👶 Проверьте навык или поведение с учётом точного возраста ребёнка.",
+         "👶 Проверить развитие"),
         (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"),
-         "🤍 Когда всё накопилось, опишите ситуацию помощнику — он поможет спокойно разложить её по шагам.",
-         "🤍 Получить поддержку"),
+         "🤍 Опишите, что происходит. Первый персональный разбор поможет спокойно увидеть следующий шаг.",
+         "🤍 Разобрать мою ситуацию"),
         (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"),
-         "👨‍👩‍👧 Сохраните семейную ситуацию и получите спокойный план следующего разговора.",
-         "👨‍👩‍👧 Разобрать ситуацию"),
+         "👨‍👩‍👧 Опишите ситуацию и получите спокойный план следующего разговора.",
+         "👨‍👩‍👧 Подготовить разговор"),
         (("беремен", "род", "восстанов", "срок"),
          "🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
          "🤰 Открыть помощника"),
@@ -3401,14 +3456,14 @@ async def webhook(request: Request):
             is_pregnant_profile = existing_birth_date.startswith("pdr:")
             channel_payloads = {
                 "channel": ("🤍 Ты пришла из канала «Я МАМА». ", None),
-                "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
-                "channel_sleep": ("🌙 Сон и режим", "today_brief" if is_pregnant_profile else "sleep_log"),
-                "channel_feeding": ("🤱 Кормления и питание", "preg_baby" if is_pregnant_profile else "feeding"),
-                "channel_doctor": ("❤️ Здоровье и подготовка", "cat_preg_health" if is_pregnant_profile else "doctor_prep"),
-                "channel_psycho": ("🧠 Поддержка для мамы", "psycho"),
-                "channel_pregnancy": ("🤰 Беременность", "preg_week" if is_pregnant_profile else "recovery"),
-                "channel_child": ("👶 Развитие малыша", "preg_baby" if is_pregnant_profile else "development"),
-                "channel_family": ("👨‍👩‍👧 Семья", "psycho" if is_pregnant_profile else "family"),
+                "channel_today": ("❓ Получить персональный ответ", "ask"),
+                "channel_sleep": ("🌙 Разобрать сон ребёнка", "funnel_sleep"),
+                "channel_feeding": ("🥣 Разобрать питание ребёнка", "funnel_feeding"),
+                "channel_doctor": ("🩺 Подготовить вопросы врачу", "funnel_doctor"),
+                "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
+                "channel_pregnancy": ("🤰 Задать вопрос по беременности", "funnel_pregnancy"),
+                "channel_child": ("👶 Проверить развитие", "funnel_development"),
+                "channel_family": ("👨‍👩‍👧 Подготовить разговор", "funnel_family"),
             }
             channel_title, channel_callback = channel_payloads.get(start_payload, ("", None))
             intro = "🤍 Ты пришла из канала «Я МАМА». Здесь рекомендации становятся персональными.\n\n" if start_payload.startswith("channel") else ""

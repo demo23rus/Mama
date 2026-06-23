@@ -823,6 +823,68 @@ def psycho_limit_for(user_id):
     return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
 
 
+FUNNEL_QUESTION_PROMPTS = {
+    "funnel_sleep": "🌙 Опиши, что происходит со сном ребёнка: возраст, время подъёма, дневные сны, укладывание и что тревожит больше всего.",
+    "funnel_feeding": "🥣 Опиши вопрос о питании или кормлении: возраст ребёнка, тип питания и что именно вызывает сомнения.",
+    "funnel_development": "👶 Напиши возраст ребёнка и навык или поведение, которое хочешь проверить по возрасту.",
+    "funnel_tantrum": "🧠 Опиши последнюю истерику: возраст, что произошло перед ней и как ребёнок успокоился.",
+    "funnel_doctor": "🩺 Опиши симптомы и наблюдения. Я помогу собрать важное и подготовить вопросы врачу. Диагноз бот не ставит.",
+    "funnel_mom": "🤍 Расскажи, что сейчас даётся тяжелее всего. Я помогу спокойно разобрать ситуацию по шагам.",
+    "funnel_family": "👨‍👩‍👧 Опиши семейную ситуацию и чего ты хочешь добиться в следующем разговоре.",
+    "funnel_pregnancy": "🤰 Напиши срок беременности и вопрос, который сейчас волнует больше всего.",
+}
+
+
+def _question_next_action(question_text, mode="mama"):
+    text = (question_text or "").lower()
+    rules = [
+        (("сон", "засып", "просып", "режим"), "🌙 Ещё вопрос о сне", "funnel_sleep"),
+        (("корм", "питан", "прикорм", "смесь", "гв"), "🥣 Уточнить питание", "funnel_feeding"),
+        (("истер", "каприз", "плач", "поведен"), "🧠 Понять поведение", "funnel_tantrum"),
+        (("развит", "речь", "навык", "возраст"), "👶 Проверить развитие", "funnel_development"),
+        (("врач", "температур", "сып", "симптом", "болит", "лекар"), "🩺 Подготовить вопросы врачу", "funnel_doctor"),
+        (("муж", "пап", "отношен", "семь"), "👨‍👩‍👧 Разобрать семью", "funnel_family"),
+        (("устал", "тревог", "выгор", "тяжело", "одиноко"), "🤍 Разобрать мою ситуацию", "funnel_mom"),
+    ]
+    for words, label, callback in rules:
+        if any(w in text for w in words): return label, callback
+    return ("🤰 Ещё вопрос о беременности", "funnel_pregnancy") if mode == "pregnant" else ("❓ Задать ещё вопрос", "ask_question")
+
+
+def build_question_funnel_tg(user_id, question_text=""):
+    plan = get_user_plan(user_id); limit = question_limit_for(user_id); used = get_request_count(user_id)
+    remaining = None if limit is None else max(0, limit - used)
+    user = get_user(user_id); mode = user[0] if user else "mama"
+    next_label, next_callback = _question_next_action(question_text, mode)
+    if plan == "free":
+        if remaining == 4:
+            text = "🤍 Ответ готов. Бесплатных персональных разборов осталось: 4 из 5."
+            rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
+        elif remaining == 3:
+            text = "🤍 Осталось 3 бесплатных разбора. Можно продолжить со сном, питанием, развитием, здоровьем или семейной ситуацией."
+            rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
+        elif remaining == 2:
+            text = "🤍 Осталось 2 бесплатных разбора. В «Старт» доступно 30 вопросов на 30 дней и основные трекеры."
+            rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)], [InlineKeyboardButton(text="🌱 Старт — 190 ₽", callback_data="pay_plan_start")]]
+        elif remaining == 1:
+            text = "🤍 Остался 1 бесплатный разбор. Используй его для вопроса, который тревожит сильнее всего."
+            rows = [[InlineKeyboardButton(text="❓ Задать последний вопрос", callback_data=next_callback)], [InlineKeyboardButton(text="💎 Посмотреть возможности", callback_data="pay_premium")]]
+        else:
+            text = "🤍 Бесплатные разборы закончились. Продолжить можно с тарифа «Старт» за 190 ₽ или получить бонус за приглашение подруги."
+            rows = [[InlineKeyboardButton(text="🌱 Продолжить — 190 ₽", callback_data="pay_plan_start")], [InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="pay_premium")], [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")]]
+    elif plan == "start":
+        text = f"✨ Использовано {used} из 30 вопросов тарифа «Старт»."
+        rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
+        if remaining is not None and remaining <= 6:
+            text += " В «Про» вопросы без лимита и доступны расширенные отчёты."
+            rows.append([InlineKeyboardButton(text="💎 Перейти на Про — 390 ₽", callback_data="pay_plan_pro")])
+    else:
+        text = "✨ Готово. Можно продолжить с ещё одним вопросом."
+        rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
+    rows.append([InlineKeyboardButton(text="📣 Вернуться в канал", url="https://t.me/yamama_ai")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def get_usage_counter(user_id, counter):
     if counter == "psycho_messages":
         return int(_usage_period_row(user_id)[4])
@@ -2284,6 +2346,13 @@ async def save_diary_entry(message: Message, state: FSMContext):
     )
 
 # ─── ВОПРОС ПОМОЩНИКУ ────────────────────────────────────────
+@dp.callback_query(F.data.in_(set(FUNNEL_QUESTION_PROMPTS)))
+async def funnel_question_entry(call: CallbackQuery, state: FSMContext):
+    await state.set_state(QuestionStates.waiting_question)
+    await state.update_data(funnel_source=call.data)
+    log_analytics_event("funnel_question_opened", call.from_user.id, call.data)
+    await call.message.edit_text(FUNNEL_QUESTION_PROMPTS[call.data])
+
 @dp.callback_query(F.data == "ask_question")
 async def ask_question(call: CallbackQuery, state: FSMContext):
     await state.set_state(QuestionStates.waiting_question)
@@ -2304,11 +2373,14 @@ async def handle_question(message: Message, state: FSMContext):
     if limit is not None:
         count = get_request_count(message.from_user.id)
         if count >= limit:
+            log_analytics_event("paywall_seen", message.from_user.id, "questions_limit", f"used={count};limit={limit}")
             await message.answer(
-                "❓ Ты использовала все бесплатные вопросы\n\n"
-                "Для продолжения оформи Про — 390 руб/месяц\n"
-                "Безлимитные вопросы + все функции бота!",
-                reply_markup=kb_premium()
+                "🤍 Бесплатные персональные разборы закончились.\n\nПродолжить можно с тарифа «Старт» — 30 вопросов на 30 дней, или получить бонусный вопрос за приглашение подруги.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🌱 Продолжить — 190 ₽", callback_data="pay_plan_start")],
+                    [InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="pay_premium")],
+                    [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")],
+                ])
             )
             return
 
@@ -2323,6 +2395,7 @@ async def handle_question(message: Message, state: FSMContext):
     else:
         context = "Мама задаёт вопрос о ребёнке или беременности."
 
+    log_analytics_event("request_started", message.from_user.id, "personal_question", message.text[:300])
     await show_typing(message.chat.id)
     answer = await ask_gpt(
         f"Ты эксперт в педиатрии, перинатальной психологии и детском развитии. "
@@ -2331,31 +2404,17 @@ async def handle_question(message: Message, state: FSMContext):
         f"Отвечай развёрнуто, точно и с теплом. При медицинских симптомах — направляй к педиатру.",
         message.text
     )
-    kb = kb_mama_menu() if user and user[0] == "mama" else kb_pregnant_menu() if user else kb_start()
-    await message.answer(answer, reply_markup=kb)
-    if ai_answer_success(answer) and limit is not None:
-        increment_request_count(message.from_user.id)
-    plan = get_user_plan(message.from_user.id)
-    used = get_request_count(message.from_user.id)
-    if plan == "free" and used >= 3:
-        await maybe_send_marketing_offer(
-            message.chat.id,
-            message.from_user.id,
-            "questions_upgrade",
-            f"🤍 У тебя осталось {max(0, 5-used)} бесплатных вопроса. В Старт доступно 30 вопросов, а в Про — полный доступ ко всем функциям.",
-            [
-                [InlineKeyboardButton(text="🌱 Старт — 190 ₽", callback_data="pay_plan_start")],
-                [InlineKeyboardButton(text="💎 Посмотреть все тарифы", callback_data="pay_premium")],
-            ],
-        )
-    elif plan == "start" and used >= 24:
-        await maybe_send_marketing_offer(
-            message.chat.id,
-            message.from_user.id,
-            "questions_pro",
-            f"✨ В тарифе Старт использовано {used} из 30 вопросов. Про снимает лимит и открывает фото, отчёты и сводку к врачу.",
-            [[InlineKeyboardButton(text="💎 Перейти на Про — 390 ₽", callback_data="pay_plan_pro")]],
-        )
+    await message.answer(answer)
+    if ai_answer_success(answer):
+        if limit is not None:
+            increment_request_count(message.from_user.id)
+        log_analytics_event("request_completed", message.from_user.id, "personal_question", f"used={get_request_count(message.from_user.id)}")
+        funnel_text, funnel_markup = build_question_funnel_tg(message.from_user.id, message.text)
+        await message.answer(funnel_text, reply_markup=funnel_markup)
+    else:
+        log_analytics_event("request_failed", message.from_user.id, "personal_question", "ai_answer_invalid")
+        kb = kb_mama_menu() if user and user[0] == "mama" else kb_pregnant_menu() if user else kb_start()
+        await message.answer("Лимит не списан. Попробуй ещё раз немного позже.", reply_markup=kb)
 
 # ─── ПЕРВЫЕ ДНИ С МАЛЫШОМ ───────────────────────────────────
 @dp.callback_query(F.data == "mama_firstdays")
@@ -3652,23 +3711,23 @@ def channel_funnel_for_post(theme="", title="", body="", format_name=""):
 
     rules = [
         (("сон", "недосып", "засып", "пробуж"),
-         "🌙 Хотите увидеть картину сна именно вашего ребёнка? Отмечайте засыпания и пробуждения в помощнике.",
-         "🌙 Записать сон ребёнка"),
+         "🌙 Общие нормы не учитывают возраст и ваш режим. Получите бесплатный персональный разбор сна.",
+         "🌙 Разобрать сон ребёнка"),
         (("корм", "гв", "груд", "прикорм", "питан", "смесь"),
-         "🍼 Не держите в голове время и детали кормлений — сохраните их в помощнике.",
-         "🍼 Открыть дневник кормлений"),
+         "🥣 Получите рекомендацию по кормлению с учётом возраста и вашей ситуации.",
+         "🥣 Разобрать питание ребёнка"),
         (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"),
-         "🩺 Зафиксируйте наблюдения и подготовьте вопросы, чтобы на приёме ничего не забыть.",
-         "🩺 Подготовиться к врачу"),
+         "🩺 Опишите наблюдения — помощник бесплатно соберёт важное и подготовит вопросы врачу.",
+         "🩺 Подготовить вопросы врачу"),
         (("развит", "возраст", "игр", "заняти", "навык", "речь"),
-         "👶 Получите подсказку с учётом возраста именно вашего ребёнка.",
-         "👶 Что важно сегодня"),
+         "👶 Проверьте навык или поведение с учётом точного возраста ребёнка.",
+         "👶 Проверить развитие"),
         (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"),
-         "🤍 Когда всё накопилось, опишите ситуацию помощнику — он поможет спокойно разложить её по шагам.",
-         "🤍 Получить поддержку"),
+         "🤍 Опишите, что происходит. Первый персональный разбор поможет спокойно увидеть следующий шаг.",
+         "🤍 Разобрать мою ситуацию"),
         (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"),
-         "👨‍👩‍👧 Сохраните семейную ситуацию и получите спокойный план следующего разговора.",
-         "👨‍👩‍👧 Разобрать ситуацию"),
+         "👨‍👩‍👧 Опишите ситуацию и получите спокойный план следующего разговора.",
+         "👨‍👩‍👧 Подготовить разговор"),
         (("беремен", "род", "восстанов", "срок"),
          "🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
          "🤰 Открыть помощника"),
@@ -3717,14 +3776,14 @@ async def open_channel_destination_tg(message: Message, payload: str):
         return False
     mode = user[0]
     mapping = {
-        "channel_today": ("✨ Персональный план на сегодня", "today_brief"),
-        "channel_sleep": ("🌙 Сон и режим", "tracker_sleep" if mode == "mama" else "today_brief"),
-        "channel_feeding": ("🤱 Кормления и питание", "tracker_feeding" if mode == "mama" else "preg_baby"),
-        "channel_doctor": ("🩺 Подготовка к врачу", "doctor_prep" if mode == "mama" else "photo_menu"),
-        "channel_psycho": ("🧠 Поддержка для мамы", "psycho_start"),
-        "channel_pregnancy": ("🤰 Беременность", "preg_week" if mode == "pregnant" else "mama_recovery"),
-        "channel_child": ("👶 Развитие ребёнка", "mama_dev" if mode == "mama" else "preg_baby"),
-        "channel_family": ("👨‍👩‍👧 Семья", "mama_family" if mode == "mama" else "psycho_start"),
+        "channel_today": ("❓ Получить персональный ответ", "ask_question"),
+        "channel_sleep": ("🌙 Разобрать сон ребёнка", "funnel_sleep"),
+        "channel_feeding": ("🥣 Разобрать питание ребёнка", "funnel_feeding"),
+        "channel_doctor": ("🩺 Подготовить вопросы врачу", "funnel_doctor"),
+        "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
+        "channel_pregnancy": ("🤰 Задать вопрос по беременности", "funnel_pregnancy"),
+        "channel_child": ("👶 Проверить развитие", "funnel_development"),
+        "channel_family": ("👨‍👩‍👧 Подготовить разговор", "funnel_family"),
     }
     title, callback_data = mapping.get(payload, mapping["channel_today"])
     await message.answer(
