@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 from urllib.parse import quote
 
-APP_VERSION = "10.3.1-channel-images-fix"
+APP_VERSION = "10.4.1-aura-visuals"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -1115,84 +1115,178 @@ def ai_answer_success(answer):
     return bool(answer and answer != AI_FAILURE_MESSAGE)
 
 
+
 def channel_visual_subject(theme="", title="", body="", format_name=""):
     text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
     mapping = [
-        (("сон", "недосып", "засып", "пробуж"), "сон малыша, спокойный вечерний или дневной семейный ритм"),
-        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "кормление малыша или спокойный семейный момент за столом"),
-        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "заботливый семейный момент о здоровье ребёнка без медицинской драмы"),
-        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "мама или папа занимаются с ребёнком по возрасту"),
-        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "спокойная эмоциональная поддержка мамы в домашней обстановке"),
-        (("отношен", "муж", "пап", "семь", "партн", "близост", "бабуш"), "тёплая семейная сцена с мамой, папой и ребёнком"),
-        (("беремен", "род", "восстанов", "срок"), "беременность или мягкое восстановление мамы после родов"),
+        (("сон", "недосып", "засып", "пробуж"), "реальная домашняя сцена сна малыша или тихого укладывания"),
+        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "реальная сцена кормления малыша или семейного приёма пищи"),
+        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "реальная заботливая сцена наблюдения за самочувствием ребёнка дома, без медицинской драмы"),
+        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "мама или папа естественно играют и занимаются с ребёнком по возрасту"),
+        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "узнаваемая жизненная сцена усталой мамы и бережной поддержки рядом"),
+        (("отношен", "муж", "пап", "семь", "партн", "близост", "бабуш"), "естественная семейная сцена с мамой, папой и ребёнком без постановочного позирования"),
+        (("беремен", "род", "восстанов", "срок"), "реальная спокойная сцена беременности или восстановления мамы после родов"),
     ]
     for keywords, subject in mapping:
         if any(word in text for word in keywords):
             return subject
-    return "тёплая современная семейная сцена с мамой и ребёнком"
+    return "естественная современная семейная сцена с мамой и ребёнком"
 
 
-def build_channel_image_prompt(slot, theme, title, body, format_name):
+async def build_channel_visual_brief(slot, theme, title, body, format_name, attempt=1):
+    """Отдельно превращает смысл поста в конкретную жизненную сцену, а не в дизайн-карточку."""
     subject = channel_visual_subject(theme, title, body, format_name)
-    if slot == "morning":
-        scene = "Утренний lifestyle-кадр, мягкий естественный свет, спокойная поддерживающая атмосфера"
-    elif slot == "afternoon":
-        scene = "Чистый редакционный lifestyle-кадр, понятная практическая сцена, аккуратная композиция"
-    elif slot == "evening":
-        scene = "Тёплый эмоциональный вечерний кадр, ощущение семьи, поддержки и узнаваемой жизни"
-    else:
-        scene = "Тёплый редакционный кадр для семейного канала"
+    time_hint = (
+        "мягкий утренний естественный свет" if slot == "morning"
+        else "тёплый вечерний домашний свет"
+    )
+    retry_hint = (
+        "Это повторная попытка: сцена должна выглядеть ещё более фотографично и жизненно, "
+        "без пустого фона, графических элементов и любой типографики."
+        if attempt > 1 else ""
+    )
+    prompt = (
+        "Ты арт-директор премиального семейного медиа. По тексту поста составь один конкретный визуальный бриф "
+        "для реалистичной lifestyle-фотографии. Опиши только то, что должно быть видно в кадре: кто, где, что делает, "
+        "эмоция, свет, ракурс и детали среды. Никаких надписей, плакатов, карточек, рамок, логотипов, инфографики, "
+        "символов, абстрактных фонов и декоративного дизайна. Не предлагай текст на изображении. "
+        "Кадр должен выглядеть как дорогая редакционная фотография реальной семьи, снятая в естественный момент.\n\n"
+        f"Время кадра: {time_hint}.\n"
+        f"Базовый сюжет: {subject}.\n"
+        f"Тема: {theme}.\nЗаголовок: {title}.\nФормат: {format_name}.\n"
+        f"Содержание поста: {' '.join((body or '').split())[:1200]}\n"
+        f"{retry_hint}\n"
+        "Верни только краткий визуальный бриф на русском, 80–140 слов."
+    )
+    try:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Ты создаёшь только реалистичные фотосцены без текста и графического дизайна."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=350,
+            ),
+            timeout=35,
+        )
+        brief = clean_text(response.choices[0].message.content)
+        if brief:
+            return brief
+    except Exception as exc:
+        logging.warning("Канал: не удалось подготовить визуальный бриф: %s", exc)
+    return f"{subject}; {time_hint}; естественный бытовой момент, искренние эмоции, правдоподобная домашняя среда"
 
-    body_hint = " ".join((body or "").split())[:700]
+
+def build_channel_image_prompt(slot, theme, title, body, format_name, visual_brief, attempt=1):
+    retry = (
+        "Previous result was rejected because it looked like a poster, template, illustration, or contained text. "
+        "Make this retry unmistakably a candid real-life photograph with people and a believable environment. "
+        if attempt > 1 else ""
+    )
     return (
-        f"Создай вертикальное изображение 4:5 для Telegram-канала о материнстве, детях и семье. "
-        f"Изображение должно иллюстрировать именно содержание поста, а не быть абстрактной картинкой. "
-        f"Основной сюжет: {subject}. {scene}. "
-        f"Стиль: тёплая реалистичная editorial lifestyle photography, мягкая натуральная цветовая палитра, "
-        f"живые современные мама, папа, ребёнок или беременная женщина, уютный дом или спокойная семейная среда, "
-        f"естественный свет, правдоподобные эмоции, без постановочного глянца. "
-        f"Важно: не делай постер, открытку, инфографику, карточку или обложку. "
-        f"Никакого текста, надписей, букв, цифр, логотипов, водяных знаков, коллажа, рамок, стикеров, баннеров и типографики в кадре. "
-        f"Один цельный тёплый кадр, который визуально продолжает пост. "
-        f"Тема поста: {theme}. Заголовок: {title}. Суть поста: {body_hint}."
+        "Create a premium vertical 4:5 editorial lifestyle photograph for a family media channel. "
+        "It must look like a genuine photograph captured in a real moment, not a designed social-media card. "
+        f"Scene brief: {visual_brief}. "
+        f"{retry}"
+        "Use photorealistic people, natural anatomy, believable skin texture, authentic facial expressions, "
+        "realistic hands, subtle depth of field, natural household details, soft cinematic but credible lighting, "
+        "and a refined contemporary editorial composition. Avoid glossy advertising poses. "
+        "ABSOLUTELY NO TEXT, letters, words, numbers, logos, watermarks, captions, signs, posters, typography, "
+        "frames, borders, icons, stickers, charts, UI elements, collages, split layouts, abstract backgrounds, "
+        "graphic design, illustration, 3D render, greeting card, quote card, book cover, or infographic. "
+        "One single full-bleed photographic scene only."
     )
 
 
-async def generate_channel_image_bytes(slot, theme, title, body, format_name):
-    if not CHANNEL_VISUALS_ENABLED:
-        return None
-    prompt = build_channel_image_prompt(slot, theme, title, body, format_name)
+async def validate_channel_image(image_bytes, theme, title, body):
+    """Отбраковывает текстовые карточки, иллюстрации и нерелевантные изображения."""
+    if not image_bytes:
+        return False, "empty"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    criteria = (
+        "Проверь изображение для семейного канала. Ответь строго PASS или RETRY, затем короткая причина. "
+        "PASS только если это реалистичная цельная lifestyle-фотография с людьми или правдоподобной жизненной сценой, "
+        "она соответствует смыслу поста и не содержит текста, букв, цифр, логотипов, водяных знаков, постерной верстки, "
+        "рамок, карточек, инфографики, коллажа, иллюстрации или 3D-рендера. "
+        f"Тема: {theme}. Заголовок: {title}. Суть: {' '.join((body or '').split())[:500]}"
+    )
     try:
-        resp = await asyncio.wait_for(
-            client.images.generate(
-                model=OPENAI_IMAGE_MODEL,
-                prompt=prompt,
-                size=CHANNEL_IMAGE_SIZE,
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": criteria},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}", "detail": "low"}},
+                    ],
+                }],
+                max_tokens=80,
             ),
-            timeout=90,
+            timeout=45,
         )
-        image_data = resp.data[0]
-        b64_json = getattr(image_data, "b64_json", None)
-        image_url = getattr(image_data, "url", None)
-        if not b64_json and isinstance(image_data, dict):
-            b64_json = image_data.get("b64_json")
-            image_url = image_data.get("url")
-        if b64_json:
-            return base64.b64decode(b64_json)
-        if image_url:
-            import httpx
-            async with httpx.AsyncClient(timeout=60) as http_client:
-                r = await http_client.get(image_url)
-                if r.is_success:
-                    return r.content
-        logging.warning("Канал TG: OpenAI вернул изображение без b64_json/url")
+        verdict = clean_text(response.choices[0].message.content)
+        return verdict.upper().startswith("PASS"), verdict[:300]
+    except Exception as exc:
+        logging.warning("Канал: автопроверка изображения недоступна: %s", exc)
+        return False, f"validation_error:{type(exc).__name__}"
+
+
+async def _generate_channel_image_once(prompt):
+    resp = await asyncio.wait_for(
+        client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size=CHANNEL_IMAGE_SIZE,
+        ),
+        timeout=90,
+    )
+    image_data = resp.data[0]
+    b64_json = getattr(image_data, "b64_json", None)
+    image_url = getattr(image_data, "url", None)
+    if not b64_json and isinstance(image_data, dict):
+        b64_json = image_data.get("b64_json")
+        image_url = image_data.get("url")
+    if b64_json:
+        return base64.b64decode(b64_json)
+    if image_url:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as http_client:
+            response = await http_client.get(image_url)
+            if response.is_success:
+                return response.content
+    return None
+
+
+async def create_channel_visual(dt, rubric, title, post_text=""):
+    """Aura-эталон: создаёт настоящую AI-фотографию только для утреннего и вечернего поста."""
+    if isinstance(dt, str):
+        slot = dt if dt in {"morning", "evening"} else ""
+    else:
+        try:
+            hour = dt.hour
+            slot = "morning" if hour < 12 else "evening" if hour >= 17 else ""
+        except Exception:
+            slot = ""
+    if not CHANNEL_VISUALS_ENABLED or slot not in {"morning", "evening"}:
         return None
-    except asyncio.TimeoutError:
-        logging.error("Канал TG: генерация изображения превысила 90 секунд")
-        return None
-    except Exception as e:
-        logging.error(f"Канал TG: не удалось сгенерировать изображение: {e}")
-        return None
+
+    format_name = "premium_editorial_photo"
+    for attempt in (1, 2):
+        try:
+            visual_brief = await build_channel_visual_brief(slot, rubric, title, post_text, format_name, attempt)
+            prompt = build_channel_image_prompt(slot, rubric, title, post_text, format_name, visual_brief, attempt)
+            image_bytes = await _generate_channel_image_once(prompt)
+            accepted, reason = await validate_channel_image(image_bytes, rubric, title, post_text)
+            logging.info("Канал: проверка изображения slot=%s attempt=%s accepted=%s reason=%s", slot, attempt, accepted, reason)
+            if accepted:
+                return image_bytes
+        except asyncio.TimeoutError:
+            logging.error("Канал: генерация изображения превысила 90 секунд, попытка %s", attempt)
+        except Exception as exc:
+            logging.error("Канал: ошибка Aura-генерации изображения, попытка %s: %s", attempt, exc)
+    logging.warning("Канал: обе попытки изображения отклонены; пост будет опубликован без картинки")
+    return None
 
 
 def fit_telegram_caption(title, body, bridge_text, limit=1024):
@@ -3519,6 +3613,26 @@ async def reset_me_tg(message: Message, state: FSMContext):
     await message.answer("✅ Ваш профиль и тестовые данные сброшены. Нажмите /start для новой регистрации.")
 
 
+@dp.message(Command("test_channel_visual"))
+async def test_channel_visual_tg(message: Message):
+    """Безопасный тест: генерирует одну AI-картинку и отправляет только владельцу."""
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("Команда доступна только владельцу. Сначала задайте TG_OWNER_ID.")
+        return
+    await message.answer("🖼 Генерирую тестовую AI-картинку. Канал не затрагивается.")
+    image_path = await create_channel_visual(
+        "evening",
+        "Забота и поддержка мамы",
+        "Тихий вечер, когда мама наконец не одна",
+        "Мама сидит рядом со спящим малышом, папа приносит ей тёплый чай. Спокойный домашний интерьер, мягкий естественный свет, живая семейная сцена.",
+    )
+    if not image_path:
+        await message.answer("❌ Тестовая картинка не создана. Канал не затронут.")
+        return
+    photo = BufferedInputFile(image_path, filename=f"test_mama_visual_{uuid.uuid4().hex[:8]}.png")
+    await message.answer_photo(photo=photo, caption="✅ Безопасный тест AI-визуала. В канал не опубликовано.")
+
+
 @dp.message(Command("publish_channel_intro"))
 async def publish_channel_intro_tg(message: Message):
     if not OWNER_ID or message.from_user.id != OWNER_ID:
@@ -3856,7 +3970,10 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
 
     try:
         image_sent = False
-        image_bytes = await generate_channel_image_bytes(slot, theme, title, body, format_name)
+        image_bytes = None
+        if slot in {"morning", "evening"}:
+            image_path = await create_channel_visual(slot, theme, title, body)
+            image_bytes = image_path
         if image_bytes:
             caption = fit_telegram_caption(title, body, bridge_text)
             image_sent = await send_channel_image_tg(slot, caption, image_bytes, reply_markup)
