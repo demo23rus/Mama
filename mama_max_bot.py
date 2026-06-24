@@ -34,7 +34,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.4.4-webhook-dedup"
+APP_VERSION = "10.4.5-strict-dedup"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -3755,15 +3755,38 @@ async def startup():
     logging.info("Мамин Помощник MAX запущен!")
 
 
-# Защита MAX webhook от повторной доставки долгих событий.
+# Строгая защита MAX webhook от повторной доставки долгих событий.
+# MAX может менять timestamp при повторной доставке, поэтому timestamp не участвует
+# в резервном ключе. Дополнительно блокируется повтор одной команды пользователя.
 _WEBHOOK_SEEN = {}
-_WEBHOOK_DEDUP_TTL = 15 * 60
+_COMMAND_SEEN = {}
+_WEBHOOK_DEDUP_TTL = 30 * 60
+_COMMAND_DEDUP_TTL = 10 * 60
 
 
-def _cleanup_webhook_seen(now_ts):
-    expired = [key for key, ts in _WEBHOOK_SEEN.items() if now_ts - ts > _WEBHOOK_DEDUP_TTL]
+def _cleanup_seen(cache, now_ts, ttl):
+    expired = [key for key, ts in cache.items() if now_ts - ts > ttl]
     for key in expired:
-        _WEBHOOK_SEEN.pop(key, None)
+        cache.pop(key, None)
+
+
+def _extract_message_id(data):
+    message = data.get("message") or {}
+    body = message.get("body") or {}
+    callback = data.get("callback") or {}
+    candidates = [
+        message.get("message_id"),
+        message.get("id"),
+        body.get("mid"),
+        body.get("message_id"),
+        data.get("update_id"),
+        callback.get("callback_id"),
+        callback.get("id"),
+    ]
+    for value in candidates:
+        if value not in (None, ""):
+            return str(value)
+    return ""
 
 
 def _webhook_event_key(data):
@@ -3773,32 +3796,48 @@ def _webhook_event_key(data):
     callback = data.get("callback") or {}
     sender = message.get("sender") or {}
     recipient = message.get("recipient") or {}
-    stable_id = (
-        data.get("update_id") or data.get("timestamp") or
-        message.get("id") or message.get("message_id") or body.get("mid") or
-        callback.get("id") or callback.get("callback_id")
-    )
+
+    stable_id = _extract_message_id(data)
     if stable_id:
         return f"{update_type}:{stable_id}"
-    # Резервный ключ для форматов MAX без явного ID события.
+
+    # Важно: timestamp намеренно исключён — MAX меняет его при ретраях.
+    attachments = body.get("attachments") or []
+    attachment_fingerprint = ""
+    if attachments:
+        attachment_fingerprint = repr(attachments)[:2000]
     raw = "|".join([
         str(update_type),
         str(sender.get("user_id") or callback.get("user", {}).get("user_id") or ""),
         str(recipient.get("chat_id") or callback.get("chat_id") or ""),
-        str(body.get("text") or callback.get("payload") or ""),
-        str(message.get("timestamp") or data.get("timestamp") or ""),
+        str((body.get("text") or "").strip()),
+        str(callback.get("payload") or ""),
+        attachment_fingerprint,
     ])
     return f"fallback:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
 
 
 def _accept_webhook_once(data):
     now_ts = datetime.now().timestamp()
-    _cleanup_webhook_seen(now_ts)
+    _cleanup_seen(_WEBHOOK_SEEN, now_ts, _WEBHOOK_DEDUP_TTL)
     key = _webhook_event_key(data)
     if key in _WEBHOOK_SEEN:
         logging.warning("MAX webhook duplicate ignored: %s", key)
         return False
     _WEBHOOK_SEEN[key] = now_ts
+    return True
+
+
+def _accept_command_once(user_id, chat_id, text):
+    now_ts = datetime.now().timestamp()
+    _cleanup_seen(_COMMAND_SEEN, now_ts, _COMMAND_DEDUP_TTL)
+    normalized = " ".join((text or "").strip().lower().split())
+    key_raw = f"{user_id}|{chat_id}|{normalized}"
+    key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()
+    if key in _COMMAND_SEEN:
+        logging.warning("MAX repeated command ignored: user=%s text=%s", user_id, normalized[:80])
+        return False
+    _COMMAND_SEEN[key] = now_ts
     return True
 
 
@@ -3924,6 +3963,8 @@ async def webhook(request: Request):
                             return JSONResponse({"ok": True})
 
             if text:
+                if not _accept_command_once(user_id, chat_id, text):
+                    return JSONResponse({"ok": True})
                 _run_webhook_task(
                     process_command(chat_id, user_id, text, username, first_name),
                     f"command:{user_id}:{text[:40]}",
