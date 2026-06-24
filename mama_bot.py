@@ -13,12 +13,14 @@ from openai import AsyncOpenAI
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import uuid
 import base64
+import hashlib
+import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 from urllib.parse import quote
 
-APP_VERSION = "10.4.1-aura-visuals"
+APP_VERSION = "10.4.3-visual-variety"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -1133,16 +1135,153 @@ def channel_visual_subject(theme="", title="", body="", format_name=""):
     return "естественная современная семейная сцена с мамой и ребёнком"
 
 
+VISUAL_SHOT_OPTIONS = [
+    "крупный эмоциональный план с акцентом на лица и жесты",
+    "средний семейный план с живым взаимодействием в кадре",
+    "общий план комнаты с заметной домашней средой и действием",
+    "репортажный кадр немного сбоку, как будто момент пойман случайно",
+    "полуверхний ракурс с ощущением спокойной бытовой жизни",
+    "естественный кадр на уровне глаз ребёнка или мамы",
+]
+
+VISUAL_ROOM_OPTIONS = [
+    "светлая спальня или детская с мягкими домашними деталями",
+    "уютная кухня или столовая зона без постановочного декора",
+    "гостиная с пледом, креслом, диваном и реальной семейной атмосферой",
+    "спокойный уголок у окна с естественным светом и воздухом",
+    "домашний интерьер с кроваткой, игрушками и аккуратным lived-in feel",
+    "небольшая современная квартира с мягким минималистичным интерьером",
+]
+
+VISUAL_MOOD_OPTIONS = [
+    "спокойная забота и эмоциональная близость",
+    "тёплая поддержка и ощущение неидеальной, но живой семьи",
+    "мягкое умиротворение без искусственной улыбчивости",
+    "нежный бытовой реализм с узнаваемой жизненной правдой",
+    "бережная усталость и тепло дома",
+    "ощущение доверия, безопасности и домашней поддержки",
+]
+
+VISUAL_DETAIL_OPTIONS = [
+    "в кадре заметны натуральные бытовые детали: чашка, плед, игрушки, книга или детские вещи",
+    "в кадре ощущается жилая среда: немного вещей, текстиль, кроватка, подушка или мягкий беспорядок",
+    "детали окружения должны поддерживать сюжет, но не перегружать сцену",
+    "добавь одну-две реалистичные семейные детали, которые делают сцену живой и узнаваемой",
+    "интерьер должен выглядеть современно и спокойно, без рекламной вылизанности",
+]
+
+VISUAL_ACTION_OPTIONS = {
+    "sleep": [
+        "мама мягко укладывает малыша, поправляет одеяло или сидит рядом с кроваткой",
+        "родитель держит сонного малыша на руках в тихом домашнем моменте",
+        "мама сидит рядом во время спокойного засыпания или ночного пробуждения",
+    ],
+    "feeding": [
+        "мама кормит малыша грудью или из бутылочки в естественной домашней позе",
+        "родители организуют спокойный семейный приём пищи или прикорм малыша",
+        "мама заботливо кормит ребёнка, а малыш взаимодействует естественно и живо",
+    ],
+    "health": [
+        "мама внимательно наблюдает за состоянием ребёнка дома без драматизации",
+        "родитель успокаивает малыша и проверяет его самочувствие в спокойной обстановке",
+        "семейная сцена домашней заботы: объятие, наблюдение, термометр или плед без акцента на болезни",
+    ],
+    "development": [
+        "мама или папа играют с ребёнком по возрасту, вовлечённо и естественно",
+        "семья вместе занимается простой домашней активностью или развивающей игрой",
+        "родитель показывает ребёнку книгу, игрушку или сенсорную игру в тёплом домашнем моменте",
+    ],
+    "emotions": [
+        "уставшая мама получает мягкую поддержку от близкого человека или отдыхает рядом с ребёнком",
+        "мама и ребёнок переживают тихий эмоциональный момент поддержки и близости",
+        "семейная сцена, где читается усталость, но есть тепло, участие и забота",
+    ],
+    "family": [
+        "мама, папа и ребёнок взаимодействуют естественно, как живая семья, без позирования",
+        "семейная сцена разговора, объятия или совместного простого действия дома",
+        "домашний момент участия отца: он рядом, помогает, держит ребёнка или поддерживает маму",
+    ],
+    "pregnancy": [
+        "беременная женщина спокойно находится дома, касается живота или отдыхает в мягком свете",
+        "пара проживает тёплый момент беременности в уютном домашнем интерьере",
+        "реальная сцена заботы о беременной женщине без глянцевой постановки",
+    ],
+    "default": [
+        "естественный семейный момент с мамой и ребёнком в домашнем интерьере",
+        "тёплая бытовая сцена заботы и близости между взрослым и ребёнком",
+        "редакционный lifestyle-кадр живой семьи в спокойной домашней среде",
+    ],
+}
+
+
+def _channel_visual_category(theme="", title="", body="", format_name=""):
+    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+    checks = [
+        (("сон", "засып", "пробуж", "уклады"), "sleep"),
+        (("корм", "гв", "прикорм", "смесь", "питан"), "feeding"),
+        (("врач", "симптом", "здоров", "температ", "сып", "педиатр", "лекар"), "health"),
+        (("развит", "игр", "заняти", "навык", "речь", "книг"), "development"),
+        (("эмоц", "истер", "каприз", "устал", "тревог", "вина", "выгор", "психолог"), "emotions"),
+        (("отношен", "семь", "муж", "пап", "партн", "близост"), "family"),
+        (("беремен", "род", "восстанов", "срок"), "pregnancy"),
+    ]
+    for words, cat in checks:
+        if any(word in text for word in words):
+            return cat
+    return "default"
+
+
+
+def build_channel_visual_variation(slot, theme, title, body, format_name, attempt=1):
+    seed = f"{slot}|{theme}|{title}|{' '.join((body or '').split())[:800]}|{format_name}|{attempt}"
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    indexes = [int(digest[i:i+4], 16) for i in range(0, 24, 4)]
+    category = _channel_visual_category(theme, title, body, format_name)
+    shot = VISUAL_SHOT_OPTIONS[indexes[0] % len(VISUAL_SHOT_OPTIONS)]
+    room = VISUAL_ROOM_OPTIONS[indexes[1] % len(VISUAL_ROOM_OPTIONS)]
+    mood = VISUAL_MOOD_OPTIONS[indexes[2] % len(VISUAL_MOOD_OPTIONS)]
+    detail = VISUAL_DETAIL_OPTIONS[indexes[3] % len(VISUAL_DETAIL_OPTIONS)]
+    action_pool = VISUAL_ACTION_OPTIONS.get(category, VISUAL_ACTION_OPTIONS["default"])
+    action = action_pool[indexes[4] % len(action_pool)]
+    if category == "pregnancy":
+        cast = [
+            "в кадре беременная женщина или беременная пара",
+            "в кадре одна беременная женщина без лишних персонажей",
+            "в кадре беременная женщина и поддерживающий партнёр",
+        ][indexes[5] % 3]
+    elif category == "family":
+        cast = [
+            "в кадре мама, папа и ребёнок",
+            "в кадре отец помогает маме и взаимодействует с ребёнком",
+            "в кадре семья из трёх человек в естественном домашнем моменте",
+        ][indexes[5] % 3]
+    else:
+        cast = [
+            "в кадре мама и ребёнок",
+            "в кадре мама с малышом, а при необходимости рядом папа",
+            "в кадре один взрослый и ребёнок в живом семейном моменте",
+        ][indexes[5] % 3]
+    lighting = "мягкий утренний естественный свет" if slot == "morning" else "тёплый вечерний домашний свет"
+    return {
+        "category": category,
+        "shot": shot,
+        "room": room,
+        "mood": mood,
+        "detail": detail,
+        "action": action,
+        "cast": cast,
+        "lighting": lighting,
+        "signature": f"{category}|{shot}|{room}|{action}|{cast}",
+    }
+
+
 async def build_channel_visual_brief(slot, theme, title, body, format_name, attempt=1):
-    """Отдельно превращает смысл поста в конкретную жизненную сцену, а не в дизайн-карточку."""
+    """Отдельно превращает смысл поста в конкретную жизненную сцену и задаёт вариативность кадра."""
     subject = channel_visual_subject(theme, title, body, format_name)
-    time_hint = (
-        "мягкий утренний естественный свет" if slot == "morning"
-        else "тёплый вечерний домашний свет"
-    )
+    variation = build_channel_visual_variation(slot, theme, title, body, format_name, attempt)
     retry_hint = (
-        "Это повторная попытка: сцена должна выглядеть ещё более фотографично и жизненно, "
-        "без пустого фона, графических элементов и любой типографики."
+        "Это повторная попытка: сцена должна быть заметно другой по композиции и действию, чем первая, "
+        "но всё ещё реалистичной и без графического дизайна."
         if attempt > 1 else ""
     )
     prompt = (
@@ -1150,13 +1289,15 @@ async def build_channel_visual_brief(slot, theme, title, body, format_name, atte
         "для реалистичной lifestyle-фотографии. Опиши только то, что должно быть видно в кадре: кто, где, что делает, "
         "эмоция, свет, ракурс и детали среды. Никаких надписей, плакатов, карточек, рамок, логотипов, инфографики, "
         "символов, абстрактных фонов и декоративного дизайна. Не предлагай текст на изображении. "
-        "Кадр должен выглядеть как дорогая редакционная фотография реальной семьи, снятая в естественный момент.\n\n"
-        f"Время кадра: {time_hint}.\n"
+        "Кадр должен выглядеть как дорогая редакционная фотография реальной семьи, снятая в естественный момент. "
+        "Избегай повторяющейся сцены: опирайся на указанный профиль вариативности.\n\n"
         f"Базовый сюжет: {subject}.\n"
         f"Тема: {theme}.\nЗаголовок: {title}.\nФормат: {format_name}.\n"
         f"Содержание поста: {' '.join((body or '').split())[:1200]}\n"
+        f"Профиль вариативности: {variation['cast']}; {variation['action']}; {variation['room']}; "
+        f"{variation['shot']}; настроение — {variation['mood']}; свет — {variation['lighting']}; {variation['detail']}.\n"
         f"{retry_hint}\n"
-        "Верни только краткий визуальный бриф на русском, 80–140 слов."
+        "Верни только краткий визуальный бриф на русском, 90–160 слов."
     )
     try:
         response = await asyncio.wait_for(
@@ -1166,32 +1307,43 @@ async def build_channel_visual_brief(slot, theme, title, body, format_name, atte
                     {"role": "system", "content": "Ты создаёшь только реалистичные фотосцены без текста и графического дизайна."},
                     {"role": "user", "content": prompt},
                 ],
-                max_tokens=350,
+                max_tokens=400,
             ),
             timeout=35,
         )
         brief = clean_text(response.choices[0].message.content)
         if brief:
-            return brief
+            return brief, variation
     except Exception as exc:
         logging.warning("Канал: не удалось подготовить визуальный бриф: %s", exc)
-    return f"{subject}; {time_hint}; естественный бытовой момент, искренние эмоции, правдоподобная домашняя среда"
+    fallback = (
+        f"{subject}; {variation['cast']}; {variation['action']}; {variation['room']}; "
+        f"{variation['shot']}; {variation['lighting']}; настроение: {variation['mood']}."
+    )
+    return fallback, variation
 
 
-def build_channel_image_prompt(slot, theme, title, body, format_name, visual_brief, attempt=1):
+def build_channel_image_prompt(slot, theme, title, body, format_name, visual_brief, variation, attempt=1):
     retry = (
-        "Previous result was rejected because it looked like a poster, template, illustration, or contained text. "
-        "Make this retry unmistakably a candid real-life photograph with people and a believable environment. "
+        "Previous result was rejected because it looked repetitive, poster-like, templated, illustrated, or contained text. "
+        "Make this retry clearly different in shot composition and action while keeping the same post meaning. "
         if attempt > 1 else ""
+    )
+    diversity = (
+        f"Required variation profile: {variation['cast']}; {variation['action']}; {variation['room']}; "
+        f"{variation['shot']}; mood: {variation['mood']}; lighting: {variation['lighting']}; {variation['detail']}. "
+        "Do not default to the same generic mother-and-baby portrait unless it truly fits this profile. "
+        "Make the scene feel distinct from other family-channel images by varying framing, room, action, and who is present. "
     )
     return (
         "Create a premium vertical 4:5 editorial lifestyle photograph for a family media channel. "
         "It must look like a genuine photograph captured in a real moment, not a designed social-media card. "
         f"Scene brief: {visual_brief}. "
+        f"{diversity}"
         f"{retry}"
         "Use photorealistic people, natural anatomy, believable skin texture, authentic facial expressions, "
         "realistic hands, subtle depth of field, natural household details, soft cinematic but credible lighting, "
-        "and a refined contemporary editorial composition. Avoid glossy advertising poses. "
+        "and a refined contemporary editorial composition. Avoid glossy advertising poses and avoid repeating the same default setup. "
         "ABSOLUTELY NO TEXT, letters, words, numbers, logos, watermarks, captions, signs, posters, typography, "
         "frames, borders, icons, stickers, charts, UI elements, collages, split layouts, abstract backgrounds, "
         "graphic design, illustration, 3D render, greeting card, quote card, book cover, or infographic. "
@@ -1274,11 +1426,14 @@ async def create_channel_visual(dt, rubric, title, post_text=""):
     format_name = "premium_editorial_photo"
     for attempt in (1, 2):
         try:
-            visual_brief = await build_channel_visual_brief(slot, rubric, title, post_text, format_name, attempt)
-            prompt = build_channel_image_prompt(slot, rubric, title, post_text, format_name, visual_brief, attempt)
+            visual_brief, variation = await build_channel_visual_brief(slot, rubric, title, post_text, format_name, attempt)
+            prompt = build_channel_image_prompt(slot, rubric, title, post_text, format_name, visual_brief, variation, attempt)
             image_bytes = await _generate_channel_image_once(prompt)
             accepted, reason = await validate_channel_image(image_bytes, rubric, title, post_text)
-            logging.info("Канал: проверка изображения slot=%s attempt=%s accepted=%s reason=%s", slot, attempt, accepted, reason)
+            logging.info(
+                "Канал: проверка изображения slot=%s attempt=%s accepted=%s reason=%s variation=%s",
+                slot, attempt, accepted, reason, variation.get("signature"),
+            )
             if accepted:
                 return image_bytes
         except asyncio.TimeoutError:
