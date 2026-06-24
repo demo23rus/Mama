@@ -34,7 +34,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.4.3-visual-variety"
+APP_VERSION = "10.4.4-webhook-dedup"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -3754,11 +3754,74 @@ async def startup():
     asyncio.create_task(channel_posting_loop())
     logging.info("Мамин Помощник MAX запущен!")
 
+
+# Защита MAX webhook от повторной доставки долгих событий.
+_WEBHOOK_SEEN = {}
+_WEBHOOK_DEDUP_TTL = 15 * 60
+
+
+def _cleanup_webhook_seen(now_ts):
+    expired = [key for key, ts in _WEBHOOK_SEEN.items() if now_ts - ts > _WEBHOOK_DEDUP_TTL]
+    for key in expired:
+        _WEBHOOK_SEEN.pop(key, None)
+
+
+def _webhook_event_key(data):
+    update_type = data.get("update_type", "")
+    message = data.get("message") or {}
+    body = message.get("body") or {}
+    callback = data.get("callback") or {}
+    sender = message.get("sender") or {}
+    recipient = message.get("recipient") or {}
+    stable_id = (
+        data.get("update_id") or data.get("timestamp") or
+        message.get("id") or message.get("message_id") or body.get("mid") or
+        callback.get("id") or callback.get("callback_id")
+    )
+    if stable_id:
+        return f"{update_type}:{stable_id}"
+    # Резервный ключ для форматов MAX без явного ID события.
+    raw = "|".join([
+        str(update_type),
+        str(sender.get("user_id") or callback.get("user", {}).get("user_id") or ""),
+        str(recipient.get("chat_id") or callback.get("chat_id") or ""),
+        str(body.get("text") or callback.get("payload") or ""),
+        str(message.get("timestamp") or data.get("timestamp") or ""),
+    ])
+    return f"fallback:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+
+
+def _accept_webhook_once(data):
+    now_ts = datetime.now().timestamp()
+    _cleanup_webhook_seen(now_ts)
+    key = _webhook_event_key(data)
+    if key in _WEBHOOK_SEEN:
+        logging.warning("MAX webhook duplicate ignored: %s", key)
+        return False
+    _WEBHOOK_SEEN[key] = now_ts
+    return True
+
+
+def _run_webhook_task(coro, label):
+    task = asyncio.create_task(coro)
+    def _done(fut):
+        try:
+            fut.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logging.exception("MAX background task failed [%s]: %s", label, exc)
+    task.add_done_callback(_done)
+    return task
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
         logging.info(f"MAX webhook: {data}")
+
+        if not _accept_webhook_once(data):
+            return JSONResponse({"ok": True})
 
         update_type = data.get("update_type", "")
         message = data.get("message", {})
@@ -3846,16 +3909,25 @@ async def webhook(request: Request):
                         )
                         logging.info(f"Фото payload: {payload_data}")
                         if photo_url:
-                            await process_photo(chat_id, user_id, photo_url)
+                            _run_webhook_task(
+                                process_photo(chat_id, user_id, photo_url),
+                                f"photo:{user_id}",
+                            )
                             return JSONResponse({"ok": True})
                     elif att.get("type") in ("audio", "voice"):
                         audio_url = att.get("payload", {}).get("url")
                         if audio_url:
-                            await process_voice(chat_id, user_id, audio_url, first_name)
+                            _run_webhook_task(
+                                process_voice(chat_id, user_id, audio_url, first_name),
+                                f"voice:{user_id}",
+                            )
                             return JSONResponse({"ok": True})
 
             if text:
-                await process_command(chat_id, user_id, text, username, first_name)
+                _run_webhook_task(
+                    process_command(chat_id, user_id, text, username, first_name),
+                    f"command:{user_id}:{text[:40]}",
+                )
 
         elif update_type == "message_callback":
             user = callback.get("user", {})
@@ -3870,7 +3942,10 @@ async def webhook(request: Request):
             payload_cb = callback.get("payload", "")
             logging.info(f"CALLBACK: chat_id={chat_id} user_id={user_id} payload={payload_cb}")
             if chat_id and payload_cb:
-                await process_callback(chat_id, user_id, payload_cb, first_name)
+                _run_webhook_task(
+                    process_callback(chat_id, user_id, payload_cb, first_name),
+                    f"callback:{user_id}:{payload_cb[:40]}",
+                )
             else:
                 logging.error(f"Нет chat_id в callback: {data}")
 
