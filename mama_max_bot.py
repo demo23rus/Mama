@@ -33,7 +33,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.4.1-aura-visuals"
+APP_VERSION = "10.4.2-max-upload-fix"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -1370,15 +1370,41 @@ async def upload_channel_image_to_max(image_bytes, filename="channel.png"):
             if not upload_resp.is_success:
                 logging.error("MAX image upload error %s %s", upload_resp.status_code, upload_resp.text[:300])
                 return None
-            payload = upload_resp.json()
-            token = payload.get("token")
+            try:
+                payload = upload_resp.json()
+            except ValueError:
+                logging.error("MAX image upload: ответ не JSON: %s", upload_resp.text[:500])
+                return None
+
+            # Рабочий формат MAX: токен изображения находится внутри объекта photos.
+            token = payload.get("token") if isinstance(payload, dict) else None
+            if not token and isinstance(payload, dict):
+                photos = payload.get("photos")
+                if isinstance(photos, dict):
+                    for photo_data in photos.values():
+                        if isinstance(photo_data, dict) and photo_data.get("token"):
+                            token = photo_data["token"]
+                            break
+                elif isinstance(photos, list):
+                    for photo_data in photos:
+                        if isinstance(photo_data, dict) and photo_data.get("token"):
+                            token = photo_data["token"]
+                            break
+
+            # Дополнительная совместимость с альтернативными ответами MAX.
+            if not token and isinstance(payload, dict):
+                for key in ("photo", "image", "attachment"):
+                    item = payload.get(key)
+                    if isinstance(item, dict) and item.get("token"):
+                        token = item["token"]
+                        break
+
             if not token:
-                try:
-                    token = parse_qs(urlparse(upload_url).query).get("token", [None])[0]
-                except Exception:
-                    token = None
-            if not token:
-                logging.error("MAX image upload: не удалось получить token")
+                logging.error(
+                    "MAX image upload: token не найден; keys=%s response=%s",
+                    list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+                    str(payload)[:800],
+                )
                 return None
             return {"token": token}
     except Exception as exc:
