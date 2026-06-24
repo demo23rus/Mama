@@ -18,7 +18,7 @@ from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 from urllib.parse import quote
 
-APP_VERSION = "10.1-referral"
+APP_VERSION = "10.3.1-channel-images-fix"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -1143,13 +1143,18 @@ def build_channel_image_prompt(slot, theme, title, body, format_name):
     else:
         scene = "Тёплый редакционный кадр для семейного канала"
 
+    body_hint = " ".join((body or "").split())[:700]
     return (
-        f"Создай вертикальное изображение для семейного канала о материнстве и детях. "
-        f"Сюжет: {subject}. {scene}. "
-        f"Стиль: реалистичная современная editorial lifestyle photography, мягкие нейтральные цвета, "
-        f"естественные люди, доверительная атмосфера, без глянцевой искусственности. "
-        f"Без текста, без логотипов, без водяных знаков, без коллажа. "
-        f"Тема поста для ориентира: {theme}. Заголовок: {title}."
+        f"Создай вертикальное изображение 4:5 для Telegram-канала о материнстве, детях и семье. "
+        f"Изображение должно иллюстрировать именно содержание поста, а не быть абстрактной картинкой. "
+        f"Основной сюжет: {subject}. {scene}. "
+        f"Стиль: тёплая реалистичная editorial lifestyle photography, мягкая натуральная цветовая палитра, "
+        f"живые современные мама, папа, ребёнок или беременная женщина, уютный дом или спокойная семейная среда, "
+        f"естественный свет, правдоподобные эмоции, без постановочного глянца. "
+        f"Важно: не делай постер, открытку, инфографику, карточку или обложку. "
+        f"Никакого текста, надписей, букв, цифр, логотипов, водяных знаков, коллажа, рамок, стикеров, баннеров и типографики в кадре. "
+        f"Один цельный тёплый кадр, который визуально продолжает пост. "
+        f"Тема поста: {theme}. Заголовок: {title}. Суть поста: {body_hint}."
     )
 
 
@@ -1158,10 +1163,13 @@ async def generate_channel_image_bytes(slot, theme, title, body, format_name):
         return None
     prompt = build_channel_image_prompt(slot, theme, title, body, format_name)
     try:
-        resp = await client.images.generate(
-            model=OPENAI_IMAGE_MODEL,
-            prompt=prompt,
-            size=CHANNEL_IMAGE_SIZE,
+        resp = await asyncio.wait_for(
+            client.images.generate(
+                model=OPENAI_IMAGE_MODEL,
+                prompt=prompt,
+                size=CHANNEL_IMAGE_SIZE,
+            ),
+            timeout=90,
         )
         image_data = resp.data[0]
         b64_json = getattr(image_data, "b64_json", None)
@@ -1179,18 +1187,44 @@ async def generate_channel_image_bytes(slot, theme, title, body, format_name):
                     return r.content
         logging.warning("Канал TG: OpenAI вернул изображение без b64_json/url")
         return None
+    except asyncio.TimeoutError:
+        logging.error("Канал TG: генерация изображения превысила 90 секунд")
+        return None
     except Exception as e:
         logging.error(f"Канал TG: не удалось сгенерировать изображение: {e}")
         return None
 
 
-async def send_channel_image_tg(slot, title, image_bytes):
+def fit_telegram_caption(title, body, bridge_text, limit=1024):
+    title = (title or "").strip()
+    body = (body or "").strip()
+    bridge_text = (bridge_text or "").strip()
+    fixed = f"{title}\n\n{{body}}\n\n{bridge_text}".strip()
+    available = limit - len(fixed.format(body=""))
+    if available <= 0:
+        return f"{title}\n\n{bridge_text}"[:limit].rstrip()
+    if len(body) > available:
+        trimmed = body[:available].rstrip()
+        sentence_end = max(trimmed.rfind(". "), trimmed.rfind("! "), trimmed.rfind("? "))
+        if sentence_end >= int(available * 0.55):
+            trimmed = trimmed[:sentence_end + 1]
+        else:
+            trimmed = trimmed.rstrip(" ,;:-") + "…"
+        body = trimmed
+    return f"{title}\n\n{body}\n\n{bridge_text}".strip()[:limit]
+
+
+async def send_channel_image_tg(slot, caption, image_bytes, reply_markup):
     if not image_bytes:
         return False
     try:
         photo = BufferedInputFile(image_bytes, filename=f"channel_{slot}_{uuid.uuid4().hex[:8]}.png")
-        caption = (title or "").strip()[:1024] or None
-        await bot.send_photo(CHANNEL_ID, photo=photo, caption=caption)
+        await bot.send_photo(
+            CHANNEL_ID,
+            photo=photo,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
         return True
     except Exception as e:
         logging.error(f"Канал TG: ошибка отправки изображения: {e}")
@@ -3574,6 +3608,17 @@ def save_channel_post(slot, theme, format_name, title, text):
     conn.close()
 
 
+def channel_slot_published_today(slot):
+    conn = db_connect()
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    row = conn.execute(
+        "SELECT 1 FROM channel_posts WHERE slot=? AND created_at>=? ORDER BY id DESC LIMIT 1",
+        (slot, start),
+    ).fetchone()
+    conn.close()
+    return bool(row)
+
+
 def get_recent_channel_posts(limit=40):
     conn = db_connect()
     rows = conn.execute(
@@ -3799,25 +3844,31 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     if not title or not body:
         logging.warning(f"Канал: публикация {slot} пропущена — не удалось получить уникальный текст")
         return
+    if channel_slot_published_today(slot):
+        logging.info(f"Канал: публикация {slot} уже выходила сегодня, повтор пропущен")
+        return
 
     bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
     final_button_text = button_text or thematic_button
     start_payload = channel_start_payload(theme, title, body, format_name)
     final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
+    reply_markup = channel_post_markup(final_button_text, start_payload)
 
     try:
-        if slot == "afternoon":
-            image_bytes = await generate_channel_image_bytes(slot, theme, title, body, format_name)
-            if image_bytes:
-                await send_channel_image_tg(slot, title, image_bytes)
-        await bot.send_message(
-            CHANNEL_ID,
-            final_text,
-            reply_markup=channel_post_markup(final_button_text, start_payload),
-            disable_web_page_preview=True,
-        )
+        image_sent = False
+        image_bytes = await generate_channel_image_bytes(slot, theme, title, body, format_name)
+        if image_bytes:
+            caption = fit_telegram_caption(title, body, bridge_text)
+            image_sent = await send_channel_image_tg(slot, caption, image_bytes, reply_markup)
+        if not image_sent:
+            await bot.send_message(
+                CHANNEL_ID,
+                final_text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
         save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={final_button_text} | start={start_payload}")
+        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={final_button_text} | start={start_payload} | image={'yes' if image_sent else 'no'}")
     except Exception as e:
         logging.error(f"Канал: ошибка публикации {slot}: {e}")
 
@@ -3854,6 +3905,9 @@ async def post_afternoon():
 
 
 async def post_evening_poll():
+    if channel_slot_published_today("evening_poll"):
+        logging.info("Канал: вечерний опрос уже публиковался сегодня, повтор пропущен")
+        return
     today = datetime.now()
     polls = {
         2: (

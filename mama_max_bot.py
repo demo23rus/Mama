@@ -33,7 +33,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.1-referral"
+APP_VERSION = "10.3.1-channel-images-fix"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -1206,13 +1206,16 @@ def build_channel_image_prompt(slot, theme, title, body, format_name):
     else:
         scene = "Тёплый редакционный кадр для семейного канала"
 
+    body_hint = " ".join((body or "").split())[:700]
     return (
-        f"Создай вертикальное изображение для семейного канала о материнстве и детях. "
-        f"Сюжет: {subject}. {scene}. "
-        f"Стиль: реалистичная современная editorial lifestyle photography, мягкие нейтральные цвета, "
-        f"естественные люди, доверительная атмосфера, без глянцевой искусственности. "
-        f"Без текста, без логотипов, без водяных знаков, без коллажа. "
-        f"Тема поста для ориентира: {theme}. Заголовок: {title}."
+        f"Создай вертикальное изображение 4:5 для семейного канала о материнстве, детях и семье. "
+        f"Изображение должно иллюстрировать именно содержание поста, а не быть абстрактной картинкой. "
+        f"Основной сюжет: {subject}. {scene}. "
+        f"Стиль: тёплая реалистичная editorial lifestyle photography, мягкая натуральная палитра, живые современные мама, папа, ребёнок или беременная женщина, уютная домашняя среда, естественный свет, правдоподобные эмоции. "
+        f"Не делай постер, открытку, карточку, инфографику или изображение с текстом. "
+        f"Никаких надписей, букв, цифр, логотипов, водяных знаков, стикеров, рамок, коллажей или типографики в кадре. "
+        f"Один цельный тёплый кадр, который визуально продолжает пост. "
+        f"Тема поста: {theme}. Заголовок: {title}. Суть поста: {body_hint}."
     )
 
 
@@ -1221,10 +1224,13 @@ async def generate_channel_image_bytes(slot, theme, title, body, format_name):
         return None
     prompt = build_channel_image_prompt(slot, theme, title, body, format_name)
     try:
-        resp = await openai_client.images.generate(
-            model=OPENAI_IMAGE_MODEL,
-            prompt=prompt,
-            size=CHANNEL_IMAGE_SIZE,
+        resp = await asyncio.wait_for(
+            openai_client.images.generate(
+                model=OPENAI_IMAGE_MODEL,
+                prompt=prompt,
+                size=CHANNEL_IMAGE_SIZE,
+            ),
+            timeout=90,
         )
         image_data = resp.data[0]
         b64_json = getattr(image_data, "b64_json", None)
@@ -1240,6 +1246,9 @@ async def generate_channel_image_bytes(slot, theme, title, body, format_name):
                 if r.is_success:
                     return r.content
         logging.warning("Канал MAX: OpenAI вернул изображение без b64_json/url")
+        return None
+    except asyncio.TimeoutError:
+        logging.error("Канал MAX: генерация изображения превысила 90 секунд")
         return None
     except Exception as exc:
         logging.error("Канал MAX: не удалось сгенерировать изображение: %s", exc)
@@ -3002,6 +3011,16 @@ def save_channel_post(slot, theme, format_name, title, text):
         )
 
 
+def channel_slot_published_today(slot):
+    start = datetime.now(ZoneInfo("Europe/Moscow")).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM channel_posts WHERE slot=? AND created_at>=? ORDER BY id DESC LIMIT 1",
+            (slot, start),
+        ).fetchone()
+    return bool(row)
+
+
 def get_recent_channel_posts(limit=40):
     conn = db_connect()
     rows = conn.execute(
@@ -3286,6 +3305,9 @@ async def post_afternoon():
 
 
 async def post_evening_poll():
+    if channel_slot_published_today("evening_poll"):
+        logging.info("Канал: вечерний опрос уже публиковался сегодня, повтор пропущен")
+        return
     today = datetime.now(ZoneInfo("Europe/Moscow"))
     polls = {
         2: ("health", "Что сейчас тревожит вас сильнее всего?", [
