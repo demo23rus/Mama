@@ -34,7 +34,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.4.8-no-repeat-visuals"
+APP_VERSION = "10.4.9-channel-image-fix"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -1749,6 +1749,12 @@ def claim_persistent_command_lock(lock_key, ttl_seconds=86400):
             (lock_key, now.isoformat()),
         )
         return True
+
+
+def release_persistent_command_lock(lock_key):
+    """Снимает временную блокировку, если публикация не состоялась."""
+    with db_connect() as conn:
+        conn.execute("DELETE FROM command_locks WHERE lock_key=?", (lock_key,))
 
 
 async def process_command(chat_id, user_id, text, username="", first_name=""):
@@ -3614,15 +3620,20 @@ def _scheduled_slot_window_ok(slot, tolerance_seconds=120):
     return True
 
 
-def _claim_visual_generation_once(slot):
-    """Не допускает повторную генерацию изображения для одного слота и даты, даже после рестарта."""
+def _channel_publish_lock_key(slot):
+    """Одна публикация на слот и дату; блокирует дубли всего поста, а не генерацию картинки отдельно."""
     today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
-    return claim_persistent_command_lock(f"max_channel_visual:{today}:{slot}", ttl_seconds=3 * 86400)
+    return f"max_channel_publish:{today}:{slot}"
 
 
 async def publish_channel_post(slot, theme, format_name, title, body, with_button=True, button_text=None):
     if not title or not body:
         logging.warning("Канал: публикация %s пропущена — не удалось получить уникальный текст", slot)
+        return
+
+    publish_lock = _channel_publish_lock_key(slot)
+    if not claim_persistent_command_lock(publish_lock, ttl_seconds=3 * 86400):
+        logging.warning("Канал: повторная публикация полностью заблокирована slot=%s", slot)
         return
 
     bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
@@ -3631,17 +3642,36 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
 
     image_payload = None
-    if slot in {"morning", "evening"}:
-        if _claim_visual_generation_once(slot):
-            logging.info("Канал: разрешена единственная генерация изображения source=scheduler slot=%s", slot)
+    try:
+        if slot in {"morning", "evening"}:
+            logging.info("Канал: старт генерации изображения source=scheduler slot=%s", slot)
             image_bytes = await create_channel_visual(slot, theme, title, body)
-            image_payload = await upload_channel_image_to_max(image_bytes, filename=f"channel_{slot}.png") if image_bytes else None
-        else:
-            logging.warning("Канал: повторная генерация изображения заблокирована slot=%s", slot)
-    ok = await send_to_channel(final_text, None, final_button_text, image_payload=image_payload, start_payload=start_payload)
-    if ok:
-        save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info("Канал: опубликовано %s | %s | %s | CTA=%s | start=%s | image=%s", slot, format_name, title, final_button_text, start_payload, 'yes' if image_payload else 'no')
+            if image_bytes:
+                image_payload = await upload_channel_image_to_max(image_bytes, filename=f"channel_{slot}.png")
+            if not image_payload:
+                logging.warning("Канал: изображение не готово, пост %s будет отправлен текстом", slot)
+
+        ok = await send_to_channel(
+            final_text,
+            None,
+            final_button_text,
+            image_payload=image_payload,
+            start_payload=start_payload,
+        )
+        if ok:
+            save_channel_post(slot, theme, format_name, title, final_text)
+            logging.info(
+                "Канал: опубликовано %s | %s | %s | CTA=%s | start=%s | image=%s",
+                slot, format_name, title, final_button_text, start_payload,
+                'yes' if image_payload else 'no',
+            )
+            return
+
+        release_persistent_command_lock(publish_lock)
+        logging.error("Канал: публикация %s не состоялась, блокировка снята для безопасной повторной попытки", slot)
+    except Exception as exc:
+        release_persistent_command_lock(publish_lock)
+        logging.exception("Канал: ошибка публикации %s, блокировка снята: %s", slot, exc)
 
 
 async def post_morning():
