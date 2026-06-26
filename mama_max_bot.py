@@ -34,7 +34,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.4.9-channel-image-fix"
+APP_VERSION = "10.5.0-text-only-channel"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -1477,36 +1477,7 @@ async def _generate_channel_image_once(prompt):
 
 
 async def create_channel_visual(dt, rubric, title, post_text=""):
-    """Aura-эталон: создаёт настоящую AI-фотографию только для утреннего и вечернего поста."""
-    if isinstance(dt, str):
-        slot = dt if dt in {"morning", "evening"} else ""
-    else:
-        try:
-            hour = dt.hour
-            slot = "morning" if hour < 12 else "evening" if hour >= 17 else ""
-        except Exception:
-            slot = ""
-    if not CHANNEL_VISUALS_ENABLED or slot not in {"morning", "evening"}:
-        return None
-
-    format_name = "premium_editorial_photo"
-    for attempt in (1, 2):
-        try:
-            visual_brief, variation = await build_channel_visual_brief(slot, rubric, title, post_text, format_name, attempt)
-            prompt = build_channel_image_prompt(slot, rubric, title, post_text, format_name, visual_brief, variation, attempt)
-            image_bytes = await _generate_channel_image_once(prompt)
-            accepted, reason = await validate_channel_image(image_bytes, rubric, title, post_text)
-            logging.info(
-                "Канал: проверка изображения slot=%s attempt=%s accepted=%s reason=%s variation=%s",
-                slot, attempt, accepted, reason, variation.get("signature"),
-            )
-            if accepted:
-                return image_bytes
-        except asyncio.TimeoutError:
-            logging.error("Канал: генерация изображения превысила 90 секунд, попытка %s", attempt)
-        except Exception as exc:
-            logging.error("Канал: ошибка Aura-генерации изображения, попытка %s: %s", attempt, exc)
-    logging.warning("Канал: обе попытки изображения отклонены; пост будет опубликован без картинки")
+    """AI-генерация изображений отключена. Канал работает в текстовом режиме."""
     return None
 
 
@@ -1767,22 +1738,7 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         if user_id != OWNER_ID:
             await send_message(chat_id, "Команда доступна только владельцу.")
             return
-        lock_key = f"max_test_channel_visual:{user_id}"
-        if not claim_persistent_command_lock(lock_key, ttl_seconds=86400):
-            logging.warning("MAX repeated visual test blocked by persistent lock: user=%s", user_id)
-            return
-        logging.info("MAX visual generation source=manual_test user=%s chat=%s", user_id, chat_id)
-        await send_message(chat_id, "🖼 Генерирую тестовую AI-картинку. Канал не затрагивается.")
-        image_path = await create_channel_visual(
-            "evening",
-            "Забота и поддержка мамы",
-            "Тихий вечер, когда мама наконец не одна",
-            "Мама сидит рядом со спящим малышом, папа приносит ей тёплый чай. Спокойный домашний интерьер, мягкий естественный свет, живая семейная сцена.",
-        )
-        image_payload = await upload_channel_image_to_max(image_path, filename="test_mama_visual.png") if image_path else None
-        ok = await send_private_image_max(chat_id, image_payload, "✅ Безопасный тест AI-визуала. В канал не опубликовано.")
-        if not ok:
-            await send_message(chat_id, "❌ Тестовая картинка не создана или не отправлена. Канал не затронут.")
+        await send_message(chat_id, "ℹ️ Генерация картинок отключена. Канал публикует текстовые посты.")
         return
     if text.strip().lower() in ("/publish_channel_intro", "publish_channel_intro"):
         if user_id != OWNER_ID:
@@ -3641,29 +3597,19 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     start_payload = channel_start_payload(theme, title, body, format_name)
     final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
 
-    image_payload = None
     try:
-        if slot in {"morning", "evening"}:
-            logging.info("Канал: старт генерации изображения source=scheduler slot=%s", slot)
-            image_bytes = await create_channel_visual(slot, theme, title, body)
-            if image_bytes:
-                image_payload = await upload_channel_image_to_max(image_bytes, filename=f"channel_{slot}.png")
-            if not image_payload:
-                logging.warning("Канал: изображение не готово, пост %s будет отправлен текстом", slot)
-
         ok = await send_to_channel(
             final_text,
             None,
             final_button_text,
-            image_payload=image_payload,
+            image_payload=None,
             start_payload=start_payload,
         )
         if ok:
             save_channel_post(slot, theme, format_name, title, final_text)
             logging.info(
-                "Канал: опубликовано %s | %s | %s | CTA=%s | start=%s | image=%s",
+                "Канал: опубликовано %s | %s | %s | CTA=%s | start=%s | image=disabled",
                 slot, format_name, title, final_button_text, start_payload,
-                'yes' if image_payload else 'no',
             )
             return
 

@@ -20,7 +20,7 @@ from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 from urllib.parse import quote
 
-APP_VERSION = "10.4.3-visual-variety"
+APP_VERSION = "10.4.4-text-only-channel"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -1411,36 +1411,7 @@ async def _generate_channel_image_once(prompt):
 
 
 async def create_channel_visual(dt, rubric, title, post_text=""):
-    """Aura-эталон: создаёт настоящую AI-фотографию только для утреннего и вечернего поста."""
-    if isinstance(dt, str):
-        slot = dt if dt in {"morning", "evening"} else ""
-    else:
-        try:
-            hour = dt.hour
-            slot = "morning" if hour < 12 else "evening" if hour >= 17 else ""
-        except Exception:
-            slot = ""
-    if not CHANNEL_VISUALS_ENABLED or slot not in {"morning", "evening"}:
-        return None
-
-    format_name = "premium_editorial_photo"
-    for attempt in (1, 2):
-        try:
-            visual_brief, variation = await build_channel_visual_brief(slot, rubric, title, post_text, format_name, attempt)
-            prompt = build_channel_image_prompt(slot, rubric, title, post_text, format_name, visual_brief, variation, attempt)
-            image_bytes = await _generate_channel_image_once(prompt)
-            accepted, reason = await validate_channel_image(image_bytes, rubric, title, post_text)
-            logging.info(
-                "Канал: проверка изображения slot=%s attempt=%s accepted=%s reason=%s variation=%s",
-                slot, attempt, accepted, reason, variation.get("signature"),
-            )
-            if accepted:
-                return image_bytes
-        except asyncio.TimeoutError:
-            logging.error("Канал: генерация изображения превысила 90 секунд, попытка %s", attempt)
-        except Exception as exc:
-            logging.error("Канал: ошибка Aura-генерации изображения, попытка %s: %s", attempt, exc)
-    logging.warning("Канал: обе попытки изображения отклонены; пост будет опубликован без картинки")
+    """AI-генерация изображений отключена. Канал работает в текстовом режиме."""
     return None
 
 
@@ -3770,22 +3741,11 @@ async def reset_me_tg(message: Message, state: FSMContext):
 
 @dp.message(Command("test_channel_visual"))
 async def test_channel_visual_tg(message: Message):
-    """Безопасный тест: генерирует одну AI-картинку и отправляет только владельцу."""
+    """AI-генерация изображений временно отключена."""
     if not OWNER_ID or message.from_user.id != OWNER_ID:
         await message.answer("Команда доступна только владельцу. Сначала задайте TG_OWNER_ID.")
         return
-    await message.answer("🖼 Генерирую тестовую AI-картинку. Канал не затрагивается.")
-    image_path = await create_channel_visual(
-        "evening",
-        "Забота и поддержка мамы",
-        "Тихий вечер, когда мама наконец не одна",
-        "Мама сидит рядом со спящим малышом, папа приносит ей тёплый чай. Спокойный домашний интерьер, мягкий естественный свет, живая семейная сцена.",
-    )
-    if not image_path:
-        await message.answer("❌ Тестовая картинка не создана. Канал не затронут.")
-        return
-    photo = BufferedInputFile(image_path, filename=f"test_mama_visual_{uuid.uuid4().hex[:8]}.png")
-    await message.answer_photo(photo=photo, caption="✅ Безопасный тест AI-визуала. В канал не опубликовано.")
+    await message.answer("ℹ️ Генерация картинок отключена. Канал публикует текстовые посты.")
 
 
 @dp.message(Command("publish_channel_intro"))
@@ -4124,23 +4084,17 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
     reply_markup = channel_post_markup(final_button_text, start_payload)
 
     try:
-        image_sent = False
-        image_bytes = None
-        if slot in {"morning", "evening"}:
-            image_path = await create_channel_visual(slot, theme, title, body)
-            image_bytes = image_path
-        if image_bytes:
-            caption = fit_telegram_caption(title, body, bridge_text)
-            image_sent = await send_channel_image_tg(slot, caption, image_bytes, reply_markup)
-        if not image_sent:
-            await bot.send_message(
-                CHANNEL_ID,
-                final_text,
-                reply_markup=reply_markup,
-                disable_web_page_preview=True,
-            )
+        await bot.send_message(
+            CHANNEL_ID,
+            final_text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
         save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={final_button_text} | start={start_payload} | image={'yes' if image_sent else 'no'}")
+        logging.info(
+            f"Канал: опубликовано {slot} | {format_name} | {title} | "
+            f"CTA={final_button_text} | start={start_payload} | image=disabled"
+        )
     except Exception as e:
         logging.error(f"Канал: ошибка публикации {slot}: {e}")
 
@@ -5035,9 +4989,9 @@ async def main():
     dp.callback_query.outer_middleware(PremiumCallbackMiddleware())
     # Напоминания о прививках — каждый день в 9:00
     scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0, id="vaccine_reminders", replace_existing=True, coalesce=True, max_instances=1)
-    scheduler.add_job(post_morning, "cron", hour=8, minute=0, id="channel_morning", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=1800)
-    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0, id="channel_afternoon", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=1800)
-    scheduler.add_job(post_evening, "cron", hour=20, minute=0, id="channel_evening", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=1800)
+    scheduler.add_job(post_morning, "cron", hour=8, minute=0, id="channel_morning", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=30)
+    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0, id="channel_afternoon", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=30)
+    scheduler.add_job(post_evening, "cron", hour=20, minute=0, id="channel_evening", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=30)
     scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="channel_weekly_report", replace_existing=True, coalesce=True, max_instances=1)
     scheduler.start()
     logging.info("Мамин помощник запущен!")
