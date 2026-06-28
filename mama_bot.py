@@ -20,7 +20,7 @@ from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 from urllib.parse import quote
 
-APP_VERSION = "10.4.4-text-only-channel"
+APP_VERSION = "10.4.5-channel-similarity-fix"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -3879,7 +3879,7 @@ def is_channel_post_too_similar(title, text, threshold=0.66):
     candidate = normalize_for_similarity(f"{title} {text}")[:1200]
     if not candidate:
         return True
-    for old_title, _, _, old_text in get_recent_channel_posts(50):
+    for old_title, _, _, old_text in get_recent_channel_posts(20):
         previous = normalize_for_similarity(f"{old_title} {old_text}")[:1200]
         if previous and SequenceMatcher(None, candidate, previous).ratio() >= threshold:
             return True

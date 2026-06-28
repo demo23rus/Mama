@@ -34,7 +34,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.5.0-text-only-channel"
+APP_VERSION = "10.5.1-channel-similarity-window-fix"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -3353,7 +3353,7 @@ def is_channel_post_too_similar(title, text, threshold=0.66):
     candidate = normalize_for_similarity(f"{title} {text}")[:1200]
     if not candidate:
         return True
-    for old_title, _, _, old_text in get_recent_channel_posts(50):
+    for old_title, _, _, old_text in get_recent_channel_posts(20):
         previous = normalize_for_similarity(f"{old_title} {old_text}")[:1200]
         if previous and SequenceMatcher(None, candidate, previous).ratio() >= threshold:
             return True
@@ -3561,7 +3561,7 @@ async def send_to_channel(text, buttons=None, bot_button_text="✨ Открыт�
         return False
 
 
-def _scheduled_slot_window_ok(slot, tolerance_seconds=120):
+def _scheduled_slot_window_ok(slot, tolerance_seconds=300):
     """Разрешает плановый запуск только рядом с точным временем, без поздних misfire-запусков."""
     schedule = {"morning": (8, 0), "afternoon": (13, 0), "evening": (20, 0)}
     if slot not in schedule:
