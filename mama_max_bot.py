@@ -10,6 +10,8 @@ import httpx
 import calendar
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 from urllib.parse import urlparse, parse_qs
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
@@ -34,7 +36,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.5.1-channel-similarity-window-fix"
+APP_VERSION = "10.5.2-moscow-tz-fix"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
