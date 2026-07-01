@@ -36,7 +36,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.5.2-moscow-tz-fix"
+APP_VERSION = "10.5.4-max-channel-poll-links"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -2088,6 +2088,24 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
     await send_message(chat_id, "Выбери действие из меню 👇", menu)
 
 
+def save_channel_poll_vote(user_id, payload):
+    """Сохраняет или обновляет голос пользователя из callback/deeplink MAX."""
+    if not payload.startswith("channel_poll_"):
+        return False
+    parts = payload.split("_", 3)
+    if len(parts) != 4:
+        return False
+    _, _, poll_key, option_key = parts
+    if not poll_key or not option_key:
+        return False
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO channel_poll_votes (poll_key, user_id, option_key, created_at) VALUES (?,?,?,?)",
+            (poll_key, user_id, option_key, datetime.now().isoformat()),
+        )
+    return True
+
+
 async def process_callback(chat_id, user_id, payload, first_name=""):
     get_user(user_id, "", first_name)
     name = first_name or "мама"
@@ -2129,19 +2147,8 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         return
 
     if payload.startswith("channel_poll_"):
-        parts = payload.split("_", 3)
-        if len(parts) == 4:
-            _, _, poll_key, option_key = parts
-            conn = db_connect()
-            try:
-                conn.execute(
-                    "INSERT OR REPLACE INTO channel_poll_votes (poll_key, user_id, option_key, created_at) VALUES (?,?,?,?)",
-                    (poll_key, user_id, option_key, datetime.now().isoformat()),
-                )
-                conn.commit()
-            finally:
-                conn.close()
-            await send_message(user_id, "Спасибо за ответ 🤍 Он поможет делать канал полезнее именно для мам.")
+        if save_channel_poll_vote(user_id, payload):
+            await send_message(chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.", main_menu_buttons() if birth_date else start_buttons())
         return
 
     if payload == "noop":
@@ -3677,7 +3684,11 @@ async def post_evening_poll():
         return
     poll_key_base, question, options = poll_data
     poll_key = f"{poll_key_base}{today.strftime('%y%m%d')}"
-    buttons = [[{"type": "callback", "text": label, "payload": f"channel_poll_{poll_key}_{key}"}] for key, label in options]
+    buttons = [[{
+        "type": "link",
+        "text": label,
+        "url": max_bot_deeplink(f"channel_poll_{poll_key}_{key}"),
+    }] for key, label in options]
     poll_bridge, poll_button = channel_funnel_for_post(
         WEEKLY_EDITORIAL[today.weekday()], question, " ".join(label for _, label in options), "опрос"
     )
@@ -3932,6 +3943,10 @@ async def webhook(request: Request):
             set_step(user_id, "idle")
             plan, _ = get_subscription(user_id)
             asyncio.create_task(asyncio.to_thread(sheets_log_visit, user_id, first_name, username, plan))
+            if start_payload.startswith("channel_poll_"):
+                if save_channel_poll_vote(user_id, start_payload):
+                    await send_message(chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.", main_menu_buttons() if get_user(user_id).get("birth_date") else start_buttons())
+                return JSONResponse({"ok": True})
             existing_user = get_user(user_id, username, first_name)
             existing_birth_date = existing_user.get("birth_date", "")
             is_pregnant_profile = existing_birth_date.startswith("pdr:")
