@@ -36,7 +36,7 @@ def load_env(path="/root/.env_mama"):
 
 _ENV = load_env()
 
-APP_VERSION = "10.5.4-max-channel-poll-links"
+APP_VERSION = "10.5.5-max-channel-private-response-fix"
 # ========== КОНФИГ ==========
 MAX_TOKEN = "f9LHodD0cOIWTyPeJTIKgqKDGe8OGcGqK1BXLiPyMJqGIi1-CZR29YAPZgDbbUpDfwQXKDJovDVJ3HN_88XV"
 MAX_API = "https://platform-api.max.ru"
@@ -2148,7 +2148,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
 
     if payload.startswith("channel_poll_"):
         if save_channel_poll_vote(user_id, payload):
-            await send_message(chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.", main_menu_buttons() if birth_date else start_buttons())
+            await send_message(chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.")
         return
 
     if payload == "noop":
@@ -3925,9 +3925,10 @@ async def webhook(request: Request):
             start_payload = data.get("payload") or ""
             chat_id = data.get("chat_id") or user.get("user_id")
             user_id = user.get("user_id") or chat_id
-            # Игнорируем если это канал
-            if not user_id or user_id == CHANNEL_ID:
+            if not user_id:
                 return JSONResponse({"ok": True})
+            # Если запуск пришёл из канала, отвечаем только пользователю в личный чат.
+            response_chat_id = user_id if chat_id == CHANNEL_ID else chat_id
             first_name = user.get("name", "мама")
             username = user.get("username", "")
             with db_connect() as conn:
@@ -3945,7 +3946,7 @@ async def webhook(request: Request):
             asyncio.create_task(asyncio.to_thread(sheets_log_visit, user_id, first_name, username, plan))
             if start_payload.startswith("channel_poll_"):
                 if save_channel_poll_vote(user_id, start_payload):
-                    await send_message(chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.", main_menu_buttons() if get_user(user_id).get("birth_date") else start_buttons())
+                    await send_message(response_chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.")
                 return JSONResponse({"ok": True})
             existing_user = get_user(user_id, username, first_name)
             existing_birth_date = existing_user.get("birth_date", "")
@@ -3965,19 +3966,19 @@ async def webhook(request: Request):
             intro = "🤍 Ты пришла из канала «Я МАМА». Здесь рекомендации становятся персональными.\n\n" if start_payload.startswith("channel") else ""
             if existing_birth_date.startswith("pdr:"):
                 weeks = calc_pregnancy_weeks(existing_birth_date[4:])
-                await send_message(chat_id, intro + f"🤰 Ты на {weeks} неделе беременности. Чем могу помочь?", pregnant_menu_buttons())
+                await send_message(response_chat_id, intro + f"🤰 Ты на {weeks} неделе беременности. Чем могу помочь?", pregnant_menu_buttons())
                 if channel_callback:
-                    await send_message(chat_id, channel_title, [[{"type": "callback", "text": channel_title, "payload": channel_callback}]])
+                    await send_message(response_chat_id, channel_title, [[{"type": "callback", "text": channel_title, "payload": channel_callback}]])
             elif existing_birth_date:
                 months = calc_child_age(existing_birth_date)
-                await send_message(chat_id, intro + f"👶 Малышу {age_label(months)}. Чем могу помочь?", main_menu_buttons())
+                await send_message(response_chat_id, intro + f"👶 Малышу {age_label(months)}. Чем могу помочь?", main_menu_buttons())
                 if channel_callback:
-                    await send_message(chat_id, channel_title, [[{"type": "callback", "text": channel_title, "payload": channel_callback}]])
+                    await send_message(response_chat_id, channel_title, [[{"type": "callback", "text": channel_title, "payload": channel_callback}]])
             else:
                 if start_payload.startswith("channel_"):
                     with db_connect() as conn:
                         conn.execute("UPDATE users SET pending_start=? WHERE user_id=?", (start_payload, user_id))
-                await send_message(chat_id, intro + WELCOME_TEXT.format(name=first_name),
+                await send_message(response_chat_id, intro + WELCOME_TEXT.format(name=first_name),
                     [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
                       {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
 
@@ -4039,8 +4040,10 @@ async def webhook(request: Request):
             user_id = user.get("user_id") or message.get("sender", {}).get("user_id")
             first_name = user.get("name") or message.get("sender", {}).get("name", "мама")
             payload_cb = callback.get("payload", "")
+            if chat_id == CHANNEL_ID and user_id:
+                chat_id = user_id
             logging.info(f"CALLBACK: chat_id={chat_id} user_id={user_id} payload={payload_cb}")
-            if chat_id and payload_cb:
+            if chat_id and user_id and payload_cb:
                 _run_webhook_task(
                     process_callback(chat_id, user_id, payload_cb, first_name),
                     f"callback:{user_id}:{payload_cb[:40]}",
