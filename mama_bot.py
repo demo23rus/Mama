@@ -14,13 +14,15 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import uuid
 import base64
 import hashlib
+import random
+import re
 import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from yookassa import Configuration, Payment
 from urllib.parse import quote
 
-APP_VERSION = "10.4.5-channel-similarity-fix"
+APP_VERSION = "10.5.0-human-channel"
 # ─── ЗАГРУЗКА КЛЮЧЕЙ ─────────────────────────────────────────
 def load_env(path="/root/.env_mama"):
     env = {}
@@ -3778,52 +3780,38 @@ BOT_PUBLIC_URL = f"{BOT_BASE_URL}?start=channel"
 
 # Три сильных публикации в день вместо пяти однотипных статей.
 # Форматы вращаются по дням и сохраняются в БД, чтобы канал не повторялся.
-WEEKLY_EDITORIAL = {
-    0: "организация недели, режим семьи и снижение бытового хаоса",
-    1: "развитие ребёнка без сравнений и лишней тревоги",
-    2: "здоровье понятным языком и безопасные алгоритмы действий",
-    3: "сон, режим и восстановление всей семьи",
-    4: "эмоции мамы, чувство вины, усталость и отношения",
-    5: "семейная жизнь, папа, бабушки, прогулки и простые игры",
-    6: "итоги недели, наблюдения, полезные привычки и подготовка к новой неделе",
-}
-
-MORNING_FORMATS = [
-    "короткое тёплое напоминание без наставлений",
-    "одна маленькая задача на день",
-    "поддерживающая мысль для уставшей мамы",
-    "мини-практика на две минуты",
-    "разрешение не быть идеальной",
+HUMAN_CHANNEL_THEMES = [
+    "вечерние ритуалы и смешные привычки детей",
+    "детские фразы, которые родители вспоминают годами",
+    "семейная ситуация, которая сначала пошла не по плану",
+    "взгляд папы на обычный день с детьми",
+    "ревность и отношения между детьми",
+    "сон, укладывание и маленькие семейные ритуалы",
+    "детский сад, прогулки и неожиданные разговоры",
+    "родительская усталость без идеальности",
+    "простое решение бытовой семейной проблемы",
+    "семейная традиция, которая появилась случайно",
+    "забавный конфликт ребёнка с правилами взрослых",
+    "момент, когда взрослый понял ребёнка не сразу",
 ]
 
-DAY_FORMATS = [
-    "сохраняемый чек-лист",
-    "миф или правда с объяснением",
-    "одна ситуация для трёх возрастов",
-    "разбор частой ошибки без осуждения",
-    "пошаговый алгоритм действий",
-    "короткий разбор вопроса мамы",
-    "что нормально, а что стоит обсудить со специалистом",
-    "три практических шага на сегодня",
-]
-
-EVENING_FORMATS = [
-    "короткая история с узнаваемой ситуацией",
-    "вопрос для самопроверки",
-    "мини-кейс до и после использования трекера",
-    "подборка из трёх полезных наблюдений",
-    "мягкая демонстрация одной функции бота",
+HUMAN_CHANNEL_FORMATS = [
+    ("живая семейная история", "Расскажи короткую собирательную семейную историю с конкретной сценой, репликой ребёнка, поворотом и тёплым финалом. Не выдавай её за историю реальной подписчицы.", 1500, "none"),
+    ("история от папы", "Напиши жизненную историю от лица папы: начни сразу со сцены, добавь честность, лёгкий юмор и момент, когда он понял важную деталь.", 1450, "none"),
+    ("смешной семейный эпизод", "Создай смешной узнаваемый эпизод: короткий диалог, неожиданная детская логика и добрый финал. Без советов и психологических терминов.", 1100, "comments"),
+    ("история с решением", "Покажи бытовую проблему через историю: что произошло, что не помогло сначала и какое простое решение сработало. Без обещания универсального результата.", 1600, "bot"),
+    ("вопрос родителям", "Начни с короткой живой сценки, затем задай один конкретный вопрос, на который легко ответить своей историей.", 950, "comments"),
+    ("детская фраза дня", "Построй пост вокруг забавной или трогательной детской фразы: контекст, реакция взрослого и короткое наблюдение о детской логике.", 1000, "comments"),
+    ("неидеальный родительский день", "Опиши день, в котором всё пошло не по плану, но нашёлся один хороший момент. Просто и самоиронично.", 1300, "none"),
+    ("полезное через историю", "Дай одну полезную мысль только через сюжет и действия героев. В конце оставь один практический шаг.", 1450, "bot"),
 ]
 
 CHANNEL_SYSTEM_PROMPT = (
-    "Ты редактор полезного Telegram-канала «Я МАМА» для беременных и родителей детей до 7 лет. "
-    "Пиши живо, тепло и естественно, без ощущения нейросетевой статьи. "
-    "Не изображай врача и не придумывай истории реальных подписчиц. "
-    "Не вставляй несуществующие исследования, ссылки, точные проценты или спорные медицинские дозировки. "
-    "Медицинские темы подавай осторожно: объясняй общие ориентиры, красные флаги и необходимость очной помощи. "
-    "Не используй канцелярит, длинное вступление, хэштеги и фразы «важно помнить», «давайте разберёмся». "
-    "Каждый пост должен иметь одну ясную мысль и практическую пользу. "
-    "Не повторяй темы и формулировки из истории публикаций."
+    "Ты живой автор семейного канала «Я МАМА», а не редактор справочника. Пиши так, будто рассказываешь знакомым родителям интересный случай: "
+    "конкретная сцена, детали, диалог, узнаваемая эмоция, лёгкий юмор и естественный ритм. Начинай сразу с события или реплики. "
+    "Не используй служебные метки, канцелярит и нейросетевую философию. Запрещены фразы: «внутренняя рефлексия», «позвольте себе», "
+    "«закройте глаза и вдохните», «важно помнить», «давайте разберёмся», «в современном мире». Не придумывай реальную подписчицу, дату, город, "
+    "исследование или новость. Каждый пост должен отличаться от недавних по герою, ситуации, началу и развязке."
 )
 
 
@@ -3922,17 +3910,22 @@ def is_ai_error_text(text):
 
 def parse_generated_channel_post(raw):
     raw = clean_text(raw or "").strip()
-    title = "Полезное для мамы"
+    raw = re.sub(r"^(?:ЗАГОЛОВОК|ТЕКСТ ПОСТА|ПОСТ)\s*:\s*", "", raw, flags=re.I)
+    lines = [line.strip() for line in raw.splitlines()]
+    while lines and re.fullmatch(r"(?:текст поста|пост|заголовок)\s*:?", lines[0], flags=re.I):
+        lines.pop(0)
+    raw = "\n".join(lines).strip()
+    title = "История из семейной жизни"
     body = raw
     if raw.startswith("ЗАГОЛОВОК:"):
         first, _, rest = raw.partition("\n")
-        title = first.replace("ЗАГОЛОВОК:", "", 1).strip() or title
+        title = first.split(":", 1)[1].strip() or title
         body = rest.strip()
     elif "\n" in raw:
         first, rest = raw.split("\n", 1)
-        if len(first) <= 90:
-            title = first.strip(" —:•") or title
-            body = rest.strip()
+        if 4 <= len(first) <= 95:
+            title, body = first.strip(" —:•"), rest.strip()
+    body = re.sub(r"^(?:Текст поста|Пост)\s*:\s*", "", body, flags=re.I).strip()
     return title[:100], body
 
 
@@ -4069,128 +4062,62 @@ async def open_channel_destination_tg(message: Message, payload: str):
     return True
 
 
-async def publish_channel_post(slot, theme, format_name, title, body, with_button=True, button_text=None):
-    if not title or not body:
-        logging.warning(f"Канал: публикация {slot} пропущена — не удалось получить уникальный текст")
+async def publish_channel_post(slot, theme, format_name, title, body, cta_mode="none"):
+    if not title or not body or channel_slot_published_today(slot):
         return
-    if channel_slot_published_today(slot):
-        logging.info(f"Канал: публикация {slot} уже выходила сегодня, повтор пропущен")
-        return
-
-    bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
-    final_button_text = button_text or thematic_button
-    start_payload = channel_start_payload(theme, title, body, format_name)
-    final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
-    reply_markup = channel_post_markup(final_button_text, start_payload)
-
+    final_text = f"{title}\n\n{body}".strip()
+    reply_markup = None
+    if cta_mode == "bot":
+        bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
+        final_text += f"\n\n{bridge_text}"
+        reply_markup = channel_post_markup(thematic_button, channel_start_payload(theme, title, body, format_name))
+    elif cta_mode == "comments":
+        final_text += "\n\nА у вас было что-то похожее? Расскажите в комментариях 🤍"
     try:
-        await bot.send_message(
-            CHANNEL_ID,
-            final_text,
-            reply_markup=reply_markup,
-            disable_web_page_preview=True,
-        )
+        await bot.send_message(CHANNEL_ID, final_text, reply_markup=reply_markup, disable_web_page_preview=True)
         save_channel_post(slot, theme, format_name, title, final_text)
-        logging.info(
-            f"Канал: опубликовано {slot} | {format_name} | {title} | "
-            f"CTA={final_button_text} | start={start_payload} | image=disabled"
-        )
+        logging.info(f"Канал: опубликовано {slot} | {format_name} | {title} | CTA={cta_mode}")
     except Exception as e:
         logging.error(f"Канал: ошибка публикации {slot}: {e}")
 
 
-async def post_morning():
-    today = datetime.now()
-    theme = WEEKLY_EDITORIAL[today.weekday()]
-    format_name = MORNING_FORMATS[today.toordinal() % len(MORNING_FORMATS)]
-    title, body = await generate_channel_post(
-        "08:00",
-        theme,
-        format_name,
-        "Создай короткий утренний пост на 350–650 знаков. Он должен поддержать маму и дать одно маленькое выполнимое действие на сегодня.",
-        700,
-        with_bot_bridge=False,
-    )
-    await publish_channel_post("morning", theme, format_name, title, body)
+def _daily_human_choice(day_key, slot):
+    rnd = random.Random(f"tg-human-channel:{day_key}:{slot}")
+    theme = rnd.choice(HUMAN_CHANNEL_THEMES)
+    format_name, instruction, max_chars, cta_mode = rnd.choice(HUMAN_CHANNEL_FORMATS)
+    return theme, format_name, instruction, max_chars, cta_mode
 
 
-async def post_afternoon():
-    today = datetime.now()
-    theme = WEEKLY_EDITORIAL[today.weekday()]
-    format_name = DAY_FORMATS[(today.toordinal() + today.weekday()) % len(DAY_FORMATS)]
-    title, body = await generate_channel_post(
-        "13:00",
-        theme,
-        format_name,
-        "Создай главный полезный материал дня на 1000–1800 знаков. Дай конкретный алгоритм, чек-лист или разбор ситуации. "
-        "Материал должен хотеться сохранить или переслать. Не перегружай теорией.",
-        1900,
-        with_bot_bridge=False,
-    )
-    await publish_channel_post("afternoon", theme, format_name, title, body)
-
-
-async def post_evening_poll():
-    if channel_slot_published_today("evening_poll"):
-        logging.info("Канал: вечерний опрос уже публиковался сегодня, повтор пропущен")
+async def post_human_slot(slot):
+    now = datetime.now()
+    if channel_slot_published_today(slot):
         return
-    today = datetime.now()
-    polls = {
-        2: (
-            "Что сейчас тревожит вас сильнее всего?",
-            ["Сон ребёнка", "Питание или прикорм", "Здоровье", "Моя усталость"],
-        ),
-        6: (
-            "Что было самым сложным на этой неделе?",
-            ["Недосып", "Капризы ребёнка", "Нехватка времени", "Тревога и чувство вины"],
-        ),
-    }
-    poll_data = polls.get(today.weekday())
-    if not poll_data:
-        logging.warning(f"Канал: для weekday={today.weekday()} вечерний опрос не настроен")
-        return
-    question, options = poll_data
-    try:
-        poll_bridge, poll_button = channel_funnel_for_post(
-            WEEKLY_EDITORIAL[today.weekday()], question, " ".join(options), "опрос"
-        )
-        await bot.send_poll(
-            CHANNEL_ID,
-            question=question,
-            options=options,
-            is_anonymous=True,
-            allows_multiple_answers=False,
-            reply_markup=channel_post_markup(poll_button, channel_start_payload(WEEKLY_EDITORIAL[today.weekday()], question, " ".join(options), "опрос")),
-        )
-        await bot.send_message(
-            CHANNEL_ID,
-            poll_bridge,
-            disable_web_page_preview=True,
-        )
-        save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(options))
-        logging.info(f"Канал: опубликован опрос | {question}")
-    except Exception as e:
-        logging.error(f"Канал: ошибка публикации опроса: {e}")
+    theme, format_name, instruction, max_chars, cta_mode = _daily_human_choice(now.date().isoformat(), slot)
+    title, body = await generate_channel_post(slot, theme, format_name, instruction, max_chars, with_bot_bridge=False)
+    await publish_channel_post(slot, theme, format_name, title, body, cta_mode)
 
 
-async def post_evening():
-    today = datetime.now()
-    if today.weekday() in (2, 6):
-        await post_evening_poll()
-        return
+async def post_human_first():
+    await post_human_slot("human_first")
 
-    theme = WEEKLY_EDITORIAL[today.weekday()]
-    format_name = EVENING_FORMATS[(today.toordinal() * 3) % len(EVENING_FORMATS)]
-    title, body = await generate_channel_post(
-        "20:00",
-        theme,
-        format_name,
-        "Создай вечерний пост на 550–1000 знаков. Он должен вызывать узнавание, реакцию или желание ответить себе на вопрос. "
-        "Не повторяй дневной материал и не пиши длинную лекцию.",
-        1100,
-        with_bot_bridge=False,
-    )
-    await publish_channel_post("evening", theme, format_name, title, body)
+
+async def post_human_second():
+    await post_human_slot("human_second")
+
+
+def schedule_daily_human_posts():
+    today = datetime.now().date()
+    rnd = random.Random(f"tg-human-times:{today.isoformat()}")
+    first_minutes = rnd.randint(9 * 60 + 17, 14 * 60 + 20)
+    second_minutes = rnd.randint(16 * 60 + 41, 22 * 60 + 10)
+    for job_id in ("channel_human_first", "channel_human_second"):
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+    scheduler.add_job(post_human_first, "date", run_date=datetime.combine(today, datetime.min.time()) + timedelta(minutes=first_minutes), id="channel_human_first", replace_existing=True, misfire_grace_time=30)
+    scheduler.add_job(post_human_second, "date", run_date=datetime.combine(today, datetime.min.time()) + timedelta(minutes=second_minutes), id="channel_human_second", replace_existing=True, misfire_grace_time=30)
+    logging.info("Канал TG: посты на сегодня запланированы на %02d:%02d и %02d:%02d", first_minutes//60, first_minutes%60, second_minutes//60, second_minutes%60)
 
 
 async def channel_weekly_editorial_report():
@@ -4989,9 +4916,8 @@ async def main():
     dp.callback_query.outer_middleware(PremiumCallbackMiddleware())
     # Напоминания о прививках — каждый день в 9:00
     scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0, id="vaccine_reminders", replace_existing=True, coalesce=True, max_instances=1)
-    scheduler.add_job(post_morning, "cron", hour=8, minute=0, id="channel_morning", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=30)
-    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0, id="channel_afternoon", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=30)
-    scheduler.add_job(post_evening, "cron", hour=20, minute=0, id="channel_evening", replace_existing=True, coalesce=True, max_instances=1, misfire_grace_time=30)
+    schedule_daily_human_posts()
+    scheduler.add_job(schedule_daily_human_posts, "cron", hour=0, minute=7, id="channel_human_daily_planner", replace_existing=True, coalesce=True, max_instances=1)
     scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="channel_weekly_report", replace_existing=True, coalesce=True, max_instances=1)
     scheduler.start()
     logging.info("Мамин помощник запущен!")
