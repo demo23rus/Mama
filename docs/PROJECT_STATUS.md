@@ -18,6 +18,7 @@
 - Preflight must be stored in JOB metadata and preflight.txt when supplied.
 - Worker prompt must ban broad repo scan, repo-wide recursive grep/find, whole-roadmap reading, backups/historical reports and unrelated modules.
 - No-preflight mode must still stay narrow.
+- 2026-10-01: real Mama narrow-preflight Router proof executed (docs-only JOB, scope limited to this file).
 
 ## WORKER CHAIN
 Preserved: Claude Code implementation → Codex independent review/repair. Kimi Code remains optional/not automatic in this migration.
