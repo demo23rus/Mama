@@ -1,0 +1,1388 @@
+:root {
+  --bg-cream: #e2d5ca;
+  --pink-soft: #f0d6e0;
+  --pink: #e8618f;
+  --pink-strong: #d84577;
+  --blue-soft: #d8e6ec;
+  --blue: #4fb3e8;
+  --blue-strong: #2a86ba;
+  --white: #ffffff;
+  --text: #2b2020;
+  --text-soft: #6e5d5c;
+  --shadow-sm: 0 4px 14px rgba(191, 120, 150, 0.14);
+  --shadow-md: 0 10px 26px rgba(191, 120, 150, 0.16);
+  --radius-lg: 24px;
+  --radius-md: 18px;
+  --radius-sm: 14px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  background: var(--bg-cream);
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  position: relative;
+  max-width: 480px;
+  margin: 0 auto;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-cream);
+  isolation: isolate;
+}
+
+/* ===== Persistent app background (single layer, created once; screens render
+   transparent above it so switching tabs never unmounts/remounts the image
+   and never causes a flash) ===== */
+.app-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  background-image: url("home_bg_scene_final/home-bg-scene-final.webp");
+  background-size: cover;
+  background-position: center top;
+  background-repeat: no-repeat;
+}
+
+/* Soft cream overlay: even wash across the whole scene, plus a gentle central veil
+   with a very slow falloff so the center never reads as a separate pale patch.
+   Same persistent element for every screen; intensity swaps via :has() (no
+   transition) between the lighter Home wash and the stronger internal-screen wash. */
+.app-bg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      ellipse 150% 110% at 50% 40%,
+      rgba(226, 213, 202, 0.62) 0%,
+      rgba(226, 213, 202, 0.52) 35%,
+      rgba(226, 213, 202, 0.4) 60%,
+      rgba(226, 213, 202, 0.28) 82%,
+      rgba(226, 213, 202, 0.16) 100%
+    ),
+    linear-gradient(rgba(226, 213, 202, 0.38), rgba(226, 213, 202, 0.38));
+}
+
+.app:has(#homeScreen) .app-bg-overlay {
+  background:
+    radial-gradient(
+      ellipse 150% 110% at 50% 44%,
+      rgba(226, 213, 202, 0.34) 0%,
+      rgba(226, 213, 202, 0.26) 35%,
+      rgba(226, 213, 202, 0.17) 60%,
+      rgba(226, 213, 202, 0.1) 82%,
+      rgba(226, 213, 202, 0.04) 100%
+    ),
+    linear-gradient(rgba(226, 213, 202, 0.2), rgba(226, 213, 202, 0.2));
+}
+
+/* ===== Screen root ===== */
+.screen-root {
+  flex: 1 1 auto;
+  padding: calc(10px + var(--tg-content-safe-area-inset-top, env(safe-area-inset-top, 0px))) 16px 18px;
+  width: 100%;
+}
+
+/* Home-only: native header already provides its own bottom inset, so drop
+   the shared 10px add-on here — the fine top offset is controlled by
+   #homeScreen's own padding-top instead (cache-bust 20260916d). */
+.app:has(#homeScreen) .screen-root {
+  padding-top: var(--tg-content-safe-area-inset-top, env(safe-area-inset-top, 0px));
+}
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  animation: fade-in .18s ease-out;
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ===== Home screen wrapper (background now lives in the persistent .app-bg
+   layer above; this stays a positioned stacking context for its own
+   decorative elements such as .hero::before) ===== */
+#homeScreen {
+  position: relative;
+  isolation: isolate;
+  margin-top: 0;
+  padding-top: 3px;
+  gap: 7px;
+}
+
+/* ===== Hero (standalone object, no card surface) =====
+   Compact cache-bust patch 20260916d: zero top padding, hero sits right
+   under #homeScreen's own small padding-top so greeting lands close to the
+   native header. */
+.hero {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 0;
+  height: auto;
+  margin-top: 0;
+  padding: 0 2px 4px;
+}
+
+.hero::before {
+  content: "";
+  position: absolute;
+  inset: -10px -12px;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(140px 110px at 20% 40%, rgba(216, 69, 119, 0.1), transparent 70%),
+    radial-gradient(170px 130px at 85% 65%, rgba(110, 84, 68, 0.1), transparent 74%);
+  filter: blur(3px);
+}
+
+.hero__image {
+  width: 52px;
+  height: 52px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 8px 14px rgba(180, 110, 138, 0.2));
+}
+
+.hero__text {
+  min-width: 0;
+}
+
+.hero__greeting {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 0 0 2px;
+  color: #4A352D;
+  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.75);
+}
+
+.hero__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #6B574D;
+  margin: 0;
+  line-height: 1.35;
+  text-shadow: 0 1px 2px rgba(255, 255, 255, 0.75);
+}
+
+/* ===== "Сегодня" — широкая кликабельная плашка на Home, лёгкое cream/glass-стекло вместо
+   тяжёлой карточки; фон приложения слегка просматривается через полупрозрачную заливку и
+   backdrop-filter. Не shortcut-ярлык — отдельный полноширинный блок над сеткой ярлыков. ===== */
+.today-banner {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  font-family: inherit;
+  color: var(--text);
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  border-radius: var(--radius-lg);
+  padding: 13px 16px 12px;
+  margin: 2px 0 4px;
+  background: rgba(255, 255, 255, 0.4);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  -webkit-tap-highlight-color: transparent;
+  transition: transform .12s ease;
+}
+
+.today-banner:active { transform: scale(0.98); }
+
+.today-banner__date {
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--pink-strong);
+}
+
+.today-banner__headline {
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--text);
+  line-height: 1.3;
+}
+
+.today-banner__meta {
+  font-size: 12.5px;
+  color: var(--text-soft);
+  line-height: 1.4;
+  min-height: 1em;
+}
+
+.today-banner__cta {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--pink-strong);
+  margin-top: 3px;
+}
+
+/* ===== Экран "Сегодня" — light/v2, компактные секции без тяжёлых panel ===== */
+.today-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.today-note {
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.today-stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+}
+
+.today-stat {
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-sm);
+  padding: 10px 6px;
+  text-align: center;
+}
+
+.today-stat__value {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--text);
+  display: block;
+}
+
+.today-stat__label {
+  font-size: 10.5px;
+  color: var(--text-soft);
+  display: block;
+  margin-top: 2px;
+}
+
+/* ===== Home shortcuts (standalone 3D objects, no card/background/border) ===== */
+.shortcut-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px 4px;
+}
+
+.shortcut {
+  appearance: none;
+  background: none;
+  border: none;
+  margin: 0;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  text-align: center;
+  font-family: inherit;
+  color: var(--text);
+  -webkit-tap-highlight-color: transparent;
+  transition: transform .12s ease;
+}
+
+.shortcut:active { transform: scale(0.96); }
+
+.shortcut__art {
+  width: 92px;
+  height: 92px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  filter:
+    drop-shadow(0 0 4px rgba(255, 253, 247, 0.65))
+    drop-shadow(0 0 13px rgba(255, 253, 247, 0.38))
+    drop-shadow(0 8px 14px rgba(180, 110, 138, 0.16));
+}
+
+/* Pastel icon pack v1: lighter WebP art, no glossy-3D glow halo needed. */
+.shortcut__art--pastel {
+  width: 84px;
+  height: 84px;
+  filter: drop-shadow(0 4px 8px rgba(180, 110, 138, 0.12));
+}
+
+.shortcut__label {
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  max-width: 140px;
+  color: #49372F;
+  text-shadow: none;
+}
+
+/* Home hero labels: same sharp, shadow-free treatment as .shortcut__label
+   above (20260916d) — kept as its own rule since .hero only renders on Home. */
+#homeScreen .hero__greeting,
+#homeScreen .hero__title {
+  font-weight: 600;
+  color: rgb(73, 55, 47);
+  text-shadow: none;
+}
+
+/* ===== Assistant shortcuts (standalone 3D objects, calm gradient backdrop, no card) ===== */
+.assistant-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+}
+
+.section-heading {
+  font-size: 16px;
+  font-weight: 800;
+  color: var(--text);
+  margin: 4px 2px 2px;
+}
+
+/* ===== Trackers shortcuts (standalone 3D objects, calm gradient backdrop, no card) ===== */
+.trackers-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+}
+
+/* ===== Stub/internal placeholder screens (v2 light style: no card shell, calm backdrop) ===== */
+.stub-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+/* ===== Section rows (История / Поддержать проект) ===== */
+.row-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.row-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--white);
+  border: 1px solid rgba(191, 120, 150, 0.12);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  font-family: inherit;
+  color: var(--text);
+  text-align: left;
+}
+
+.row-card__icon {
+  width: 44px;
+  height: 44px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.row-card__title {
+  font-size: 14.5px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.row-card__sub {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  margin: 2px 0 0;
+}
+
+/* ===== Фотоанализ: выбор/превью фото (mobile file picker, без камеры) ===== */
+.photo-pick {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 180px;
+  background: var(--bg-cream);
+  border: 1px dashed rgba(191, 120, 150, 0.35);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  overflow: hidden;
+  margin-bottom: 14px;
+}
+
+.photo-pick__placeholder {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-soft);
+}
+
+.photo-pick__preview {
+  width: 100%;
+  height: 100%;
+  max-height: 320px;
+  object-fit: contain;
+  display: block;
+}
+
+.photo-pick__input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+.section-title {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--text-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  margin: 6px 2px 0;
+}
+
+/* ===== History screen (v2 light style: no card shell, calm backdrop) ===== */
+.history-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.history-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.history-top__icon {
+  width: 52px;
+  height: 52px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 6px 10px rgba(180, 110, 138, 0.14));
+}
+
+.history-top__sub {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-soft);
+  margin: 2px 0 0;
+}
+
+.history-filters {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.history-filter-chip {
+  appearance: none;
+  border: none;
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--text-soft);
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.history-filter-chip.is-active {
+  background: var(--pink);
+  color: var(--white);
+}
+
+.history-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 2px;
+  border-bottom: 1px solid rgba(191, 120, 150, 0.1);
+}
+
+.history-row:last-child { border-bottom: none; }
+
+.history-row__label {
+  font-size: 13.5px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.history-row__detail {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin: 2px 0 0;
+}
+
+.history-row__time {
+  font-size: 11px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.history-empty {
+  text-align: center;
+  padding: 22px 12px 8px;
+}
+
+.history-empty__icon {
+  width: 84px;
+  height: 84px;
+  object-fit: contain;
+  margin: 0 auto 10px;
+  filter: drop-shadow(0 4px 8px rgba(180, 110, 138, 0.12));
+}
+
+.history-empty__title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+  margin: 0 0 6px;
+}
+
+.history-empty__text {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.5;
+  margin: 0;
+}
+
+/* ===== Generic panel (profile/stub) ===== */
+.panel {
+  background: var(--white);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  box-shadow: var(--shadow-sm);
+}
+
+.panel__title {
+  font-size: 16px;
+  font-weight: 800;
+  margin: 0 0 10px;
+}
+
+.field-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(191, 120, 150, 0.1);
+  font-size: 13.5px;
+  gap: 12px;
+}
+
+.field-row:last-child { border-bottom: none; }
+
+.field-row__label { color: var(--text-soft); }
+.field-row__value { font-weight: 700; text-align: right; }
+
+.pill-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pill-tab {
+  border: 1px solid rgba(191, 120, 150, 0.25);
+  background: var(--white);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.pill-tab.is-active {
+  background: var(--pink);
+  border-color: var(--pink);
+  color: var(--white);
+}
+
+.history-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 0;
+  border-bottom: 1px solid rgba(191, 120, 150, 0.1);
+}
+
+.history-item:last-child { border-bottom: none; }
+
+.history-item__label {
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.history-item__detail {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin-top: 2px;
+}
+
+.history-item__time {
+  font-size: 11px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.state-message {
+  text-align: center;
+  padding: 26px 12px;
+  color: var(--text-soft);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.state-message__title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+  margin: 0 0 6px;
+}
+
+.btn-back {
+  position: relative;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: none;
+  background: var(--blue-soft);
+  color: var(--blue-strong);
+  font-weight: 700;
+  font-size: 12.5px;
+  border-radius: 999px;
+  padding: 7px 14px;
+  cursor: pointer;
+  font-family: inherit;
+  align-self: flex-start;
+}
+
+.stub-icon {
+  width: 72px;
+  height: 72px;
+  object-fit: contain;
+  display: block;
+  align-self: center;
+  margin: 6px auto 4px;
+  filter: drop-shadow(0 6px 10px rgba(180, 110, 138, 0.14));
+}
+
+/* ===== Profile screen (v2 light style: no card shell, calm backdrop) ===== */
+.profile-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ===== Internal screens wrapper (background now lives in the persistent
+   .app-bg layer above; these stay positioned stacking contexts for their
+   own decorative/content elements) ===== */
+#assistantScreen,
+#trackersScreen,
+#historyScreen,
+#profileScreen,
+#stubScreen,
+#aiQuestionScreen,
+#inviteScreen {
+  position: relative;
+  isolation: isolate;
+}
+
+.profile-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.profile-top__icon {
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 6px 10px rgba(180, 110, 138, 0.14));
+}
+
+.profile-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.profile-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.profile-action {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: none;
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-sm);
+  padding: 11px 14px;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform .12s ease;
+}
+
+.profile-action:active { transform: scale(0.98); }
+
+.profile-action__icon {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  flex: 0 0 auto;
+  color: var(--pink-strong);
+}
+
+svg.profile-action__icon {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.profile-action__chevron {
+  margin-left: auto;
+  color: var(--text-soft);
+  font-size: 15px;
+  flex: 0 0 auto;
+}
+
+.profile-action--danger,
+.profile-action--danger .profile-action__chevron {
+  color: #c0392b;
+}
+
+/* ===== Пригласить подругу (v2 light style: no card shell, calm backdrop) ===== */
+.invite-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.invite-link-box {
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: 13px;
+  word-break: break-all;
+  color: var(--text);
+}
+
+/* ===== Bottom nav ===== */
+.bottomnav {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  display: flex;
+  background: var(--white);
+  border-top: 1px solid rgba(191, 120, 150, 0.14);
+  padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+}
+
+.bottomnav__item {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  border: none;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 6px 2px;
+  cursor: pointer;
+  font-family: inherit;
+  border-radius: 12px;
+}
+
+.bottomnav__item.is-active {
+  color: var(--pink-strong);
+  background: var(--pink-soft);
+}
+
+.bottomnav__icon {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 340px) {
+  .shortcut__art { width: 80px; height: 80px; }
+  .shortcut__label { font-size: 11.5px; }
+  .hero__image { width: 48px; height: 48px; }
+}
+
+/* ===== Личный разбор ситуации ===== */
+.row-card__price {
+  font-size: 12.5px;
+  font-weight: 800;
+  color: var(--pink-strong);
+  margin: 4px 0 0;
+}
+
+.pr-hint {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.45;
+  margin: 0 0 14px;
+}
+
+.pr-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.pr-field__label {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text-soft);
+}
+
+.pr-textarea, .pr-input {
+  font-family: inherit;
+  font-size: 13.5px;
+  color: var(--text);
+  background: var(--bg-cream);
+  border: 1px solid rgba(191, 120, 150, 0.2);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  resize: vertical;
+}
+
+.pr-textarea:focus, .pr-input:focus {
+  outline: 2px solid var(--pink);
+  outline-offset: 1px;
+}
+
+.pr-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.pr-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--text-soft);
+  padding: 8px 0;
+  cursor: pointer;
+}
+
+.pr-check input, .pr-radio input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  width: 17px;
+  height: 17px;
+  accent-color: var(--pink);
+}
+
+.pr-error {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--pink-strong);
+  margin: 4px 0 10px;
+}
+
+.pr-safety-banner {
+  background: #fdeaea;
+  border: 1px solid #e2777a;
+  color: #a5262c;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.45;
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  margin: 0 0 14px;
+}
+
+.pr-price {
+  font-size: 16px;
+  font-weight: 800;
+  margin: 0 0 8px;
+}
+
+.pr-note {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.45;
+  margin: 0 0 16px;
+}
+
+.btn-primary {
+  display: block;
+  width: 100%;
+  border: none;
+  background: var(--pink);
+  color: var(--white);
+  font-family: inherit;
+  font-weight: 800;
+  font-size: 14.5px;
+  border-radius: var(--radius-sm);
+  padding: 13px 16px;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ===== Ребёнок: контейнер для пары кнопок "Обновить" + "Ещё" (games/books/recipes) ===== */
+.child-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ===== Вопрос специалисту (v2 light style: no card shell, calm backdrop) ===== */
+.ai-q-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ai-q-icon {
+  width: 72px;
+  height: 72px;
+  object-fit: contain;
+  display: block;
+  align-self: center;
+  margin: 4px auto 0;
+  filter: drop-shadow(0 6px 10px rgba(180, 110, 138, 0.14));
+}
+
+.ai-q-hint {
+  font-size: 13px;
+  color: var(--text-soft);
+  line-height: 1.45;
+  margin: 0 0 4px;
+  text-align: center;
+}
+
+.ai-q-answer {
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-sm);
+  padding: 14px;
+  margin-bottom: 4px;
+}
+
+/* ===== Прививки (v2 light style: no card shell, calm backdrop) ===== */
+.vac-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vac-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 2px 0;
+}
+
+.vac-row__main { min-width: 0; }
+
+.vac-row__title {
+  font-size: 13.5px;
+  font-weight: 700;
+  margin: 0;
+}
+
+.vac-row__date {
+  font-size: 12px;
+  color: var(--text-soft);
+  margin: 2px 0 0;
+}
+
+.vac-status {
+  font-size: 11.5px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+.vac-status--done { color: var(--blue-strong); }
+.vac-status--pending { color: var(--pink-strong); }
+
+.vac-row__actions {
+  display: flex;
+  gap: 8px;
+  padding: 6px 2px 10px;
+  border-bottom: 1px solid rgba(191, 120, 150, 0.1);
+}
+
+.vac-row__actions:last-child { border-bottom: none; }
+
+.vac-btn {
+  flex: 1 1 0;
+  border: 1px solid rgba(191, 120, 150, 0.35);
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--text);
+  font-family: inherit;
+  font-weight: 700;
+  font-size: 12.5px;
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  cursor: pointer;
+}
+
+.vac-btn:disabled { opacity: 0.6; cursor: default; }
+
+.vac-btn--primary {
+  border-color: transparent;
+  background: var(--pink);
+  color: var(--white);
+}
+
+.vac-info {
+  margin: 0 2px 10px;
+}
+
+/* ===== Сон (v2 light style: no card shell, calm backdrop) ===== */
+.sleep-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.sleep-actions__btn {
+  flex: 1 1 0;
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
+.sleep-confirm {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--pink-strong);
+  margin: 4px 0 10px;
+}
+
+/* ===== Мамин психолог (v2 light style: no card shell, calm backdrop) ===== */
+.psycho-scene {
+  position: relative;
+  isolation: isolate;
+  padding-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.psycho-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+
+.psycho-msg {
+  max-width: 86%;
+  padding: 10px 13px;
+  border-radius: var(--radius-sm);
+  font-size: 13.5px;
+  line-height: 1.5;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.psycho-msg--assistant {
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--text);
+  border-bottom-left-radius: 4px;
+}
+
+.psycho-msg--user {
+  align-self: flex-end;
+  background: var(--pink);
+  color: var(--white);
+  border-bottom-right-radius: 4px;
+}
+
+.psycho-msg--typing {
+  opacity: 0.6;
+}
+
+.psycho-actions {
+  margin-top: 2px;
+}
+
+/* ===== Прикорм 6+ (v2 light style: reuses row-card/vac-row/history-filter-chip patterns) ===== */
+.cf-entry {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--white);
+  border: 1px solid rgba(191, 120, 150, 0.16);
+  border-radius: var(--radius-md);
+  padding: 13px 14px;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  font-family: inherit;
+  color: var(--text);
+  text-align: left;
+  width: 100%;
+  margin: 4px 0 10px;
+}
+
+.cf-entry__icon {
+  width: 46px;
+  height: 46px;
+  object-fit: contain;
+  flex: 0 0 auto;
+}
+
+.cf-entry__title {
+  font-size: 15px;
+  font-weight: 800;
+  margin: 0;
+}
+
+.cf-entry__sub {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  margin: 2px 0 0;
+}
+
+.cf-progress {
+  background: rgba(255, 255, 255, 0.55);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  margin: 0 0 10px;
+}
+
+.cf-progress__label {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-soft);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.cf-progress__bar {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(191, 120, 150, 0.15);
+  overflow: hidden;
+}
+
+.cf-progress__fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--pink);
+}
+
+.cf-category {
+  border: 1px solid rgba(191, 120, 150, 0.14);
+  border-radius: var(--radius-md);
+  background: var(--white);
+  box-shadow: var(--shadow-sm);
+  margin: 0 0 10px;
+  overflow: hidden;
+}
+
+.cf-category__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  background: none;
+  font-family: inherit;
+  text-align: left;
+  padding: 13px 14px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.cf-category__title {
+  font-size: 14px;
+  font-weight: 800;
+  margin: 0;
+}
+
+.cf-category__sub {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  margin: 2px 0 0;
+}
+
+.cf-category__chevron {
+  flex: 0 0 auto;
+  font-size: 13px;
+  color: var(--text-soft);
+  transition: transform .15s ease;
+}
+
+.cf-category__chevron.is-open { transform: rotate(180deg); }
+
+.cf-category__body {
+  padding: 0 14px 12px;
+}
+
+.cf-category__example {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  line-height: 1.4;
+  margin: 0 0 8px;
+  font-style: italic;
+}
+
+.cf-food-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid rgba(191, 120, 150, 0.1);
+  cursor: pointer;
+  background: none;
+  border-left: none;
+  border-right: none;
+  border-top: none;
+  width: 100%;
+  font-family: inherit;
+  text-align: left;
+  color: var(--text);
+}
+
+.cf-food-row:last-child { border-bottom: none; }
+
+.cf-food-row__title {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.cf-food-row__allergen {
+  font-size: 10.5px;
+  color: var(--pink-strong);
+  font-weight: 700;
+}
+
+.cf-food-status {
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  color: var(--text-soft);
+}
+
+.cf-food-status--tried { color: var(--blue-strong); }
+.cf-food-status--liked { color: var(--pink-strong); }
+.cf-food-status--disliked { color: var(--text-soft); }
+.cf-food-status--reaction { color: #a5262c; }
+
+.cf-food-detail {
+  margin: 0 0 10px;
+  padding: 10px 2px 2px;
+}
+
+.cf-food-detail__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.cf-status-btn {
+  flex: 1 1 auto;
+  border: 1px solid rgba(191, 120, 150, 0.35);
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--text);
+  font-family: inherit;
+  font-weight: 700;
+  font-size: 12px;
+  border-radius: var(--radius-sm);
+  padding: 9px 8px;
+  cursor: pointer;
+}
+
+.cf-status-btn.is-active {
+  border-color: transparent;
+  background: var(--pink);
+  color: var(--white);
+}
+
+.cf-status-btn:disabled { opacity: 0.6; cursor: default; }

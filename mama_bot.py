@@ -2,10 +2,13 @@ import asyncio
 import logging
 import sqlite3
 import os
+import json
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject, BufferedInputFile, ReplyKeyboardRemove, WebAppInfo
 from aiogram.filters import CommandStart, Command
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -40,7 +43,7 @@ def load_env(path="/root/.env_mama"):
 _env = load_env()
 
 # ─── НАСТРОЙКИ ───────────────────────────────────────────────
-BOT_TOKEN  = "8769245157:AAH2EbEFpGj8MzuHUMiBKeLB7eJztyxfC1s"
+BOT_TOKEN = _env.get("BOT_TOKEN", "").strip()
 SUPPORT_USERNAME = "@demo23rus"
 OWNER_ID = int(_env.get("TG_OWNER_ID", "0") or 0)
 CHANNEL_REPORT_CHAT_ID = _env.get("CHANNEL_REPORT_CHAT_ID", str(OWNER_ID) if OWNER_ID else SUPPORT_USERNAME)
@@ -66,7 +69,20 @@ client = AsyncOpenAI(api_key=OPENAI_KEY)
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 logging.basicConfig(level=logging.INFO)
 
+HEARTBEAT_FILE = "/tmp/mama_telegram.heartbeat"
+
+async def heartbeat_loop():
+    """Обновляет heartbeat-файл для независимого watchdog."""
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
+                os.utime(HEARTBEAT_FILE, None)
+        except Exception as exc:
+            logging.error("Не удалось обновить Telegram heartbeat: %s", exc)
+        await asyncio.sleep(30)
+
 DB_PATH = "/root/mama.db"
+MAX_DB_PATH = "/root/mama_max.db"
 CHANNEL_VISUALS_ENABLED = _env.get("CHANNEL_VISUALS_ENABLED", "1") == "1"
 OPENAI_IMAGE_MODEL = _env.get("OPENAI_IMAGE_MODEL", "gpt-image-1")
 CHANNEL_IMAGE_SIZE = _env.get("CHANNEL_IMAGE_SIZE", "1024x1024")
@@ -86,6 +102,10 @@ ONE_TIME_PRODUCTS = {
 }
 PAID_PLANS = {"start", "pro", "pro_year"}
 PRO_PLANS = {"pro", "pro_year"}
+
+# ─── ЛИЧНЫЙ РАЗБОР СИТУАЦИИ (отдельная платная услуга, без кредитов и подписки) ──
+PERSONAL_REVIEW_PRICE_RUB = 690
+PERSONAL_REVIEW_PRODUCT_CODE = "personal_mom_review"
 
 PLAN_LIMITS = {
     "free": {"questions": 5, "psycho_messages": 15},
@@ -131,6 +151,9 @@ class PsychoStates(StatesGroup):
 
 class EmergencyStates(StatesGroup):
     waiting_description = State()
+
+class OwnerReviewStates(StatesGroup):
+    waiting_voice = State()
 
 # ─── БАЗА ДАННЫХ ─────────────────────────────────────────────
 def db_connect():
@@ -365,8 +388,34 @@ def init_db():
         platform TEXT NOT NULL, user_id INTEGER NOT NULL, product_code TEXT NOT NULL,
         amount TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'RUB', ends_at TEXT DEFAULT ''
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS support_payments (
+        payment_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, platform TEXT NOT NULL,
+        amount TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'RUB', status TEXT NOT NULL DEFAULT 'pending',
+        variant TEXT NOT NULL DEFAULT '', source TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS personal_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL DEFAULT 'telegram',
+        user_id INTEGER NOT NULL,
+        situation_text TEXT NOT NULL,
+        preferred_reply TEXT NOT NULL DEFAULT 'telegram',
+        email TEXT DEFAULT NULL,
+        consent_at TEXT NOT NULL,
+        payment_id TEXT DEFAULT '',
+        payment_status TEXT NOT NULL DEFAULT 'unpaid',
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        answer_file_id TEXT DEFAULT NULL,
+        answer_path TEXT DEFAULT NULL,
+        answered_at TEXT DEFAULT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_personal_reviews_user ON personal_reviews(user_id, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_personal_reviews_status ON personal_reviews(status, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_personal_reviews_payment ON personal_reviews(payment_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_sales_user_date ON sales_events(user_id, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_support_payments_user ON support_payments(user_id, created_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_counters (user_id INTEGER NOT NULL, counter TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,counter))""")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_periods (
         user_id INTEGER PRIMARY KEY, plan TEXT NOT NULL DEFAULT 'free',
@@ -418,6 +467,16 @@ def init_db():
             created_at TEXT DEFAULT ''
         )
     """)
+    c.execute("""CREATE TABLE IF NOT EXISTS broadcast_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, broadcast_key TEXT NOT NULL, platform TEXT NOT NULL,
+        user_id INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT DEFAULT '', ts TEXT NOT NULL,
+        UNIQUE(broadcast_key, platform, user_id)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS feedback_campaign_likes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_key TEXT NOT NULL, platform TEXT NOT NULL,
+        user_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(campaign_key, platform, user_id)
+    )""")
     _run_db_migrations(conn)
     conn.commit()
     conn.close()
@@ -727,6 +786,7 @@ def mark_payment_canceled(payment_id):
     now=datetime.now().isoformat()
     with db_connect() as conn:
         conn.execute("UPDATE payments SET status='canceled',raw_status='canceled',updated_at=? WHERE payment_id=?",(now,payment_id)); conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+        conn.execute("UPDATE support_payments SET status='canceled',updated_at=? WHERE payment_id=?",(now,payment_id))
 
 def process_subscription_payment(payment_id,user_id,plan):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now(); conn=db_connect()
@@ -767,7 +827,8 @@ def plan_rank(plan):
 
 
 def has_plan_access(user_id, minimum="start"):
-    return plan_rank(get_user_plan(user_id)) >= plan_rank(minimum)
+    # Проект бесплатный: весь функционал доступен всем без тарифа.
+    return True
 
 
 def get_credit(user_id, product_code):
@@ -815,16 +876,18 @@ def consume_credit(user_id, product_code):
 
 
 def can_use_product(user_id, product_code):
-    return get_user_plan(user_id) in PRO_PLANS or get_credit(user_id, product_code) > 0
+    # Проект бесплатный: разовые разборы и отчёты доступны без покупки.
+    return True
 
 
 def question_limit_for(user_id):
-    base = PLAN_LIMITS[get_user_plan(user_id)]["questions"]
-    return None if base is None else int(base) + get_referral_bonus_questions(user_id)
+    # Проект бесплатный: лимит AI-вопросов снят для всех тарифов.
+    return None
 
 
 def psycho_limit_for(user_id):
-    return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
+    # Проект бесплатный: лимит поддерживающего диалога снят для всех тарифов.
+    return None
 
 
 FUNNEL_QUESTION_PROMPTS = {
@@ -832,11 +895,112 @@ FUNNEL_QUESTION_PROMPTS = {
     "funnel_feeding": "🥣 Опиши вопрос о питании или кормлении: возраст ребёнка, тип питания и что именно вызывает сомнения.",
     "funnel_development": "👶 Напиши возраст ребёнка и навык или поведение, которое хочешь проверить по возрасту.",
     "funnel_tantrum": "🧠 Опиши последнюю истерику: возраст, что произошло перед ней и как ребёнок успокоился.",
+    "funnel_garden": "🎒 Опиши, что происходит с садиком: возраст ребёнка, как давно ходит, когда тяжелее всего и что уже пробовали.",
+    "funnel_school": "📚 Опиши ситуацию со школой, уроками или оценками: возраст ребёнка, что вызывает конфликт и как он обычно заканчивается.",
+    "funnel_gadgets": "📱 Опиши ситуацию с гаджетами: возраст ребёнка, сколько экранного времени сейчас и из-за чего чаще всего спорите.",
+    "funnel_grandma": "👵 Опиши ситуацию с бабушками или родственниками: о чём спор, где нужна граница и какого разговора ты хочешь.",
     "funnel_doctor": "🩺 Опиши симптомы и наблюдения. Я помогу собрать важное и подготовить вопросы врачу. Диагноз бот не ставит.",
     "funnel_mom": "🤍 Расскажи, что сейчас даётся тяжелее всего. Я помогу спокойно разобрать ситуацию по шагам.",
     "funnel_family": "👨‍👩‍👧 Опиши семейную ситуацию и чего ты хочешь добиться в следующем разговоре.",
     "funnel_pregnancy": "🤰 Напиши срок беременности и вопрос, который сейчас волнует больше всего.",
 }
+
+
+CHANNEL_LANDING = {
+    "channel_today": {
+        "title": "Получить персональный ответ",
+        "free": "Ответьте на один вопрос — получите короткий план по вашей ситуации.",
+        "button": "Задать вопрос",
+        "callback": "ask_question",
+    },
+    "channel_doctor": {
+        "title": "Ребёнок заболел — подготовить вопросы врачу",
+        "free": "Сейчас помогу собрать симптомы, что записать перед приёмом и какие вопросы задать врачу.",
+        "button": "Подготовить вопросы врачу",
+        "callback": "funnel_doctor",
+    },
+    "channel_sleep": {
+        "title": "Плохо спит — разобрать режим",
+        "free": "Ответьте на несколько вопросов — получите первичный разбор режима и 2–3 идеи, что попробовать сегодня.",
+        "button": "Разобрать сон ребёнка",
+        "callback": "funnel_sleep",
+    },
+    "channel_tantrum": {
+        "title": "Истерики и поведение — получить план действий",
+        "free": "Сначала бесплатно разберём ситуацию: что делать родителю, чего лучше не делать и что сказать ребёнку.",
+        "button": "Понять, что делать при истерике",
+        "callback": "funnel_tantrum",
+    },
+    "channel_garden": {
+        "title": "Не хочет в садик — понять, что делать",
+        "free": "Соберём короткий чек-лист адаптации, вопросы воспитателю и способ облегчить утро.",
+        "button": "Разобрать адаптацию к садику",
+        "callback": "funnel_garden",
+    },
+    "channel_school": {
+        "title": "Школа, уроки, оценки — получить подсказки",
+        "free": "Получите короткий план по одной ситуации, вопросы ребёнку после школы и идею, как снизить конфликт.",
+        "button": "Получить подсказки по школе",
+        "callback": "funnel_school",
+    },
+    "channel_feeding": {
+        "title": "Что приготовить ребёнку",
+        "free": "Подберём 1–3 идеи завтрака, перекуса или ужина и простой рецепт из доступных продуктов.",
+        "button": "Получить подсказку по питанию",
+        "callback": "funnel_feeding",
+    },
+    "channel_psycho": {
+        "title": "Мама устала — поговорить с помощником",
+        "free": "Можно начать с бесплатных сообщений психологическому помощнику и собрать короткий план разгрузки на день.",
+        "button": "Поговорить с психологическим помощником",
+        "callback": "psycho_start",
+    },
+    "channel_grandma": {
+        "title": "Бабушки и воспитание — договориться без ссоры",
+        "free": "Соберём готовые фразы для разговора и способ обозначить границы без конфликта.",
+        "button": "Подготовить разговор",
+        "callback": "funnel_grandma",
+    },
+    "channel_gadgets": {
+        "title": "Гаджеты и экранное время",
+        "free": "Соберём короткий план семейных правил, чтобы телефон не превращался в постоянную войну.",
+        "button": "Составить правила экранного времени",
+        "callback": "funnel_gadgets",
+    },
+    "channel_child": {
+        "title": "Понять развитие ребёнка по возрасту",
+        "free": "Опишите возраст и навык — получите спокойную подсказку, что обычно важно проверить.",
+        "button": "Проверить развитие",
+        "callback": "funnel_development",
+    },
+    "channel_family": {
+        "title": "Семейная ситуация — подготовить разговор",
+        "free": "Разберём, что важно сказать, где поставить границу и как не усиливать конфликт.",
+        "button": "Подготовить разговор",
+        "callback": "funnel_family",
+    },
+    "channel_pregnancy": {
+        "title": "Беременность — получить подсказку по сроку",
+        "free": "Напишите срок и вопрос — получите понятный бесплатный ответ с учётом беременности.",
+        "button": "Задать вопрос по беременности",
+        "callback": "funnel_pregnancy",
+    },
+}
+
+
+def channel_landing_tg(payload):
+    item = CHANNEL_LANDING.get(payload, CHANNEL_LANDING["channel_today"])
+    text = (
+        f"{item['title']}\n\n"
+        f"{item['free']}\n\n"
+        "Это не заменяет врача или специалиста, но поможет не забыть важное.\n\n"
+        "Ответ бесплатный — как и все остальные функции «Маминого помощника»."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=item["button"], callback_data=item["callback"])],
+        [InlineKeyboardButton(text="Все функции Маминого помощника", callback_data="main_menu")],
+    ])
+    return text, markup
 
 
 def _question_next_action(question_text, mode="mama"):
@@ -845,6 +1009,10 @@ def _question_next_action(question_text, mode="mama"):
         (("сон", "засып", "просып", "режим"), "🌙 Ещё вопрос о сне", "funnel_sleep"),
         (("корм", "питан", "прикорм", "смесь", "гв"), "🥣 Уточнить питание", "funnel_feeding"),
         (("истер", "каприз", "плач", "поведен"), "🧠 Понять поведение", "funnel_tantrum"),
+        (("сад", "адаптац", "воспитател"), "🎒 Разобрать садик", "funnel_garden"),
+        (("школ", "урок", "оцен"), "📚 Разобрать школу", "funnel_school"),
+        (("гаджет", "телефон", "экран", "мультик"), "📱 Настроить правила", "funnel_gadgets"),
+        (("бабуш", "дедуш", "родствен", "границ"), "👵 Подготовить разговор", "funnel_grandma"),
         (("развит", "речь", "навык", "возраст"), "👶 Проверить развитие", "funnel_development"),
         (("врач", "температур", "сып", "симптом", "болит", "лекар"), "🩺 Подготовить вопросы врачу", "funnel_doctor"),
         (("муж", "пап", "отношен", "семь"), "👨‍👩‍👧 Разобрать семью", "funnel_family"),
@@ -856,35 +1024,23 @@ def _question_next_action(question_text, mode="mama"):
 
 
 def build_question_funnel_tg(user_id, question_text=""):
-    plan = get_user_plan(user_id); limit = question_limit_for(user_id); used = get_request_count(user_id)
-    remaining = None if limit is None else max(0, limit - used)
+    # Проект бесплатный: без счётчика оставшихся вопросов и без цен.
     user = get_user(user_id); mode = user[0] if user else "mama"
     next_label, next_callback = _question_next_action(question_text, mode)
-    if plan == "free":
-        if remaining == 4:
-            text = "🤍 Ответ готов. Бесплатных персональных разборов осталось: 4 из 5."
-            rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
-        elif remaining == 3:
-            text = "🤍 Осталось 3 бесплатных разбора. Можно продолжить со сном, питанием, развитием, здоровьем или семейной ситуацией."
-            rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
-        elif remaining == 2:
-            text = "🤍 Осталось 2 бесплатных разбора. В «Старт» доступно 30 вопросов на 30 дней и основные трекеры."
-            rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)], [InlineKeyboardButton(text="🌱 Старт — 190 ₽", callback_data="pay_plan_start")]]
-        elif remaining == 1:
-            text = "🤍 Остался 1 бесплатный разбор. Используй его для вопроса, который тревожит сильнее всего."
-            rows = [[InlineKeyboardButton(text="❓ Задать последний вопрос", callback_data=next_callback)], [InlineKeyboardButton(text="💎 Посмотреть возможности", callback_data="pay_premium")]]
-        else:
-            text = "🤍 Бесплатные разборы закончились. Продолжить можно с тарифа «Старт» за 190 ₽ или получить бонус за приглашение подруги."
-            rows = [[InlineKeyboardButton(text="🌱 Продолжить — 190 ₽", callback_data="pay_plan_start")], [InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="pay_premium")], [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")]]
-    elif plan == "start":
-        text = f"✨ Использовано {used} из 30 вопросов тарифа «Старт»."
-        rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
-        if remaining is not None and remaining <= 6:
-            text += " В «Про» вопросы без лимита и доступны расширенные отчёты."
-            rows.append([InlineKeyboardButton(text="💎 Перейти на Про — 390 ₽", callback_data="pay_plan_pro")])
-    else:
-        text = "✨ Готово. Можно продолжить с ещё одним вопросом."
-        rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
+    text = "✨ Готово. Можно продолжить с ещё одним вопросом."
+    rows = [[InlineKeyboardButton(text=next_label, callback_data=next_callback)]]
+    lower_question = (question_text or "").lower()
+    soft_offer = ""
+    if any(word in lower_question for word in ("врач", "температур", "сып", "симптом", "болит", "лекар")):
+        soft_offer = "Если нужно, бот может собрать полную сводку для врача по вашим ответам — это бесплатно."
+    elif any(word in lower_question for word in ("сон", "засып", "просып", "режим")):
+        soft_offer = "Если проблема повторяется, можно сделать подробный разбор сна с учётом возраста и режима."
+    elif any(word in lower_question for word in ("корм", "питан", "прикорм", "смесь", "гв", "рецепт", "ужин", "завтрак")):
+        soft_offer = "Если нужна более точная картина, можно продолжить разбор питания или кормлений."
+    elif any(word in lower_question for word in ("истер", "каприз", "поведен", "сад", "школ", "урок", "оцен", "гаджет", "телефон", "экран", "бабуш", "границ")):
+        soft_offer = "Если ситуация повторяется часто, её можно разобрать подробнее с персональным планом."
+    if soft_offer:
+        text += "\n\n" + soft_offer
     rows.append([InlineKeyboardButton(text="📣 Вернуться в канал", url="https://t.me/yamama_ai")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -913,8 +1069,8 @@ def increment_usage_counter(user_id, counter):
 
 
 def can_show_marketing_offer(user_id, offer_type, global_hours=24, repeat_hours=72):
-    if get_user_plan(user_id) in PRO_PLANS:
-        return False
+    # Проект бесплатный: больше не предлагаем купить тариф.
+    return False
     conn = db_connect()
     try:
         rows = conn.execute(
@@ -964,13 +1120,7 @@ async def maybe_send_marketing_offer(chat_id, user_id, offer_type, text, rows):
 
 
 def callback_feature(payload):
-    if payload in {"doctor_prep"}: return ("product", "doctor_report")
-    if payload in {"weekly_report"}: return ("product", "weekly_report")
-    if payload in {"sleep_analyze"}: return ("product", "sleep_report")
-    if payload in {"feed_stats"}: return ("product", "feeding_report")
-    if payload in {"photo_menu", "photo_analysis", "photo_uzi", "photo_med_preg", "photo_skin", "photo_stool", "photo_food", "photo_package"}: return ("product", "photo_analysis")
-    if payload in {"tracker_growth", "growth_add", "growth_analyze", "tracker_symptoms", "symptom_add", "symptom_analyze", "tracker_feeding", "feed_left", "feed_right", "feed_bottle", "tracker_sleep", "sleep_start", "sleep_end", "tracker_vaccines", "vaccines_create", "vaccines_done", "vaccines_info", "benefits_menu", "ben_birth", "ben_15", "ben_3", "ben_matcap", "ben_decree", "ben_multi", "ben_personal"} or payload.startswith("vac_"):
-        return ("plan", "start")
+    # Проект бесплатный: ни один callback больше не требует тарифа или покупки.
     return None
 
 def save_vaccination(user_id, vaccine, scheduled_date):
@@ -1553,33 +1703,45 @@ def kb_emergency():
     ])
 
 # ─── КЛАВИАТУРЫ ──────────────────────────────────────────────
-def kb_start():
-    return InlineKeyboardMarkup(inline_keyboard=[
+MINIAPP_URL = "https://maminpomoshnik.ru/app/"
+
+
+def _with_owner_button(rows, user_id=None):
+    if OWNER_ID and int(user_id or 0) == OWNER_ID:
+        rows.append([InlineKeyboardButton(text="👑 Кабинет владельца", callback_data="owner_cab:home")])
+    return rows
+
+
+def kb_start(user_id=None):
+    return InlineKeyboardMarkup(inline_keyboard=_with_owner_button([
         [InlineKeyboardButton(text="🤰 Я беременна", callback_data="mode_pregnant")],
         [InlineKeyboardButton(text="👩 Я уже мама", callback_data="mode_mama")],
+        [InlineKeyboardButton(text="📱 Открыть приложение", web_app=WebAppInfo(url=MINIAPP_URL))],
         [InlineKeyboardButton(text="📢 Наш канал", url="https://t.me/yamama_ai")],
-        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="❤️ Поддержать проект", callback_data="donate_menu"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")]
-    ])
+    ], user_id))
 
-def kb_pregnant_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
+def kb_pregnant_menu(user_id=None):
+    return InlineKeyboardMarkup(inline_keyboard=_with_owner_button([
         [InlineKeyboardButton(text="✨ Сегодня", callback_data="today_brief")],
+        [InlineKeyboardButton(text="📱 Открыть приложение", web_app=WebAppInfo(url=MINIAPP_URL))],
         [InlineKeyboardButton(text="🤰 Беременность", callback_data="cat_pregnancy"),
          InlineKeyboardButton(text="❤️ Здоровье", callback_data="cat_preg_health")],
         [InlineKeyboardButton(text="🧠 Для мамы", callback_data="cat_mom_preg"),
          InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="❤️ Поддержать проект", callback_data="donate_menu"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
         [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
-    ])
+    ], user_id))
 
 
-def kb_mama_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
+def kb_mama_menu(user_id=None):
+    return InlineKeyboardMarkup(inline_keyboard=_with_owner_button([
         [InlineKeyboardButton(text="✨ Сегодня", callback_data="today_brief")],
+        [InlineKeyboardButton(text="📱 Открыть приложение", web_app=WebAppInfo(url=MINIAPP_URL))],
         [InlineKeyboardButton(text="👶 Ребёнок", callback_data="cat_child"),
          InlineKeyboardButton(text="❤️ Здоровье", callback_data="cat_health")],
         [InlineKeyboardButton(text="📊 Трекеры", callback_data="cat_trackers"),
@@ -1587,11 +1749,11 @@ def kb_mama_menu():
         [InlineKeyboardButton(text="👨‍👩‍👧 Семья", callback_data="cat_family"),
          InlineKeyboardButton(text="📓 Мои данные", callback_data="profile")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 Премиум", callback_data="pay_premium"),
+        [InlineKeyboardButton(text="❤️ Поддержать проект", callback_data="donate_menu"),
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support_menu")],
         [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")],
         [InlineKeyboardButton(text="🔄 Изменить данные", callback_data="change_data")]
-    ])
+    ], user_id))
 
 
 def kb_cat_child():
@@ -1606,9 +1768,9 @@ def kb_cat_child():
          InlineKeyboardButton(text="😴 Проблемы со сном", callback_data="mama_sleep")],
         [InlineKeyboardButton(text="😢 Истерики и капризы", callback_data="mama_tantrums")],
         [InlineKeyboardButton(text="📋 Первые дни с малышом", callback_data="mama_firstdays")],
-        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="🌙 Разбор сна · Про / 199 ₽", callback_data="buy_sleep_report")],
-        [InlineKeyboardButton(text="📈 Отчёт за неделю · Про / 199 ₽", callback_data="buy_weekly_report")],
+        [InlineKeyboardButton(text="✨ ДОПОЛНИТЕЛЬНО", callback_data="noop")],
+        [InlineKeyboardButton(text="🌙 Разбор сна", callback_data="sleep_analyze")],
+        [InlineKeyboardButton(text="📈 Отчёт за неделю", callback_data="weekly_report")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
@@ -1620,10 +1782,10 @@ def kb_cat_health():
         [InlineKeyboardButton(text="🌡 Здоровье", callback_data="mama_health"),
          InlineKeyboardButton(text="💊 Лекарства", callback_data="mama_meds")],
         [InlineKeyboardButton(text="🦷 Зубки", callback_data="mama_teeth")],
-        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="🩺 Сводка врачу · Про / 149 ₽", callback_data="doctor_prep")],
-        [InlineKeyboardButton(text="📸 Анализ фото · Про / 99 ₽", callback_data="photo_menu")],
-        [InlineKeyboardButton(text="💉 Прививки · Старт", callback_data="check_premium_vaccines")],
+        [InlineKeyboardButton(text="✨ ДОПОЛНИТЕЛЬНО", callback_data="noop")],
+        [InlineKeyboardButton(text="🩺 Сводка врачу", callback_data="doctor_prep")],
+        [InlineKeyboardButton(text="📸 Анализ фото", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="💉 Прививки", callback_data="check_premium_vaccines")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
@@ -1632,15 +1794,15 @@ def kb_cat_trackers():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
-        [InlineKeyboardButton(text="🌱 ДОСТУПНО СО СТАРТ", callback_data="noop")],
-        [InlineKeyboardButton(text="📏 Рост и вес · Старт", callback_data="check_premium_growth"),
-         InlineKeyboardButton(text="🌡 Симптомы · Старт", callback_data="check_premium_symptoms")],
-        [InlineKeyboardButton(text="🤱 Кормления · Старт", callback_data="check_premium_feeding"),
-         InlineKeyboardButton(text="🌙 Сон · Старт", callback_data="check_premium_sleep")],
-        [InlineKeyboardButton(text="💎 ГЛУБОКИЙ АНАЛИЗ", callback_data="noop")],
-        [InlineKeyboardButton(text="🤱 Разбор кормлений · Про / 149 ₽", callback_data="buy_feeding_report")],
-        [InlineKeyboardButton(text="🌙 Разбор сна · Про / 199 ₽", callback_data="buy_sleep_report")],
-        [InlineKeyboardButton(text="📈 Отчёт за 7 дней · Про / 199 ₽", callback_data="weekly_report")],
+        [InlineKeyboardButton(text="📊 ТРЕКЕРЫ", callback_data="noop")],
+        [InlineKeyboardButton(text="📏 Рост и вес", callback_data="check_premium_growth"),
+         InlineKeyboardButton(text="🌡 Симптомы", callback_data="check_premium_symptoms")],
+        [InlineKeyboardButton(text="🤱 Кормления", callback_data="check_premium_feeding"),
+         InlineKeyboardButton(text="🌙 Сон", callback_data="check_premium_sleep")],
+        [InlineKeyboardButton(text="✨ ГЛУБОКИЙ АНАЛИЗ", callback_data="noop")],
+        [InlineKeyboardButton(text="🤱 Разбор кормлений", callback_data="feed_stats")],
+        [InlineKeyboardButton(text="🌙 Разбор сна", callback_data="sleep_analyze")],
+        [InlineKeyboardButton(text="📈 Отчёт за 7 дней", callback_data="weekly_report")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
@@ -1651,9 +1813,9 @@ def kb_cat_mom():
         [InlineKeyboardButton(text="🧠 Эмоции мамы", callback_data="mama_emotions")],
         [InlineKeyboardButton(text="🤱 Грудное вскармливание", callback_data="mama_breastfeeding")],
         [InlineKeyboardButton(text="🏥 Восстановление мамы", callback_data="mama_recovery")],
-        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="🧠 Мамин психолог · 15 бесплатно", callback_data="psycho_start")],
-        [InlineKeyboardButton(text="💰 Пособия и выплаты · Старт", callback_data="check_premium_benefits")],
+        [InlineKeyboardButton(text="✨ ДОПОЛНИТЕЛЬНО", callback_data="noop")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
@@ -1663,8 +1825,8 @@ def kb_cat_family():
         [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="👨‍👩‍👧 Отношения в семье", callback_data="mama_family")],
         [InlineKeyboardButton(text="📓 Дневник малыша", callback_data="mama_diary")],
-        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="📈 Недельный отчёт · Про / 199 ₽", callback_data="weekly_report")],
+        [InlineKeyboardButton(text="✨ ДОПОЛНИТЕЛЬНО", callback_data="noop")],
+        [InlineKeyboardButton(text="📈 Недельный отчёт", callback_data="weekly_report")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_mama")]
     ])
 
@@ -1684,8 +1846,8 @@ def kb_cat_preg_health():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="❓ Задать вопрос", callback_data="ask_question")],
-        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="📸 Анализы и УЗИ · Про / 99 ₽", callback_data="photo_menu")],
+        [InlineKeyboardButton(text="✨ ДОПОЛНИТЕЛЬНО", callback_data="noop")],
+        [InlineKeyboardButton(text="📸 Анализы и УЗИ", callback_data="photo_menu")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
     ])
 
@@ -1694,9 +1856,9 @@ def kb_cat_mom_preg():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆓 БЕСПЛАТНО", callback_data="noop")],
         [InlineKeyboardButton(text="🧠 Эмоциональная поддержка", callback_data="mama_emotions")],
-        [InlineKeyboardButton(text="💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ", callback_data="noop")],
-        [InlineKeyboardButton(text="🧠 Мамин психолог · 15 бесплатно", callback_data="psycho_start")],
-        [InlineKeyboardButton(text="💰 Пособия и выплаты · Старт", callback_data="check_premium_benefits")],
+        [InlineKeyboardButton(text="✨ ДОПОЛНИТЕЛЬНО", callback_data="noop")],
+        [InlineKeyboardButton(text="🧠 Мамин психолог", callback_data="psycho_start")],
+        [InlineKeyboardButton(text="💰 Пособия и выплаты", callback_data="check_premium_benefits")],
         [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu_pregnant")]
     ])
 
@@ -1763,14 +1925,334 @@ def kb_back_to_menu(mode):
         [InlineKeyboardButton(text="🏠 Главная", callback_data="main_menu")]
     ])
 
+
+OWNER_SECTIONS = {
+    "today": "📊 Сегодня",
+    "sales": "💰 Продажи",
+    "users": "👥 Пользователи",
+    "funnel": "📈 Воронка",
+    "sources": "🎯 Источники рекламы",
+    "ads": "📣 Реклама",
+    "errors": "⚠️ Ошибки",
+    "feedback": "💬 Обратная связь",
+    "broadcast": "📤 Рассылка",
+    "export": "📄 Экспорт / Google-таблица",
+    "check": "🧪 Проверка бота",
+}
+
+
+def owner_cabinet_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Сегодня", callback_data="owner_cab:today"),
+         InlineKeyboardButton(text="💰 Продажи", callback_data="owner_cab:sales")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="owner_cab:users"),
+         InlineKeyboardButton(text="📈 Воронка", callback_data="owner_cab:funnel")],
+        [InlineKeyboardButton(text="🎯 Источники рекламы", callback_data="owner_cab:sources"),
+         InlineKeyboardButton(text="📣 Реклама", callback_data="owner_cab:ads")],
+        [InlineKeyboardButton(text="⚠️ Ошибки", callback_data="owner_cab:errors"),
+         InlineKeyboardButton(text="💬 Обратная связь", callback_data="owner_cab:feedback")],
+        [InlineKeyboardButton(text="📤 Рассылка", callback_data="owner_cab:broadcast")],
+        [InlineKeyboardButton(text="📄 Экспорт / Google-таблица", callback_data="owner_cab:export")],
+        [InlineKeyboardButton(text="🧪 Проверка бота", callback_data="owner_cab:check")],
+        [InlineKeyboardButton(text="🏠 В обычное меню", callback_data="main_menu")],
+    ])
+
+
+def owner_back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="owner_cab:home"),
+         InlineKeyboardButton(text="🏠 В обычное меню", callback_data="main_menu")]
+    ])
+
+
+def owner_home_text():
+    return "👑 Кабинет владельца «Мамин помощник»\n\nВыберите раздел:"
+
+
+def _owner_conn(path):
+    conn = sqlite3.connect(path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _owner_table_exists(conn, table):
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def _owner_scalar(path, sql, params=(), default=0):
+    try:
+        with _owner_conn(path) as conn:
+            return conn.execute(sql, params).fetchone()[0] or default
+    except Exception:
+        return default
+
+
+def _owner_sales(path, since):
+    try:
+        with _owner_conn(path) as conn:
+            if _owner_table_exists(conn, "sales_events"):
+                rows = conn.execute("SELECT product_code, amount FROM sales_events WHERE created_at>=?", (since,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT product_code, amount FROM payments WHERE status IN ('processed','succeeded') AND updated_at>=?",
+                    (since,),
+                ).fetchall()
+        count = len(rows)
+        amount = sum(float(r["amount"] or 0) for r in rows)
+        products = {}
+        for r in rows:
+            code = r["product_code"] or "unknown"
+            products[code] = products.get(code, 0) + 1
+        return count, amount, products
+    except Exception:
+        return 0, 0.0, {}
+
+
+def _owner_event_count(path, since, names=None, source_prefix=None):
+    try:
+        with _owner_conn(path) as conn:
+            if not _owner_table_exists(conn, "analytics_events"):
+                return 0
+            sql = "SELECT COUNT(*) FROM analytics_events WHERE created_at>=?"
+            params = [since]
+            if names:
+                sql += " AND event_name IN (%s)" % ",".join("?" for _ in names)
+                params.extend(names)
+            if source_prefix:
+                sql += " AND source LIKE ?"
+                params.append(source_prefix + "%")
+            return conn.execute(sql, params).fetchone()[0] or 0
+    except Exception:
+        return 0
+
+
+def _owner_top_sources(path, since, limit=3):
+    try:
+        with _owner_conn(path) as conn:
+            if not _owner_table_exists(conn, "analytics_events"):
+                return []
+            return conn.execute(
+                "SELECT COALESCE(NULLIF(source,''),'organic') source, COUNT(*) cnt "
+                "FROM analytics_events WHERE created_at>=? AND (source LIKE 'channel_%' OR source LIKE 'ref_%') "
+                "GROUP BY source ORDER BY cnt DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+    except Exception:
+        return []
+
+
+def _owner_user_counts(path, platform):
+    if platform == "tg":
+        today_sql = "SELECT COUNT(*) FROM users WHERE created_at>=?"
+        complete_sql = "SELECT COUNT(*) FROM users WHERE COALESCE(mode,'')<>'' AND COALESCE(date_value,'')<>''"
+        pregnant_sql = "SELECT COUNT(*) FROM users WHERE mode='pregnant'"
+        mama_sql = "SELECT COUNT(*) FROM users WHERE mode='mama'"
+    else:
+        today_sql = "SELECT COUNT(*) FROM users WHERE registered_at>=?"
+        complete_sql = "SELECT COUNT(*) FROM users WHERE COALESCE(birth_date,'')<>''"
+        pregnant_sql = "SELECT COUNT(*) FROM users WHERE birth_date LIKE 'pdr:%'"
+        mama_sql = "SELECT COUNT(*) FROM users WHERE COALESCE(birth_date,'')<>'' AND birth_date NOT LIKE 'pdr:%'"
+    today = date.today().isoformat()
+    week = (datetime.now() - timedelta(days=7)).isoformat()
+    month = (datetime.now() - timedelta(days=30)).isoformat()
+    return {
+        "total": _owner_scalar(path, "SELECT COUNT(*) FROM users"),
+        "today": _owner_scalar(path, today_sql, (today,)),
+        "week": _owner_scalar(path, today_sql, (week,)),
+        "month": _owner_scalar(path, today_sql, (month,)),
+        "complete": _owner_scalar(path, complete_sql),
+        "pregnant": _owner_scalar(path, pregnant_sql),
+        "mama": _owner_scalar(path, mama_sql),
+    }
+
+
+def _owner_product_lines(products):
+    names = {**{k: v["name"] for k, v in PLAN_CATALOG.items()}, **{k: v["name"] for k, v in ONE_TIME_PRODUCTS.items()}}
+    if not products:
+        return "нет"
+    return ", ".join(f"{names.get(k, k)}: {v}" for k, v in sorted(products.items(), key=lambda item: (-item[1], item[0]))[:8])
+
+
+def _owner_report(section):
+    now = datetime.now()
+    today = date.today().isoformat()
+    week = (now - timedelta(days=7)).isoformat()
+    month = (now - timedelta(days=30)).isoformat()
+    dbs = [("TG", DB_PATH), ("MAX", MAX_DB_PATH)]
+    if section == "today":
+        tg = _owner_user_counts(DB_PATH, "tg")
+        mx = _owner_user_counts(MAX_DB_PATH, "max")
+        active = sum(_owner_event_count(path, today) for _, path in dbs)
+        ad = sum(_owner_event_count(path, today, source_prefix="channel_") for _, path in dbs)
+        sales = [_owner_sales(path, today) for _, path in dbs]
+        pay_count = sum(item[0] for item in sales)
+        pay_sum = sum(item[1] for item in sales)
+        errors = sum(_owner_event_count(path, today, names=("error_logged",)) for _, path in dbs)
+        source_rows = []
+        for label, path in dbs:
+            source_rows.extend((label, r["source"], r["cnt"]) for r in _owner_top_sources(path, today))
+        top = "\n".join(f"• {src} ({label}): {cnt}" for label, src, cnt in source_rows[:3]) or "нет данных"
+        scenarios = ["doctor", "sleep", "feeding", "psycho", "tantrum", "garden", "school", "gadgets", "grandma"]
+        scen_lines = []
+        for key in scenarios:
+            cnt = sum(_owner_event_count(path, today, names=("free_result_started", "funnel_question_opened"), source_prefix=f"channel_{key}") for _, path in dbs)
+            scen_lines.append(f"{key}: {cnt}")
+        return (
+            "📊 Сегодня\n\n"
+            f"Новые TG: {tg['today']}\nНовые MAX: {mx['today']}\nВсего новых: {tg['today'] + mx['today']}\n"
+            f"Активных по событиям: {active}\nРекламные payload: {ad}\n"
+            f"Оплат: {pay_count}\nСумма: {pay_sum:.0f} ₽\nОшибки: {errors}\n\n"
+            f"Топ источников:\n{top}\n\nБесплатные сценарии:\n" + "\n".join(scen_lines)
+        )
+    if section == "sales":
+        lines = ["💰 Продажи"]
+        for label, since in (("Сегодня", today), ("7 дней", week), ("30 дней", month)):
+            sales = [_owner_sales(path, since) for _, path in dbs]
+            count = sum(item[0] for item in sales)
+            amount = sum(item[1] for item in sales)
+            products = {}
+            for _, _, prod in sales:
+                for k, v in prod.items():
+                    products[k] = products.get(k, 0) + v
+            avg = amount / count if count else 0
+            lines.append(f"\n{label}: {count} оплат, {amount:.0f} ₽, средний чек {avg:.0f} ₽\nПродукты: {_owner_product_lines(products)}")
+        tg30 = _owner_sales(DB_PATH, month)
+        mx30 = _owner_sales(MAX_DB_PATH, month)
+        lines.append(f"\nПлатформы 30 дней: TG {tg30[0]} / {tg30[1]:.0f} ₽, MAX {mx30[0]} / {mx30[1]:.0f} ₽")
+        return "\n".join(lines)
+    if section == "users":
+        tg = _owner_user_counts(DB_PATH, "tg")
+        mx = _owner_user_counts(MAX_DB_PATH, "max")
+        active_today = sum(_owner_event_count(path, today) for _, path in dbs)
+        active_week = sum(_owner_event_count(path, week) for _, path in dbs)
+        paid = sum(_owner_scalar(path, "SELECT COUNT(*) FROM subscriptions WHERE plan IN ('start','pro','pro_year') AND COALESCE(sub_end,'')<>''") for _, path in dbs)
+        one_time = sum(_owner_scalar(path, "SELECT COUNT(DISTINCT user_id) FROM purchases") for _, path in dbs)
+        return (
+            "👥 Пользователи\n\n"
+            f"Всего: {tg['total'] + mx['total']} (TG {tg['total']}, MAX {mx['total']})\n"
+            f"Новые: сегодня {tg['today'] + mx['today']}, 7 дней {tg['week'] + mx['week']}, 30 дней {tg['month'] + mx['month']}\n"
+            f"Активные: сегодня {active_today}, 7 дней {active_week}\n"
+            f"Беременные: {tg['pregnant'] + mx['pregnant']}\nМамы: {tg['mama'] + mx['mama']}\n"
+            f"Профиль заполнен: {tg['complete'] + mx['complete']}\nБез завершённого профиля: {tg['total'] + mx['total'] - tg['complete'] - mx['complete']}\n"
+            f"Платные тарифы: {paid}\nРазовые покупки: {one_time}"
+        )
+    if section == "funnel":
+        steps = [
+            ("Перешёл по ссылке", ("channel_click", "ad_payload_opened")),
+            ("Start / bot_started", ("user_start",)),
+            ("Профиль заполнен", ("profile_completed",)),
+            ("Бесплатный сценарий", ("free_result_started", "funnel_question_opened")),
+            ("Бесплатный результат", ("free_result_completed",)),
+            ("Платный оффер", ("paid_offer_shown",)),
+            ("Нажал оплату", ("payment_clicked",)),
+            ("Оплатил", ("payment_success", "payment_succeeded")),
+        ]
+        lines = ["📈 Воронка за 30 дней"]
+        for title, names in steps:
+            lines.append(f"{title}: {sum(_owner_event_count(path, month, names=names) for _, path in dbs)}")
+        return "\n".join(lines)
+    if section == "sources":
+        lines = ["🎯 Источники рекламы за 30 дней"]
+        sources = {}
+        for _, path in dbs:
+            for row in _owner_top_sources(path, month, 20):
+                sources[row["source"]] = sources.get(row["source"], 0) + row["cnt"]
+        if not sources:
+            lines.append("Данных по источникам пока нет.")
+        for src, cnt in sorted(sources.items(), key=lambda item: (-item[1], item[0]))[:15]:
+            paid = sum(_owner_event_count(path, month, names=("payment_success", "payment_succeeded"), source_prefix=src) for _, path in dbs)
+            conv = (paid / cnt * 100) if cnt else 0
+            lines.append(f"• {src}: входов {cnt}, оплат {paid}, конверсия {conv:.1f}%")
+        return "\n".join(lines)
+    if section == "ads":
+        bot_link = "https://t.me/MaminPomoshnikAI_bot?start="
+        topics = [("врач", "channel_doctor"), ("сон", "channel_sleep"), ("питание", "channel_feeding"), ("психолог", "channel_psycho"), ("истерики", "channel_tantrum"), ("садик", "channel_garden"), ("школа", "channel_school"), ("гаджеты", "channel_gadgets"), ("бабушки", "channel_grandma")]
+        lines = ["📣 Реклама", "Telegram ссылки:"]
+        for title, payload in topics:
+            lines.append(f"• {title}: {bot_link}{payload}")
+            lines.append(f"  ya/vk/land: {payload}_ya1 | {payload}_vk1 | {payload}_land1")
+        lines.append("\nMAX: публичная ссылка формируется в MAX-боте, если задан MAX_BOT_PUBLIC_URL.")
+        return "\n".join(lines)
+    if section == "errors":
+        today_count = sum(_owner_event_count(path, today, names=("error_logged",)) for _, path in dbs)
+        week_count = sum(_owner_event_count(path, week, names=("error_logged",)) for _, path in dbs)
+        return f"⚠️ Ошибки\n\nСегодня: {today_count}\nЗа 7 дней: {week_count}\n\nСистемный journal из бота не читается, чтобы не подвешивать процесс."
+    if section == "feedback":
+        lines = ["💬 Обратная связь"]
+        try:
+            with _owner_conn(MAX_DB_PATH) as conn:
+                if _owner_table_exists(conn, "reviews"):
+                    rows = conn.execute("SELECT created_at, review FROM reviews ORDER BY id DESC LIMIT 10").fetchall()
+                    lines.extend(f"• {r['created_at'][:16]}: {str(r['review'])[:160]}" for r in rows)
+        except Exception:
+            pass
+        if len(lines) == 1:
+            lines.append("Отдельная таблица отзывов есть в MAX; свежих записей не найдено.")
+        return "\n".join(lines)
+    if section == "broadcast":
+        tg = _owner_user_counts(DB_PATH, "tg")["total"]
+        mx = _owner_user_counts(MAX_DB_PATH, "max")["total"]
+        return f"📤 Рассылка\n\nРассылка пока в безопасном режиме.\nПотенциальные получатели: TG {tg}, MAX {mx}.\n\nМассовая отправка из этого кабинета не выполняется."
+    if section == "export":
+        return "📄 Экспорт / Google-таблица\n\nИнтеграция Google Sheets в проекте уже есть для пользователей/продаж/отзывов.\n\nОтдельный экспорт кабинета подключается отдельной задачей.\nЛисты: Mama TG, Mama MAX, Продажи, Реклама, Ошибки, Воронка."
+    if section == "check":
+        def hb(path):
+            try:
+                dt = datetime.fromtimestamp(os.path.getmtime(path))
+                age = int((datetime.now() - dt).total_seconds())
+                return f"{dt.strftime('%d.%m %H:%M:%S')} ({age} сек. назад)"
+            except Exception:
+                return "нет данных"
+        return (
+            "🧪 Проверка бота\n\n"
+            f"TG version: {APP_VERSION}\nMAX DB доступна: {'да' if os.path.exists(MAX_DB_PATH) else 'нет'}\n"
+            f"TG heartbeat: {hb(HEARTBEAT_FILE)}\n"
+            f"Production TG: /root/mama_bot.py\nProduction MAX: /root/mama_max_bot.py\n\n"
+            "Перезапуск сервисов из кабинета не выполняется."
+        )
+    return owner_home_text()
+
+
+@dp.message(Command("owner", "admin"))
+async def owner_command_tg(message: Message):
+    if not OWNER_ID or message.from_user.id != OWNER_ID:
+        await message.answer("Недоступно")
+        return
+    await message.answer(owner_home_text(), reply_markup=owner_cabinet_keyboard())
+
+
+@dp.callback_query(F.data.startswith("owner_cab:"))
+async def owner_cabinet_tg(call: CallbackQuery):
+    if not OWNER_ID or call.from_user.id != OWNER_ID:
+        await call.answer("Недоступно", show_alert=True)
+        return
+    section = (call.data or "owner_cab:home").split(":", 1)[1]
+    if section == "home":
+        await call.message.edit_text(owner_home_text(), reply_markup=owner_cabinet_keyboard())
+    else:
+        await call.message.edit_text(_owner_report(section), reply_markup=owner_back_keyboard())
+    await call.answer()
+
+
 # ─── СТАРТ ───────────────────────────────────────────────────
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+
+    # Удаляем старую постоянную клавиатуру, которая могла остаться от другого бота.
+    cleanup_message = await message.answer(
+        "\u2063",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    try:
+        await cleanup_message.delete()
+    except Exception:
+        pass
     parts = (message.text or "").split(maxsplit=1)
     start_payload = parts[1].strip() if len(parts) > 1 else ""
     user = get_user(message.from_user.id)
     name = message.from_user.first_name or "мамочка"
+    log_analytics_event("user_start", message.from_user.id, start_payload)
     rewarded_referrer = None
     if user is None and start_payload.startswith("ref_"):
         try:
@@ -1785,35 +2267,36 @@ async def cmd_start(message: Message, state: FSMContext):
     if start_payload.startswith("channel_"):
         await state.update_data(channel_start_payload=start_payload)
         log_analytics_event("channel_click", message.from_user.id, start_payload)
+        log_analytics_event("ad_payload_opened", message.from_user.id, start_payload)
 
     if user:
         mode, date_value, saved_name = user
         if mode == "pregnant":
             weeks, days = calc_pregnancy_weeks(date_value)
-            if weeks:
+            if weeks and start_payload.startswith("channel_"):
+                await open_channel_destination_tg(message, start_payload)
+            elif weeks:
                 await message.answer(
                     f"👋 С возвращением, {saved_name or name}!\n\n"
                     f"🤰 Ты на {weeks} неделе беременности ({days} дн.)\n\n"
                     f"Чем могу помочь?",
                     
-                    reply_markup=kb_pregnant_menu()
+                    reply_markup=kb_pregnant_menu(message.from_user.id)
                 )
-                if start_payload.startswith("channel_"):
-                    await open_channel_destination_tg(message, start_payload)
             else:
                 await show_start(message, name, state)
         else:
             months, days = calc_child_age(date_value)
-            if months is not None:
+            if months is not None and start_payload.startswith("channel_"):
+                await open_channel_destination_tg(message, start_payload)
+            elif months is not None:
                 await message.answer(
                     f"👋 С возвращением, {saved_name or name}!\n\n"
                     f"👶 Малышу {age_label(months)}\n\n"
                     f"Чем могу помочь?",
                     
-                    reply_markup=kb_mama_menu()
+                    reply_markup=kb_mama_menu(message.from_user.id)
                 )
-                if start_payload.startswith("channel_"):
-                    await open_channel_destination_tg(message, start_payload)
             else:
                 await show_start(message, name, state)
     else:
@@ -1827,12 +2310,12 @@ async def show_start(message: Message, name: str, state: FSMContext):
     await state.set_state(RegStates.choosing_mode)
     await message.answer(
         f"👋 Привет, {name}!\n\n"
-        f"Я Мамин Помощник — личный AI-помощник для беременности, ребёнка и поддержки мамы.\n\n"
+        f"Я Мамин Помощник — бесплатный личный AI-помощник для беременности, ребёнка и поддержки мамы.\n\n"
         f"Подскажу по возрасту, помогу вести трекеры, подготовиться к врачу "
         f"и разобраться в сложной ситуации.\n\n"
         f"Расскажи, кто ты 👇",
         
-        reply_markup=kb_start()
+        reply_markup=kb_start(message.from_user.id)
     )
 
 # ─── ВЫБОР РЕЖИМА ────────────────────────────────────────────
@@ -1871,16 +2354,22 @@ async def enter_pdr(message: Message, state: FSMContext):
     pending_data = await state.get_data()
     pending_payload = pending_data.get("channel_start_payload", "")
     save_user(message.from_user.id, "pregnant", text, name)
+    log_analytics_event("profile_completed", message.from_user.id, pending_payload)
     await state.clear()
-    await message.answer(
-        f"✅ Сохранила!\n\n"
-        f"🤰 Ты на {weeks} неделе беременности ({days} дн.)\n\n"
-        f"Я буду давать советы и отвечать на вопросы именно для этого срока 💕",
-        
-        reply_markup=kb_pregnant_menu()
-    )
     if pending_payload:
+        await message.answer(
+            f"✅ Сохранила!\n\n"
+            f"🤰 Ты на {weeks} неделе беременности ({days} дн.)"
+        )
         await open_channel_destination_tg(message, pending_payload)
+    else:
+        await message.answer(
+            f"✅ Сохранила!\n\n"
+            f"🤰 Ты на {weeks} неделе беременности ({days} дн.)\n\n"
+            f"Я буду давать советы и отвечать на вопросы именно для этого срока 💕",
+            
+            reply_markup=kb_pregnant_menu(message.from_user.id)
+        )
 
 # ─── ВВОД ДАТЫ РОЖДЕНИЯ ──────────────────────────────────────
 @dp.message(RegStates.entering_birthdate, F.text)
@@ -1898,16 +2387,22 @@ async def enter_birthdate(message: Message, state: FSMContext):
     pending_data = await state.get_data()
     pending_payload = pending_data.get("channel_start_payload", "")
     save_user(message.from_user.id, "mama", text, name)
+    log_analytics_event("profile_completed", message.from_user.id, pending_payload)
     await state.clear()
-    await message.answer(
-        f"✅ Сохранила!\n\n"
-        f"👶 Малышу {age_label(months)}\n\n"
-        f"Буду давать советы именно для этого возраста 💕",
-        
-        reply_markup=kb_mama_menu()
-    )
     if pending_payload:
+        await message.answer(
+            f"✅ Сохранила!\n\n"
+            f"👶 Малышу {age_label(months)}"
+        )
         await open_channel_destination_tg(message, pending_payload)
+    else:
+        await message.answer(
+            f"✅ Сохранила!\n\n"
+            f"👶 Малышу {age_label(months)}\n\n"
+            f"Буду давать советы именно для этого возраста 💕",
+            
+            reply_markup=kb_mama_menu(message.from_user.id)
+        )
 
 # ─── ГЛАВНОЕ МЕНЮ ────────────────────────────────────────────
 @dp.callback_query(F.data == "main_menu")
@@ -1922,18 +2417,18 @@ async def main_menu(call: CallbackQuery, state: FSMContext):
             weeks, days = calc_pregnancy_weeks(date_value)
             await call.message.answer(
                 f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?",
-                reply_markup=kb_pregnant_menu()
+                reply_markup=kb_pregnant_menu(call.from_user.id)
             )
         else:
             months, _ = calc_child_age(date_value)
             await call.message.answer(
                 f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?",
-                reply_markup=kb_mama_menu()
+                reply_markup=kb_mama_menu(call.from_user.id)
             )
     else:
         await call.message.answer(
             "👋 Привет! Расскажи мне о себе 👇",
-            reply_markup=kb_start()
+            reply_markup=kb_start(call.from_user.id)
         )
 
 @dp.callback_query(F.data == "menu_pregnant")
@@ -1946,7 +2441,7 @@ async def menu_pregnant(call: CallbackQuery):
         weeks, days = calc_pregnancy_weeks(date_value)
         await call.message.answer(
             f"🤰 Ты на {weeks} неделе беременности\n\nЧем могу помочь?",
-            reply_markup=kb_pregnant_menu()
+            reply_markup=kb_pregnant_menu(call.from_user.id)
         )
 
 @dp.callback_query(F.data == "menu_mama")
@@ -1959,7 +2454,7 @@ async def menu_mama(call: CallbackQuery):
         months, _ = calc_child_age(date_value)
         await call.message.answer(
             f"👶 Малышу {age_label(months)}\n\nЧем могу помочь?",
-            reply_markup=kb_mama_menu()
+            reply_markup=kb_mama_menu(call.from_user.id)
         )
 
 @dp.callback_query(F.data == "change_data")
@@ -1967,7 +2462,7 @@ async def change_data(call: CallbackQuery, state: FSMContext):
     await state.set_state(RegStates.choosing_mode)
     await call.message.edit_text(
         "Выбери свой статус 👇",
-        reply_markup=kb_start()
+        reply_markup=kb_start(call.from_user.id)
     )
 
 @dp.callback_query(F.data == "noop")
@@ -2020,13 +2515,9 @@ async def invite_friend(call: CallbackQuery):
         "🎁 Пригласить подругу\n\n"
         "Поделись личной ссылкой:\n"
         f"{link}\n\n"
-        "За первый запуск подруги — 1 дополнительный AI-вопрос. "
-        "За её первую оплату — 7 дней тарифа Про.\n\n"
-        "За запуск начисляется не более 5 бонусов в месяц. Самоприглашения и повторные регистрации не учитываются.\n\n"
+        "Все функции «Маминого помощника» и так доступны бесплатно — приглашение просто помогает больше мам узнать о проекте.\n\n"
         f"Приглашено: {invited}\n"
-        f"Бонусов начислено: {start_rewards}\n"
-        f"Доступно AI-вопросов: {available_bonus}\n"
-        f"Наград Про: {payment_rewards}"
+        f"Бонусов начислено: {start_rewards}"
     )
     await call.answer()
     await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2142,8 +2633,6 @@ async def doctor_prep(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
     ])
     await send_long_message(call.message.chat.id, "🩺 Сводка к педиатру\n\n" + answer, reply_markup=kb)
-    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
-        consume_credit(call.from_user.id, "doctor_report")
 
 @dp.callback_query(F.data == "weekly_report")
 async def weekly_report(call: CallbackQuery):
@@ -2167,8 +2656,6 @@ async def weekly_report(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ В меню", callback_data="menu_mama")]
     ])
     await send_long_message(call.message.chat.id, "📈 Ваши 7 дней\n\n" + answer, reply_markup=kb)
-    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
-        consume_credit(call.from_user.id, "weekly_report")
 
 # ─── БЕРЕМЕННОСТЬ — РАЗДЕЛЫ ──────────────────────────────────
 EXPERT_PREG = (
@@ -2624,21 +3111,7 @@ async def ask_question(call: CallbackQuery, state: FSMContext):
 async def handle_question(message: Message, state: FSMContext):
     user = get_user(message.from_user.id)
     await state.clear()
-    # Проверка лимита запросов
     limit = question_limit_for(message.from_user.id)
-    if limit is not None:
-        count = get_request_count(message.from_user.id)
-        if count >= limit:
-            log_analytics_event("paywall_seen", message.from_user.id, "questions_limit", f"used={count};limit={limit}")
-            await message.answer(
-                "🤍 Бесплатные персональные разборы закончились.\n\nПродолжить можно с тарифа «Старт» — 30 вопросов на 30 дней, или получить бонусный вопрос за приглашение подруги.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🌱 Продолжить — 190 ₽", callback_data="pay_plan_start")],
-                    [InlineKeyboardButton(text="💎 Выбрать тариф", callback_data="pay_premium")],
-                    [InlineKeyboardButton(text="🎁 Пригласить подругу", callback_data="invite_friend")],
-                ])
-            )
-            return
 
     if user:
         mode, date_value, name = user
@@ -3116,7 +3589,7 @@ async def handle_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     photo_type = data.get("photo_type", "skin")
     user = get_user(message.from_user.id)
-    use_photo_credit = get_user_plan(message.from_user.id) not in PRO_PLANS
+    use_photo_credit = False  # Проект бесплатный: старые кредиты за анализ фото больше не расходуются
     await state.clear()
 
     # Получаем фото
@@ -3279,9 +3752,6 @@ async def photo_wrong_input(message: Message, state: FSMContext):
 async def handle_voice(message: Message, state: FSMContext):
     # Сбрасываем любое текущее состояние — голос имеет приоритет
     await state.clear()
-    if get_user_plan(message.from_user.id) not in PRO_PLANS:
-        await message.answer("🔒 Голосовые сообщения доступны в Про 💎", reply_markup=kb_premium())
-        return
     user = get_user(message.from_user.id)
     await message.answer("🎤 Слушаю тебя...")
 
@@ -3389,10 +3859,73 @@ SALES_HEADERS = [
     "Тип", "Сумма", "Payment ID", "Дата окончания", "Статус"
 ]
 
+# Таблица PostGenius Users общая для нескольких независимых проектов (Aura,
+# МамаБот, MarketPro, AI Местный и др.) через один service account. Гвард не
+# даёт коду МамаБот удалить/переименовать/массово очистить свой или чужой
+# лист — инициализация может только создать отсутствующий собственный лист.
+_BLOCKED_SPREADSHEET_METHODS = ("del_worksheet", "delete_worksheet", "duplicate_sheet", "batch_update")
+_BLOCKED_WORKSHEET_METHODS = ("clear", "batch_clear", "update_title", "delete_rows", "delete_columns", "delete_dimension")
+
+
+class _NoDeleteWorksheetGuard:
+    """Прокси над gspread.Worksheet, блокирующий удаление/переименование/очистку."""
+
+    def __init__(self, worksheet, spreadsheet_title):
+        object.__setattr__(self, "_wrapped", worksheet)
+        object.__setattr__(self, "_spreadsheet_title", spreadsheet_title)
+
+    def __getattr__(self, name):
+        if name in _BLOCKED_WORKSHEET_METHODS:
+            def _blocked(*args, **kwargs):
+                logging.error(
+                    "destructive_action_blocked: попытка вызвать %s() на листе %s (таблица %s) "
+                    "заблокирована — деструктивные операции над листами общей таблицы требуют "
+                    "отдельного owner-решения",
+                    name, self._wrapped.title, self._spreadsheet_title,
+                )
+                raise PermissionError(
+                    f"{name} is blocked: destructive worksheet operations require explicit owner sign-off"
+                )
+            return _blocked
+        target = getattr(self._wrapped, name)
+        return target
+
+
+class _NoDeleteSpreadsheetGuard:
+    """Прокси над gspread.Spreadsheet, блокирующий деструктивные операции и
+    оборачивающий возвращаемые листы в _NoDeleteWorksheetGuard."""
+
+    def __init__(self, spreadsheet):
+        object.__setattr__(self, "_wrapped", spreadsheet)
+
+    def __getattr__(self, name):
+        title = getattr(self._wrapped, "title", SPREADSHEET_ID)
+        if name in _BLOCKED_SPREADSHEET_METHODS:
+            def _blocked(*args, **kwargs):
+                logging.error(
+                    "destructive_action_blocked: попытка вызвать %s() на таблице %s "
+                    "заблокирована — удаление/переименование листов требует отдельного "
+                    "owner-решения",
+                    name, title,
+                )
+                raise PermissionError(
+                    f"{name} is blocked: destructive worksheet operations require explicit owner sign-off"
+                )
+            return _blocked
+        target = getattr(self._wrapped, name)
+        if name in ("worksheet", "add_worksheet", "get_worksheet"):
+            def _wrapped_call(*args, **kwargs):
+                return _NoDeleteWorksheetGuard(target(*args, **kwargs), title)
+            return _wrapped_call
+        if name == "sheet1":
+            return _NoDeleteWorksheetGuard(target, title)
+        return target
+
+
 def _sheets_book():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(SPREADSHEET_ID)
+    return _NoDeleteSpreadsheetGuard(gspread.authorize(creds).open_by_key(SPREADSHEET_ID))
 
 def _worksheet(book, title, headers):
     try:
@@ -3559,6 +4092,149 @@ def process_commercial_payment(payment_id, user_id, product_code):
         conn.close()
 
 
+def create_support_payment(user_id, amount):
+    amount_str = f"{amount:.2f}"
+    return Payment.create({
+        "amount": {"value": amount_str, "currency": "RUB"},
+        "confirmation": {"type": "redirect", "return_url": "https://t.me/MaminPomoshnikAI_bot"},
+        "capture": True,
+        "description": "Добровольная поддержка развития цифрового сервиса",
+        "receipt": {"customer": {"email": "client@maminpomoshnik.ru"}, "items": [{
+            "description": "Добровольная поддержка развития цифрового сервиса", "quantity": "1.00",
+            "amount": {"value": amount_str, "currency": "RUB"}, "vat_code": 1,
+            "payment_subject": "service", "payment_mode": "full_payment"
+        }]},
+        "metadata": {"user_id": user_id, "product_code": "support_project", "product_type": "support"}
+    }, str(uuid.uuid4()))
+
+
+def save_support_payment(payment_id, user_id, amount, variant, platform="telegram"):
+    amount_str = f"{amount:.2f}"
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO pending_payments(payment_id,user_id,plan,created_at) VALUES (?,?,?,?)", (payment_id, user_id, "support_project", now))
+        conn.execute(
+            "INSERT OR IGNORE INTO payments(payment_id,user_id,platform,product_type,product_code,amount,currency,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (payment_id, user_id, platform, "support", "support_project", amount_str, "RUB", "pending", now, now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO support_payments(payment_id,user_id,platform,amount,currency,status,variant,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (payment_id, user_id, platform, amount_str, "RUB", "pending", variant, "main_menu", now, now),
+        )
+
+
+def process_support_payment(payment_id, user_id):
+    """Идемпотентно фиксирует добровольный платёж поддержки. Не выдаёт кредиты, не активирует подписку."""
+    now_iso = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM processed_payments WHERE payment_id=?", (payment_id,)).fetchone():
+            conn.rollback(); return False, None
+        row = conn.execute("SELECT amount FROM payments WHERE payment_id=?", (payment_id,)).fetchone()
+        amount = row[0] if row else "0.00"
+        conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)", (payment_id, user_id, "support_project", now_iso))
+        conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?", (now_iso, payment_id))
+        conn.execute("UPDATE support_payments SET status='processed',updated_at=? WHERE payment_id=?", (now_iso, payment_id))
+        conn.execute(
+            "INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",
+            (payment_id, now_iso, "telegram", user_id, "support_project", amount, "RUB", ""),
+        )
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+        conn.commit(); return True, amount
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+# ─── ЛИЧНЫЙ РАЗБОР СИТУАЦИИ ───────────────────────────────────
+def get_personal_review(review_id):
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM personal_reviews WHERE id=?", (review_id,)).fetchone()
+
+
+def get_personal_review_by_payment(payment_id):
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM personal_reviews WHERE payment_id=?", (payment_id,)).fetchone()
+
+
+def process_personal_review_payment(payment_id, user_id):
+    """Идемпотентно фиксирует оплату личного разбора. Не выдаёт кредиты, не активирует подписку."""
+    now_iso = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM processed_payments WHERE payment_id=?", (payment_id,)).fetchone():
+            conn.rollback(); return False, None
+        review_row = conn.execute("SELECT id FROM personal_reviews WHERE payment_id=?", (payment_id,)).fetchone()
+        if not review_row:
+            conn.rollback(); return False, None
+        review_id = review_row[0]
+        conn.execute(
+            "UPDATE personal_reviews SET status='paid',payment_status='paid',updated_at=? "
+            "WHERE payment_id=? AND status IN ('draft','payment_pending')",
+            (now_iso, payment_id),
+        )
+        conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)", (payment_id, user_id, PERSONAL_REVIEW_PRODUCT_CODE, now_iso))
+        conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?", (now_iso, payment_id))
+        conn.execute(
+            "INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",
+            (payment_id, now_iso, "telegram", user_id, PERSONAL_REVIEW_PRODUCT_CODE, f"{PERSONAL_REVIEW_PRICE_RUB:.2f}", "RUB", ""),
+        )
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+        conn.commit(); return True, review_id
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def mark_personal_review_canceled(payment_id):
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE personal_reviews SET status='cancelled',payment_status='cancelled',updated_at=? "
+            "WHERE payment_id=? AND status IN ('draft','payment_pending')",
+            (now_iso, payment_id),
+        )
+
+
+def take_personal_review(review_id, owner_id):
+    """paid -> in_review, идемпотентно (повторный клик ничего не меняет)."""
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE personal_reviews SET status='in_review',updated_at=? WHERE id=? AND status='paid'",
+            (now_iso, review_id),
+        )
+        return cur.rowcount == 1
+
+
+def attach_personal_review_voice(review_id, file_id):
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE personal_reviews SET answer_file_id=?,updated_at=? WHERE id=? AND status='in_review'",
+            (file_id, now_iso, review_id),
+        )
+        return cur.rowcount == 1
+
+
+def mark_personal_review_answered(review_id):
+    """in_review -> answered, идемпотентно. Возвращает True только на первом успешном переходе."""
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE personal_reviews SET status='answered',answered_at=?,updated_at=? "
+            "WHERE id=? AND status='in_review' AND answer_file_id IS NOT NULL",
+            (now_iso, now_iso, review_id),
+        )
+        return cur.rowcount == 1
+
+
 async def check_payments_loop():
     while True:
         await asyncio.sleep(15)
@@ -3567,6 +4243,35 @@ async def check_payments_loop():
                 try:
                     payment = Payment.find_one(payment_id)
                     if payment.status == "succeeded":
+                        if product_code == "support_project":
+                            processed, amount = process_support_payment(payment_id, user_id)
+                            if not processed: continue
+                            log_analytics_event("support_payment_success", user_id, "support_project", amount)
+                            await bot.send_message(
+                                user_id,
+                                "Спасибо за поддержку ❤️ Благодаря вам «Мамин помощник» сможет развиваться и оставаться бесплатным для родителей.",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Вернуться в главное меню", callback_data="main_menu")]]),
+                            )
+                            owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+                            try: await bot.send_message(owner_target, f"💛 Поддержка проекта (Telegram)\n\nUser ID: {user_id}\nСумма: {amount} ₽\nPayment ID: {payment_id}")
+                            except Exception as exc: logging.error(f"Ошибка уведомления владельца о поддержке TG: {exc}")
+                            continue
+                        if product_code == PERSONAL_REVIEW_PRODUCT_CODE:
+                            processed, review_id = process_personal_review_payment(payment_id, user_id)
+                            if not processed: continue
+                            log_analytics_event("personal_review_payment_success", user_id, PERSONAL_REVIEW_PRODUCT_CODE, payment_id)
+                            try:
+                                await bot.send_message(user_id, "Заявка принята ✅\n\nЛичный разбор готовит автор проекта. Ответ придёт голосовым сообщением прямо сюда, в этот чат.")
+                            except Exception as exc: logging.error(f"Ошибка уведомления клиента о заявке на разбор: {exc}")
+                            owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+                            try:
+                                kb = InlineKeyboardMarkup(inline_keyboard=[
+                                    [InlineKeyboardButton(text="Открыть заявку", callback_data=f"pr_open:{review_id}")],
+                                    [InlineKeyboardButton(text="Взять в работу", callback_data=f"pr_take:{review_id}")],
+                                ])
+                                await bot.send_message(owner_target, f"🧩 Новая заявка на личный разбор №{review_id} — {PERSONAL_REVIEW_PRICE_RUB} ₽", reply_markup=kb)
+                            except Exception as exc: logging.error(f"Ошибка уведомления владельца о заявке на разбор: {exc}")
+                            continue
                         processed,end,product_type = process_commercial_payment(payment_id,user_id,product_code)
                         if not processed: continue
                         info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
@@ -3583,9 +4288,174 @@ async def check_payments_loop():
                         owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
                         try: await bot.send_message(owner_target, f"💳 Новая продажа Telegram\n\nUser ID: {user_id}\nПродукт: {info['name']}\nСумма: {info['amount']} ₽\nPayment ID: {payment_id}")
                         except Exception as exc: logging.error(f"Ошибка уведомления владельца TG: {exc}")
-                    elif payment.status == "canceled": mark_payment_canceled(payment_id)
+                    elif payment.status == "canceled":
+                        if product_code == PERSONAL_REVIEW_PRODUCT_CODE:
+                            mark_personal_review_canceled(payment_id)
+                            mark_payment_canceled(payment_id)
+                            log_analytics_event("personal_review_payment_failed", user_id, PERSONAL_REVIEW_PRODUCT_CODE, payment_id)
+                            try:
+                                await bot.send_message(user_id, "Оплата не завершена. Заявка на личный разбор не оформлена — попробуй ещё раз из мини-приложения.")
+                            except Exception as exc: logging.error(f"Ошибка уведомления об отмене заявки на разбор: {exc}")
+                            continue
+                        mark_payment_canceled(payment_id)
+                        if product_code == "support_project":
+                            log_analytics_event("support_payment_failed", user_id, "support_project")
+                            try:
+                                await bot.send_message(user_id, "Оплата не завершена. Все функции «Маминого помощника» по-прежнему доступны бесплатно.")
+                            except Exception as exc: logging.error(f"Ошибка уведомления об отмене поддержки TG: {exc}")
                 except Exception as exc: logging.error(f"Ошибка проверки платежа {payment_id}: {exc}")
         except Exception as exc: logging.error(f"Ошибка check_payments_loop: {exc}")
+
+
+# ─── ЛИЧНЫЙ РАЗБОР СИТУАЦИИ: owner-flow ───────────────────────
+def _pr_status_label(status):
+    return {
+        "draft": "черновик", "payment_pending": "ожидает оплаты", "paid": "оплачена",
+        "in_review": "в работе", "answered": "отвечена", "cancelled": "отменена",
+    }.get(status, status)
+
+
+@dp.callback_query(F.data.startswith("pr_open:"))
+async def pr_open(call: CallbackQuery):
+    if not OWNER_ID or call.from_user.id != OWNER_ID:
+        await call.answer("Недоступно", show_alert=True)
+        return
+    try:
+        review_id = int(call.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await call.answer("Некорректная заявка", show_alert=True)
+        return
+    row = get_personal_review(review_id)
+    if not row:
+        await call.answer("Заявка не найдена", show_alert=True)
+        return
+    reply_label = "Email" if row["preferred_reply"] == "email" else "Telegram"
+    lines = [
+        f"Заявка №{review_id} — {_pr_status_label(row['status'])}",
+        f"User ID: {row['user_id']}",
+        f"Способ ответа: {reply_label}",
+    ]
+    if row["preferred_reply"] == "email" and row["email"]:
+        lines.append(f"Email клиента: {row['email']}")
+    lines.append("")
+    lines.append("Текст ситуации:")
+    lines.append(row["situation_text"])
+    kb_rows = []
+    if row["status"] == "paid":
+        kb_rows.append([InlineKeyboardButton(text="Взять в работу", callback_data=f"pr_take:{review_id}")])
+    await call.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pr_take:"))
+async def pr_take(call: CallbackQuery, state: FSMContext):
+    if not OWNER_ID or call.from_user.id != OWNER_ID:
+        await call.answer("Недоступно", show_alert=True)
+        return
+    try:
+        review_id = int(call.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await call.answer("Некорректная заявка", show_alert=True)
+        return
+    ok = take_personal_review(review_id, call.from_user.id)
+    if not ok:
+        row = get_personal_review(review_id)
+        current = _pr_status_label(row["status"]) if row else "не найдена"
+        await call.answer(f"Уже {current}", show_alert=True)
+        return
+    await state.set_state(OwnerReviewStates.waiting_voice)
+    await state.update_data(review_id=review_id)
+    await call.message.answer(f"Заявка №{review_id} взята в работу. Отправь одно голосовое сообщение с ответом — оно будет привязано к этой заявке.")
+    await call.answer()
+
+
+@dp.message(OwnerReviewStates.waiting_voice, F.voice, F.from_user.id == OWNER_ID)
+async def pr_receive_voice(message: Message, state: FSMContext):
+    data = await state.get_data()
+    review_id = data.get("review_id")
+    if not review_id:
+        await message.answer("Нет активной заявки для голосового ответа.")
+        await state.clear()
+        return
+    ok = attach_personal_review_voice(review_id, message.voice.file_id)
+    await state.clear()
+    if not ok:
+        await message.answer(f"Не удалось привязать голосовое к заявке №{review_id} — проверь её статус через «Открыть заявку».")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить ответ клиенту", callback_data=f"pr_send:{review_id}")],
+        [InlineKeyboardButton(text="🔁 Записать заново", callback_data=f"pr_rerecord:{review_id}")],
+    ])
+    await message.answer("Отправить ответ клиенту?", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("pr_rerecord:"))
+async def pr_rerecord(call: CallbackQuery, state: FSMContext):
+    if not OWNER_ID or call.from_user.id != OWNER_ID:
+        await call.answer("Недоступно", show_alert=True)
+        return
+    try:
+        review_id = int(call.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await call.answer("Некорректная заявка", show_alert=True)
+        return
+    row = get_personal_review(review_id)
+    if not row or row["status"] != "in_review":
+        await call.answer("Заявка недоступна для перезаписи", show_alert=True)
+        return
+    await state.set_state(OwnerReviewStates.waiting_voice)
+    await state.update_data(review_id=review_id)
+    await call.message.answer(f"Хорошо, пришли новое голосовое для заявки №{review_id}.")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("pr_send:"))
+async def pr_send(call: CallbackQuery):
+    if not OWNER_ID or call.from_user.id != OWNER_ID:
+        await call.answer("Недоступно", show_alert=True)
+        return
+    try:
+        review_id = int(call.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await call.answer("Некорректная заявка", show_alert=True)
+        return
+    row = get_personal_review(review_id)
+    if not row or row["status"] != "in_review" or not row["answer_file_id"]:
+        await call.answer("Заявка не готова к отправке", show_alert=True)
+        return
+    client_user_id = row["user_id"]
+    preferred_reply = row["preferred_reply"]
+    answer_file_id = row["answer_file_id"]
+    if preferred_reply == "email":
+        delivered = mark_personal_review_answered(review_id)
+        if not delivered:
+            await call.answer("Ответ уже был отправлен", show_alert=True)
+            return
+        await call.message.answer(
+            f"Заявка №{review_id}: клиент выбрал ответ по email.\n"
+            f"Email клиента: {row['email'] or '—'}\n\n"
+            "Голосовое сохранено — отправь его на почту клиента вручную. Ниже пересылаю запись для удобства."
+        )
+        try:
+            await bot.send_voice(call.from_user.id, answer_file_id)
+        except Exception as exc:
+            logging.error(f"Не удалось переслать голосовое владельцу для заявки {review_id}: {exc}")
+    else:
+        try:
+            await bot.send_message(client_user_id, "Ваш разбор готов 🎧")
+            await bot.send_voice(client_user_id, answer_file_id)
+        except Exception as exc:
+            logging.error(f"Не удалось отправить голосовое клиенту по заявке {review_id}: {exc}")
+            await call.message.answer(f"Не удалось отправить сообщение клиенту (заявка №{review_id}): {exc}")
+            await call.answer("Не удалось отправить ответ клиенту", show_alert=True)
+            return
+        delivered = mark_personal_review_answered(review_id)
+        if not delivered:
+            await call.answer("Ответ уже был отправлен", show_alert=True)
+            return
+        await call.message.answer(f"Готово — ответ отправлен клиенту (заявка №{review_id}).")
+    log_analytics_event("personal_review_answered", client_user_id, PERSONAL_REVIEW_PRODUCT_CODE, review_id)
+    await call.answer()
 
 
 async def start_product_payment(call, product_code):
@@ -3604,27 +4474,129 @@ async def start_product_payment(call, product_code):
         await call.message.answer("Не удалось создать платёж. Попробуй позже или напиши в поддержку.", reply_markup=kb_premium())
 
 
+def kb_already_free():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❤️ Поддержать проект", callback_data="donate_menu")],
+        [InlineKeyboardButton(text="🏠 Вернуться в главное меню", callback_data="main_menu")],
+    ])
+
+
 @dp.callback_query(F.data == "pay_premium")
 @dp.callback_query(F.data == "show_premium")
 async def show_premium(call: CallbackQuery):
+    # Старые тарифные ссылки/кнопки больше не продают функционал — он бесплатный.
     await call.message.answer(
-        "💎 Доступ к Маминому помощнику\n\n"
-        "Старт — основные трекеры, 30 AI-вопросов и 50 сообщений поддержки.\n"
-        "Про — все функции, отчёты и анализ фото.\n"
-        "Про на год — полный доступ на 365 дней.\n\n"
-        "Можно купить и один конкретный результат без подписки.",
-        reply_markup=kb_premium(),
+        "Все текущие функции «Маминого помощника» теперь доступны бесплатно.",
+        reply_markup=kb_already_free(),
     )
 
 
 @dp.callback_query(F.data.startswith("pay_plan_"))
 async def pay_plan_selected(call: CallbackQuery):
-    await start_product_payment(call, call.data.replace("pay_plan_", "", 1))
+    await show_premium(call)
 
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_product_selected(call: CallbackQuery):
-    await start_product_payment(call, call.data.replace("buy_", "", 1))
+    await show_premium(call)
+
+# ─── ПОДДЕРЖАТЬ ПРОЕКТ (добровольно) ─────────────────────────
+DONATE_AMOUNTS = [
+    (99, "99 ₽ — Сказать спасибо"),
+    (199, "199 ₽ — Поддержать развитие"),
+    (499, "499 ₽ — Большое спасибо"),
+    (990, "990 ₽ — Помочь проекту расти"),
+]
+DONATE_MIN_AMOUNT = 10
+DONATE_MAX_AMOUNT = 100000
+
+class DonateStates(StatesGroup):
+    waiting_custom_amount = State()
+
+def kb_donate_menu():
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"donate_amt_{amount}")] for amount, label in DONATE_AMOUNTS]
+    rows.append([InlineKeyboardButton(text="Другая сумма", callback_data="donate_amt_custom")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data == "donate_menu")
+async def donate_menu(call: CallbackQuery):
+    log_analytics_event("support_open", call.from_user.id)
+    await call.message.answer(
+        "Поддержать проект\n\n"
+        "«Мамин помощник» остаётся бесплатным для всех родителей. Если проект оказался полезен, "
+        "вы можете поддержать его развитие любой удобной суммой. Это добровольная благодарность — "
+        "все функции доступны и без оплаты.",
+        reply_markup=kb_donate_menu(),
+    )
+
+async def show_donate_confirm(message, amount, variant):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Оплатить {amount:.0f} ₽" if amount == int(amount) else f"Оплатить {amount:.2f} ₽", callback_data=f"donate_confirm:{variant}:{amount:.2f}")],
+        [InlineKeyboardButton(text="Назад", callback_data="donate_menu")],
+    ])
+    await message.answer(
+        "Вы поддерживаете развитие бесплатного проекта «Мамин помощник». "
+        "Оплата добровольная и не открывает дополнительных функций — они уже доступны всем.",
+        reply_markup=kb,
+    )
+
+@dp.callback_query(F.data.startswith("donate_amt_"))
+async def donate_amount_selected(call: CallbackQuery, state: FSMContext):
+    variant = call.data.replace("donate_amt_", "", 1)
+    if variant == "custom":
+        log_analytics_event("support_custom", call.from_user.id)
+        await state.set_state(DonateStates.waiting_custom_amount)
+        await call.message.answer(f"Введи сумму в рублях (от {DONATE_MIN_AMOUNT} до {DONATE_MAX_AMOUNT}):")
+        return
+    try:
+        amount = float(variant)
+    except ValueError:
+        return
+    if not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+        return
+    log_analytics_event(f"support_amount_{variant}", call.from_user.id)
+    await show_donate_confirm(call.message, amount, variant)
+
+@dp.message(DonateStates.waiting_custom_amount, F.text)
+async def donate_custom_amount_input(message: Message, state: FSMContext):
+    await state.clear()
+    raw = (message.text or "").replace(",", ".").strip()
+    try:
+        amount = float(raw)
+    except ValueError:
+        amount = None
+    if amount is None or not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+        await message.answer(
+            f"Пожалуйста, введи сумму от {DONATE_MIN_AMOUNT} до {DONATE_MAX_AMOUNT} рублей, например: 250",
+            reply_markup=kb_donate_menu(),
+        )
+        return
+    await show_donate_confirm(message, round(amount, 2), "custom")
+
+@dp.callback_query(F.data.startswith("donate_confirm:"))
+async def donate_confirm(call: CallbackQuery):
+    try:
+        _, variant, amount_str = call.data.split(":", 2)
+        amount = float(amount_str)
+    except (ValueError, IndexError):
+        await call.message.answer("Не удалось определить сумму. Попробуй ещё раз.", reply_markup=kb_donate_menu())
+        return
+    if not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+        await call.message.answer("Некорректная сумма.", reply_markup=kb_donate_menu())
+        return
+    try:
+        payment = create_support_payment(call.from_user.id, amount)
+        save_support_payment(payment.id, call.from_user.id, amount, variant, "telegram")
+        log_analytics_event("support_payment_created", call.from_user.id, variant, amount_str)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"💳 Оплатить {amount:.0f} ₽", url=payment.confirmation.confirmation_url)],
+            [InlineKeyboardButton(text="Назад", callback_data="donate_menu")],
+        ])
+        await call.message.answer("Спасибо! Нажми кнопку ниже, чтобы завершить оплату.", reply_markup=kb)
+    except Exception as exc:
+        logging.error(f"Ошибка создания платежа поддержки TG: {exc}")
+        await call.message.answer("Не удалось создать платёж. Попробуй позже.", reply_markup=kb_donate_menu())
 
 # ─── ПОДДЕРЖКА И ОТЗЫВЫ ──────────────────────────────────────
 class SupportStates(StatesGroup):
@@ -3713,15 +4685,368 @@ async def suggestion_send(message: Message, state: FSMContext):
     )).start()
     await message.answer("💡 Спасибо за идею! Мы обязательно рассмотрим её 🤍", reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start())
 
+# ─── ОДНОРАЗОВАЯ РАССЫЛКА ОБРАТНОЙ СВЯЗИ (campaign: feedback_features_2026_09) ──
+FEEDBACK_CAMPAIGN_KEY = "feedback_features_2026_09"
+FEEDBACK_CAMPAIGN_TEXT = (
+    "❤️ Дорогие мамы!\n\n"
+    "Мне очень приятно видеть, что вас становится всё больше и что «Мамин Помощник» "
+    "действительно используется каждый день.\n\n"
+    "Я продолжаю развивать приложение и хочу делать его не просто больше, а действительно "
+    "полезнее именно для вас.\n\n"
+    "Поэтому хочу спросить:\n\n"
+    "Какой функции вам сейчас не хватает? Что вы хотели бы видеть в приложении дальше?\n\n"
+    "Это может быть что угодно — новый трекер, полезный раздел, напоминания, новая возможность "
+    "для ребёнка или для мамы.\n\n"
+    "Я читаю ваши предложения и буду учитывать их при следующих обновлениях ❤️\n\n"
+    "Нажмите кнопку ниже и напишите свою идею."
+)
+
+def feedback_campaign_kb_tg():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Предложить функцию", callback_data="fb2026:suggest")],
+        [InlineKeyboardButton(text="❤️ Всё нравится", callback_data="fb2026:like")],
+    ])
+
+class FeedbackCampaignStates(StatesGroup):
+    waiting_suggestion = State()
+
+def _claim_feedback_broadcast_tg(user_id):
+    now = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO broadcast_log(broadcast_key, platform, user_id, status, error_code, ts) "
+            "VALUES (?, 'telegram', ?, 'claimed', '', ?) "
+            "ON CONFLICT(broadcast_key, platform, user_id) DO UPDATE SET status='claimed', ts=excluded.ts "
+            "WHERE broadcast_log.status NOT IN ('sent', 'claimed', 'forbidden', 'blocked')",
+            (FEEDBACK_CAMPAIGN_KEY, user_id, now),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+def _mark_feedback_broadcast_tg(user_id, status, error_code=""):
+    now = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE broadcast_log SET status=?, error_code=?, ts=? WHERE broadcast_key=? AND platform='telegram' AND user_id=?",
+            (status, str(error_code)[:200], now, FEEDBACK_CAMPAIGN_KEY, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _feedback_broadcast_status_tg(user_id):
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT status FROM broadcast_log WHERE broadcast_key=? AND platform='telegram' AND user_id=?",
+            (FEEDBACK_CAMPAIGN_KEY, user_id),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+async def send_feedback_campaign_tg():
+    """Ручная одноразовая рассылка обратной связи. Не запускается из scheduler/main —
+    вызывается один раз внешним job-скриптом. Безопасна для повторного запуска: уже
+    отправленным по этому broadcast_key пользователям сообщение повторно не уходит."""
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT user_id FROM users WHERE user_id IS NOT NULL AND user_id > 0").fetchall()
+    finally:
+        conn.close()
+    audience = [r[0] for r in rows if r[0] != OWNER_ID]
+    sent, failed = 0, 0
+    for user_id in audience:
+        if not _claim_feedback_broadcast_tg(user_id):
+            status = _feedback_broadcast_status_tg(user_id)
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            continue
+        try:
+            await bot.send_message(user_id, FEEDBACK_CAMPAIGN_TEXT, reply_markup=feedback_campaign_kb_tg())
+            _mark_feedback_broadcast_tg(user_id, "sent")
+            sent += 1
+        except TelegramForbiddenError:
+            _mark_feedback_broadcast_tg(user_id, "forbidden")
+            failed += 1
+        except TelegramBadRequest as e:
+            _mark_feedback_broadcast_tg(user_id, "chat_not_found", str(e))
+            failed += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(user_id, FEEDBACK_CAMPAIGN_TEXT, reply_markup=feedback_campaign_kb_tg())
+                _mark_feedback_broadcast_tg(user_id, "sent")
+                sent += 1
+            except Exception as e2:
+                _mark_feedback_broadcast_tg(user_id, "temp_error", str(e2))
+                failed += 1
+        except Exception as e:
+            _mark_feedback_broadcast_tg(user_id, "temp_error", str(e))
+            failed += 1
+        await asyncio.sleep(0.15)
+    return {"audience": len(audience), "sent": sent, "failed": failed}
+
+@dp.callback_query(F.data == "fb2026:suggest")
+async def fb2026_suggest(call: CallbackQuery, state: FSMContext):
+    await state.set_state(FeedbackCampaignStates.waiting_suggestion)
+    await call.message.answer(
+        "💬 Напишите одним сообщением, какую функцию или возможность вы хотели бы добавить "
+        "в «Мамин Помощник».\n\nМожно написать совсем коротко — я обязательно прочитаю ❤️"
+    )
+    await call.answer()
+
+@dp.message(FeedbackCampaignStates.waiting_suggestion, F.text, ~F.text.startswith("/"))
+async def fb2026_suggestion_send(message: Message, state: FSMContext):
+    await state.clear()
+    username = message.from_user.username or ""
+    name = message.from_user.first_name or ""
+    target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+    username_line = f"@{username}" if username else "—"
+    owner_text = (
+        "💡 Новое предложение\n\n"
+        "Платформа: Telegram\n"
+        f"Имя: {name or '—'}\n"
+        f"Username: {username_line}\n"
+        f"User ID: {message.from_user.id}\n"
+        f"Предложение:\n{message.text}"
+    )
+    try:
+        await bot.send_message(target, owner_text[:3900])
+    except Exception as e:
+        logging.error(f"fb2026 suggestion owner notify error: {e}")
+    import threading
+    threading.Thread(target=sheets_add_review, args=(
+        message.from_user.id, message.from_user.username, message.text, "Предложения МамаБот"
+    )).start()
+    await message.answer(
+        "Спасибо ❤️ Предложение отправлено. Я обязательно его прочитаю.",
+        reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start()
+    )
+
+@dp.callback_query(F.data == "fb2026:like")
+async def fb2026_like(call: CallbackQuery):
+    user_id = call.from_user.id
+    now = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO feedback_campaign_likes(campaign_key, platform, user_id, created_at) VALUES (?, 'telegram', ?, ?)",
+            (FEEDBACK_CAMPAIGN_KEY, user_id, now),
+        )
+        conn.commit()
+        already = cur.rowcount == 0
+    finally:
+        conn.close()
+    await call.answer()
+    if already:
+        await call.message.answer("Спасибо ❤️ Ваш ответ уже получен.")
+        return
+    username = call.from_user.username or ""
+    name = call.from_user.first_name or ""
+    target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+    username_line = f"@{username}" if username else "—"
+    owner_text = (
+        "❤️ Положительная обратная связь\n\n"
+        "Платформа: Telegram\n"
+        f"Имя: {name or '—'}\n"
+        f"Username: {username_line}\n"
+        f"User ID: {user_id}\n"
+        "Ответ: Всё нравится"
+    )
+    try:
+        await bot.send_message(target, owner_text[:3900])
+    except Exception as e:
+        logging.error(f"fb2026 like owner notify error: {e}")
+    import threading
+    threading.Thread(target=sheets_add_review, args=(
+        user_id, username, "Всё нравится (кампания feedback_features_2026_09)", "Отзывы МамаБот"
+    )).start()
+    await call.message.answer(
+        "Спасибо ❤️ Очень приятно это знать. Такие сообщения действительно помогают продолжать развивать приложение."
+    )
+
+# ─── ОДНОРАЗОВАЯ РАССЫЛКА «ПРИКОРМ 6+» (campaign: complementary_foods_2026_09) ──
+CF_CAMPAIGN_KEY = "complementary_foods_2026_09"
+CF_CAMPAIGN_TEXT = (
+    "🥣 Новая функция — «Прикорм 6+» ❤️\n\n"
+    "Дорогие мамы, в «Мамин Помощник» появился новый раздел для начала прикорма.\n\n"
+    "Теперь можно:\n"
+    "• посмотреть, что можно давать ребёнку по возрасту;\n"
+    "• отмечать уже попробованные продукты;\n"
+    "• сохранять, что понравилось или не понравилось;\n"
+    "• отмечать возможную реакцию;\n"
+    "• смотреть рекомендации по введению продуктов и важные правила безопасности.\n\n"
+    "Раздел находится:\nПитание → Прикорм 6+\n\n"
+    "Буду очень рада вашей обратной связи ❤️\n"
+    "Попробуйте новую функцию и напишите, насколько она вам полезна и чего в ней ещё не хватает."
+)
+
+def cf_campaign_kb_tg():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🥣 Открыть «Прикорм 6+»", web_app=WebAppInfo(url=MINIAPP_URL + "?screen=complementary-feeding"))],
+        [InlineKeyboardButton(text="💬 Оставить мнение", callback_data="cf2026:feedback")],
+    ])
+
+class CFCampaignStates(StatesGroup):
+    waiting_feedback = State()
+
+def _claim_cf_broadcast_tg(user_id):
+    now = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO broadcast_log(broadcast_key, platform, user_id, status, error_code, ts) "
+            "VALUES (?, 'telegram', ?, 'claimed', '', ?) "
+            "ON CONFLICT(broadcast_key, platform, user_id) DO UPDATE SET status='claimed', ts=excluded.ts "
+            "WHERE broadcast_log.status NOT IN ('sent', 'claimed', 'forbidden', 'blocked')",
+            (CF_CAMPAIGN_KEY, user_id, now),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+def _mark_cf_broadcast_tg(user_id, status, error_code=""):
+    now = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE broadcast_log SET status=?, error_code=?, ts=? WHERE broadcast_key=? AND platform='telegram' AND user_id=?",
+            (status, str(error_code)[:200], now, CF_CAMPAIGN_KEY, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def _cf_broadcast_status_tg(user_id):
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT status FROM broadcast_log WHERE broadcast_key=? AND platform='telegram' AND user_id=?",
+            (CF_CAMPAIGN_KEY, user_id),
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+async def send_cf_campaign_tg():
+    """Ручная одноразовая рассылка «Прикорм 6+». Не запускается из scheduler/main —
+    вызывается один раз внешним job-скриптом. Безопасна для повторного запуска: уже
+    отправленным по этому broadcast_key пользователям сообщение повторно не уходит."""
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT user_id FROM users WHERE user_id IS NOT NULL AND user_id > 0").fetchall()
+    finally:
+        conn.close()
+    audience = [r[0] for r in rows if r[0] != OWNER_ID]
+    sent, failed = 0, 0
+    for user_id in audience:
+        if not _claim_cf_broadcast_tg(user_id):
+            status = _cf_broadcast_status_tg(user_id)
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            continue
+        try:
+            await bot.send_message(user_id, CF_CAMPAIGN_TEXT, reply_markup=cf_campaign_kb_tg())
+            _mark_cf_broadcast_tg(user_id, "sent")
+            sent += 1
+        except TelegramForbiddenError:
+            _mark_cf_broadcast_tg(user_id, "forbidden")
+            failed += 1
+        except TelegramBadRequest as e:
+            _mark_cf_broadcast_tg(user_id, "chat_not_found", str(e))
+            failed += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await bot.send_message(user_id, CF_CAMPAIGN_TEXT, reply_markup=cf_campaign_kb_tg())
+                _mark_cf_broadcast_tg(user_id, "sent")
+                sent += 1
+            except Exception as e2:
+                _mark_cf_broadcast_tg(user_id, "temp_error", str(e2))
+                failed += 1
+        except Exception as e:
+            _mark_cf_broadcast_tg(user_id, "temp_error", str(e))
+            failed += 1
+        await asyncio.sleep(0.15)
+    return {"audience": len(audience), "sent": sent, "failed": failed}
+
+@dp.callback_query(F.data == "cf2026:feedback")
+async def cf2026_feedback(call: CallbackQuery, state: FSMContext):
+    await state.set_state(CFCampaignStates.waiting_feedback)
+    await call.message.answer(
+        "💬 Напишите одним сообщением, как вам новый раздел «Прикорм 6+».\n\n"
+        "Что понравилось? Чего не хватает? Что стоит сделать удобнее?\n\n"
+        "Я обязательно прочитаю ❤️"
+    )
+    await call.answer()
+
+@dp.message(CFCampaignStates.waiting_feedback, F.text)
+async def cf2026_feedback_send(message: Message, state: FSMContext):
+    await state.clear()
+    username = message.from_user.username or ""
+    name = message.from_user.first_name or ""
+    target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
+    username_line = f"@{username}" if username else "—"
+    owner_text = (
+        "🥣 Отзыв о «Прикорм 6+»\n\n"
+        "Платформа: Telegram\n"
+        f"Имя: {name or '—'}\n"
+        f"Username: {username_line}\n"
+        f"User ID: {message.from_user.id}\n\n"
+        f"Отзыв:\n{message.text}"
+    )
+    try:
+        await bot.send_message(target, owner_text[:3900])
+    except Exception as e:
+        logging.error(f"cf2026 feedback owner notify error: {e}")
+    import threading
+    threading.Thread(target=sheets_add_review, args=(
+        message.from_user.id, message.from_user.username, f"ОТЗЫВ (Прикорм 6+): {message.text}", "Отзывы МамаБот"
+    )).start()
+    await message.answer(
+        "Спасибо ❤️ Ваше мнение отправлено. Оно поможет сделать «Прикорм 6+» полезнее.",
+        reply_markup=kb_mama_menu() if get_user(message.from_user.id) and get_user(message.from_user.id)[0] == "mama" else kb_start()
+    )
+
 @dp.message(Command("myid"))
-async def myid_tg(message: Message):
+async def myid_tg(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
 
 
 @dp.message(Command("reset_me"))
 async def reset_me_tg(message: Message, state: FSMContext):
     """Полностью сбрасывает личные тестовые данные пользователя, но сохраняет журнал продаж."""
-    user_id = message.from_user.id
+    await state.clear()
+    await message.answer(
+        "⚠️ Это удалит ваш профиль и сохранённые данные в боте. Платёжный журнал не удаляется.\n\n"
+        "Удалить данные?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Удалить данные", callback_data="reset_me_confirm")],
+            [InlineKeyboardButton(text="Отмена", callback_data="reset_me_cancel")],
+        ])
+    )
+
+
+@dp.callback_query(F.data == "reset_me_cancel")
+async def reset_me_cancel_tg(call: CallbackQuery):
+    await call.message.edit_text("Отменено. Данные не удалены.")
+
+
+@dp.callback_query(F.data == "reset_me_confirm")
+async def reset_me_confirm_tg(call: CallbackQuery, state: FSMContext):
+    """Полностью сбрасывает личные тестовые данные пользователя, но сохраняет журнал продаж."""
+    user_id = call.from_user.id
     await state.clear()
     tables = [
         "diary", "growth", "symptoms", "feeding", "sleep_log", "psycho_history",
@@ -3738,7 +5063,7 @@ async def reset_me_tg(message: Message, state: FSMContext):
         conn.commit()
     finally:
         conn.close()
-    await message.answer("✅ Ваш профиль и тестовые данные сброшены. Нажмите /start для новой регистрации.")
+    await call.message.edit_text("✅ Ваш профиль и тестовые данные сброшены. Нажмите /start для новой регистрации.")
 
 
 @dp.message(Command("test_channel_visual"))
@@ -3778,40 +5103,135 @@ CHANNEL_ID = "@yamama_ai"
 BOT_BASE_URL = "https://t.me/MaminPomoshnikAI_bot"
 BOT_PUBLIC_URL = f"{BOT_BASE_URL}?start=channel"
 
-# Три сильных публикации в день вместо пяти однотипных статей.
-# Форматы вращаются по дням и сохраняются в БД, чтобы канал не повторялся.
-HUMAN_CHANNEL_THEMES = [
-    "вечерние ритуалы и смешные привычки детей",
-    "детские фразы, которые родители вспоминают годами",
-    "семейная ситуация, которая сначала пошла не по плану",
-    "взгляд папы на обычный день с детьми",
-    "ревность и отношения между детьми",
-    "сон, укладывание и маленькие семейные ритуалы",
-    "детский сад, прогулки и неожиданные разговоры",
-    "родительская усталость без идеальности",
-    "простое решение бытовой семейной проблемы",
-    "семейная традиция, которая появилась случайно",
-    "забавный конфликт ребёнка с правилами взрослых",
-    "момент, когда взрослый понял ребёнка не сразу",
-]
+# 3 поста в день, 8 рубрик практического родительского контента (без ежедневных
+# выдуманных семейных историй). Категории: REC рецепт, WHATIF воспитание/поведение,
+# HEALTH здоровье-сон-врач, AGE сад/школа/развитие по возрасту, MOM мама тоже человек,
+# DAD папин взгляд (короткое наблюдение, не сюжет), FAM бабушки-дедушки-семья,
+# SAVE сохрани-пригодится (также резерв вместо личной истории без фактов владельца).
+# Темы и форматы вращаются по дням и сохраняются в БД, чтобы канал не повторялся.
 
-HUMAN_CHANNEL_FORMATS = [
-    ("живая семейная история", "Расскажи короткую собирательную семейную историю с конкретной сценой, репликой ребёнка, поворотом и тёплым финалом. Не выдавай её за историю реальной подписчицы.", 1500, "none"),
-    ("история от папы", "Напиши жизненную историю от лица папы: начни сразу со сцены, добавь честность, лёгкий юмор и момент, когда он понял важную деталь.", 1450, "none"),
-    ("смешной семейный эпизод", "Создай смешной узнаваемый эпизод: короткий диалог, неожиданная детская логика и добрый финал. Без советов и психологических терминов.", 1100, "comments"),
-    ("история с решением", "Покажи бытовую проблему через историю: что произошло, что не помогло сначала и какое простое решение сработало. Без обещания универсального результата.", 1600, "bot"),
-    ("вопрос родителям", "Начни с короткой живой сценки, затем задай один конкретный вопрос, на который легко ответить своей историей.", 950, "comments"),
-    ("детская фраза дня", "Построй пост вокруг забавной или трогательной детской фразы: контекст, реакция взрослого и короткое наблюдение о детской логике.", 1000, "comments"),
-    ("неидеальный родительский день", "Опиши день, в котором всё пошло не по плану, но нашёлся один хороший момент. Просто и самоиронично.", 1300, "none"),
-    ("полезное через историю", "Дай одну полезную мысль только через сюжет и действия героев. В конце оставь один практический шаг.", 1450, "bot"),
-]
+CHANNEL_CONTENT_LIBRARY_PATH = "/root/mama_channel_content.json"
+
+# Редакционная архитектура: свободная AI-генерация поста с нуля больше не используется.
+# Основа каждой публикации — заранее написанный и вручную проверенный материал из
+# библиотеки CHANNEL_CONTENT_LIBRARY_PATH (минимум 120 готовых постов). AI-адаптация
+# (лёгкая правка вступления/порядка абзацев/CTA-фразы) необязательна и по умолчанию
+# выключена — надёжный дефолт после FINAL_FAIL свободной генерации в предыдущей задаче
+# (JOB_20260711_175411). Включать только после отдельной проверки владельцем.
+CHANNEL_AI_ADAPTATION_ENABLED = False
+
+CHANNEL_LIBRARY_MAX_CHARS = {
+    "REC": 2000, "WHATIF": 1300, "HEALTH": 1300, "AGE": 1300,
+    "MOM": 1200, "DAD": 700, "FAM": 1200, "SAVE": 1200,
+}
+
+# Рубрика -> все format_name, которые ей присваиваются (для анти-повтора по истории
+# публикаций: get_recent_channel_posts хранит только slot/theme/format_name/text).
+CHANNEL_FORMAT_NAMES_BY_CATEGORY = {
+    "REC": ("рецепт",),
+    "WHATIF": ("что делать, если", "поговорим честно"),
+    "HEALTH": ("здоровье и сон",),
+    "AGE": ("по возрасту",),
+    "MOM": ("мама тоже человек",),
+    "DAD": ("папин взгляд",),
+    "FAM": ("семья и бабушки",),
+    "SAVE": ("сохрани, пригодится",),
+}
+
+_channel_content_library_cache = None
+
+
+def load_channel_content_library():
+    """Загружает и кеширует библиотеку готовых постов из CHANNEL_CONTENT_LIBRARY_PATH."""
+    global _channel_content_library_cache
+    if _channel_content_library_cache is None:
+        with open(CHANNEL_CONTENT_LIBRARY_PATH, "r", encoding="utf-8") as f:
+            _channel_content_library_cache = json.load(f)
+    return _channel_content_library_cache
+
+
+def channel_library_by_category(category):
+    return [item for item in load_channel_content_library() if item.get("category") == category]
+
+
+def _recent_channel_topics(limit=45):
+    return {theme_ for _, theme_, _, _ in get_recent_channel_posts(limit) if theme_}
+
+
+def _recent_channel_topics_for_category(category, limit):
+    format_names = CHANNEL_FORMAT_NAMES_BY_CATEGORY.get(category, ())
+    rows = get_recent_channel_posts(limit)
+    return [theme_ for _, theme_, f, _ in rows if f in format_names and theme_]
+
+
+def select_channel_library_post(category, rnd, exclude_topics=()):
+    """Выбирает готовый пост из библиотеки: не повторяет тему/id до полного цикла
+    рубрики и не повторяет тему за последние 45 публикаций (раздел 9 задачи)."""
+    pool = channel_library_by_category(category)
+    if not pool:
+        return None
+    cycle_len = max(len(pool) - 1, 0)
+    recent_in_category = _recent_channel_topics_for_category(category, limit=cycle_len + 45 + 5)
+    banned_topics = set(recent_in_category[:cycle_len]) | _recent_channel_topics(45) | set(exclude_topics)
+    candidates = [item for item in pool if item["topic"] not in banned_topics]
+    if not candidates:
+        candidates = [item for item in pool if item["topic"] not in exclude_topics] or list(pool)
+    return rnd.choice(candidates)
 
 CHANNEL_SYSTEM_PROMPT = (
-    "Ты живой автор семейного канала «Я МАМА», а не редактор справочника. Пиши так, будто рассказываешь знакомым родителям интересный случай: "
-    "конкретная сцена, детали, диалог, узнаваемая эмоция, лёгкий юмор и естественный ритм. Начинай сразу с события или реплики. "
-    "Не используй служебные метки, канцелярит и нейросетевую философию. Запрещены фразы: «внутренняя рефлексия», «позвольте себе», "
-    "«закройте глаза и вдохните», «важно помнить», «давайте разберёмся», «в современном мире». Не придумывай реальную подписчицу, дату, город, "
-    "исследование или новость. Каждый пост должен отличаться от недавних по герою, ситуации, началу и развязке."
+    "Ты ведёшь канал «Мамин помощник» — полезно о детях, семье и родительской жизни простыми человеческими словами. "
+    "Твой голос — это голос отца троих дочерей, но ты не обязан быть героем каждого поста и не должен ежедневно "
+    "сочинять события своей семьи: тебе запрещено выдумывать конкретные биографические события автора, жены и "
+    "дочерей. Настоящие личные истории — отдельная серия и не твоя задача. "
+    "Пиши простым разговорным русским языком, обращайся к читателям напрямую, абзацы разной длины, лёгкий юмор "
+    "и самоирония уместны, конкретика и практическая польза обязательны, переходы между мыслями естественные. "
+    "Каждый пост должен звучать так, будто его написал живой человек, а не нейросеть и не редакция. "
+    "Запрещено: сочинять ежедневные истории семьи автора; придумывать прямую речь детей; указывать возраст детей "
+    "в скобках вроде «старшая (11 лет)»; служебные заголовки-названия формата («История дня», «Семейная история», "
+    "«Полезный пост», «Ситуация из жизни»); название рубрики в тексте поста; сценические ремарки в скобках; "
+    "искусственные диалоги; обязательный счастливый финал; мораль в конце; высокопарные метафоры; журнальный или "
+    "канцелярский язык; странные литературные обороты; образ идеального и мудрого отца; одинаковая композиция "
+    "каждый день; фальшивые исследования и статистика; советы, приписанные врачам или психологам без источника; "
+    "диагнозы; назначение лечения; гарантированный результат. "
+    "Особенно запрещены фразы: «И тут я понял…», «В такие моменты понимаешь…», «Ссоры временны, а дружба навсегда», "
+    "«Как важно создавать пространство…», «Жизнь внесла свои коррективы», «Серые тучи сгущались», «Мораль этой "
+    "истории», «Каждая мама должна», «Важно помнить», «Давайте разберёмся», «По мнению экспертов» без конкретного "
+    "проверенного источника, «каждый ребёнок уникален», «главное — сохранять спокойствие», «это нормально», "
+    "«в современном мире», «ни для кого не секрет», «внешняя сторона семьи», «бешеный диссонанс», «полная "
+    "безысходность», «хорошая мама должна», «хорошая мама обязана», «это важная тема для родителей», «это может "
+    "быть стрессовым моментом», «непростой процесс». "
+    "Не давай советы без конкретики вроде «просто будьте рядом», «уделите ребёнку внимание», «создайте атмосферу "
+    "поддержки», «следите за состоянием» — если даёшь такой совет, сразу поясни, что именно делать: что сказать, "
+    "что сделать руками, сколько минут, что именно наблюдать. Вместо «поддержите ребёнка» пиши «сядьте рядом», "
+    "«скажите, что будет происходить», «предложите выбрать игрушку» — конкретное действие вместо общего лозунга. "
+    "Не начинай пост с общих фраз вроде «Сегодня я хочу поговорить о важной теме», «В современном мире родители "
+    "часто сталкиваются», «Давайте разберёмся», «Важно помнить», «Гаджеты — важная тема для родителей», "
+    "«Воспитание детей — непростой процесс». Начинай сразу с конкретной ситуации, вопроса или факта, как будто "
+    "читатель уже в середине разговора, например: «Если ребёнок боится уколов, фраза 'не бойся' часто не "
+    "помогает», «Ребёнок снова говорит, что не хочет в садик», «Этот ужин можно приготовить за 25 минут». "
+    "Ты — мужчина, отец троих дочерей, ведущий канала, а не герой каждого текста: фразы вроде «с тремя детьми "
+    "быстро понимаешь одну вещь…», «мне как папе это тоже знакомо» уместны изредка и только по смыслу, не в "
+    "каждом посте; формальные вставки авторства без содержания («я сам это чувствую», «на мой взгляд» без "
+    "продолжения мысли) запрещены. "
+    "Никогда не выдумывай сцены и цитаты, поданные как реальные сегодняшние или вчерашние события — что "
+    "сказала бабушка, жена, ребёнок или сосед, что случилось только что дома у автора. Готовая фраза для "
+    "разговора с ребёнком — это совет читателю, что сказать («скажите: 'я рядом'»), а не цитата в кавычках "
+    "с припиской «сказала», «заявила», «эта фраза сегодня звучала» — так писать запрещено. "
+    "Каждый пост обязан дать читателю конкретный результат: чек-лист, последовательность действий, рецепт, "
+    "готовую фразу для разговора с ребёнком, вопросы врачу, понятное правило или наблюдение. Если после текста "
+    "нельзя ответить, что именно читатель узнал, сохранил или сможет попробовать — текст не годится. "
+    "Не заканчивай пост фразами «всё обязательно получится», «главное — любовь», «семья — это самое важное», "
+    "«каждый момент бесценен», «детство проходит быстро» — заверши конкретным выводом, вопросом, предложением "
+    "сохранить пост или уместным по теме CTA. "
+    "Про здоровье пиши только информационно и организационно: наблюдения, дневник симптомов, вопросы врачу, режим "
+    "сна, напоминание обратиться за медицинской помощью — без диагнозов, без дозировок, без замены врача. Точные "
+    "возрастные нормы, нормы сна, экранного времени и другие цифры без проверенного источника не выдумывай — "
+    "используй осторожные формулировки вроде «ориентируйтесь на рекомендации своего педиатра» или «нормы "
+    "индивидуальны и зависят от ситуации». "
+    "Не придумывай реальные даты, города, новости, исследования или статистику. Не обрывай текст на середине слова "
+    "или фразы. Каждый пост должен отличаться от недавних по теме, началу и структуре — не используй одинаковое "
+    "начало и одну и ту же композицию постоянно. Один естественный вопрос читателям или просьба поделиться опытом "
+    "уместны не в каждом посте, а изредка и по смыслу."
 )
 
 
@@ -3862,45 +5282,90 @@ def normalize_for_similarity(text):
     return " ".join(re.sub(r"[^а-яёa-z0-9 ]", " ", (text or "").lower()).split())
 
 
-def is_channel_post_too_similar(title, text, threshold=0.66):
+def is_channel_post_too_similar(title, text, threshold=0.66, edge_threshold=0.8):
+    """Сравнивает не только общий текст, но и начало/конец — против повтора сюжета, героя и развязки."""
     from difflib import SequenceMatcher
     candidate = normalize_for_similarity(f"{title} {text}")[:1200]
     if not candidate:
         return True
-    for old_title, _, _, old_text in get_recent_channel_posts(20):
+    candidate_body = normalize_for_similarity(text)
+    candidate_start = candidate_body[:220]
+    candidate_end = candidate_body[-220:]
+    for old_title, _, _, old_text in get_recent_channel_posts(35):
         previous = normalize_for_similarity(f"{old_title} {old_text}")[:1200]
         if previous and SequenceMatcher(None, candidate, previous).ratio() >= threshold:
+            return True
+        old_body = normalize_for_similarity(old_text)
+        old_start = old_body[:220]
+        old_end = old_body[-220:]
+        if old_start and candidate_start and SequenceMatcher(None, candidate_start, old_start).ratio() >= edge_threshold:
+            return True
+        if old_end and candidate_end and SequenceMatcher(None, candidate_end, old_end).ratio() >= edge_threshold:
             return True
     return False
 
 
-def fallback_channel_post(slot, theme, format_name):
-    """Резервный пост, чтобы канал не останавливался при недоступности AI."""
-    theme_low = (theme or "").lower()
-    if "сон" in theme_low:
-        subject = "сон ребёнка"
-        action = "Сегодня отметьте время засыпания и пробуждения — даже две записи уже полезнее, чем попытка вспомнить всё вечером."
-    elif any(x in theme_low for x in ("питан", "корм", "гв", "прикорм")):
-        subject = "питание и кормления"
-        action = "Сегодня запишите хотя бы одно кормление: время, продолжительность и то, как чувствовал себя малыш."
-    elif any(x in theme_low for x in ("здоров", "симптом", "врач")):
-        subject = "здоровье ребёнка"
-        action = "Если что-то настораживает, запишите время появления симптома, температуру и изменения в поведении — это поможет врачу увидеть картину точнее."
-    elif any(x in theme_low for x in ("эмоц", "устал", "тревог", "мам")):
-        subject = "состояние мамы"
-        action = "Выберите сегодня одно действие, которое действительно уменьшит нагрузку: попросить о помощи, перенести необязательное дело или отдохнуть 15 минут без чувства вины."
-    elif any(x in theme_low for x in ("развит", "игр", "речь")):
-        subject = "развитие ребёнка"
-        action = "Проведите десять спокойных минут без телефона: поговорите, назовите предметы вокруг или повторите любимую игру малыша."
-    else:
-        subject = "спокойный день с ребёнком"
-        action = "Не пытайтесь сделать всё идеально. Выберите одно важное дело для ребёнка и одно маленькое действие для себя."
+def looks_like_full_recipe(text):
+    """Грубая проверка: рецепт должен содержать количества и шаги, а не просто идею блюда."""
+    value = (text or "").lower()
+    has_quantity = bool(re.search(r"\d+\s*(г\b|мл|ст\.?\s*л|ч\.?\s*л|шт\b|стакан|минут|мин\b|градус|°)", value))
+    has_steps = value.count("\n") >= 3 or len(re.findall(r"\d+[.)]", value)) >= 3
+    return bool(has_quantity and has_steps and len(text or "") >= 400)
 
-    if slot in ("08:00", "morning"):
-        return "Один спокойный шаг на сегодня", f"Сегодняшняя тема — {subject}.\n\n{action}\n\nМаленькие повторяющиеся действия дают больше пользы, чем редкие идеальные дни."
-    if slot in ("13:00", "afternoon"):
-        return "Практичный ориентир для мамы", f"Когда дел много, полезно опираться не на память, а на простую систему.\n\nТема дня: {subject}.\n\n1. Зафиксируйте один важный факт.\n2. Отметьте, что изменилось по сравнению со вчера.\n3. Запишите один вопрос, который стоит обсудить со специалистом или близкими.\n4. Не делайте выводов по одному эпизоду — смотрите на динамику.\n\n{action}"
-    return "День не обязан быть идеальным", f"Сегодня мы говорили про {subject}.\n\nВечером достаточно ответить себе на два вопроса: что сегодня получилось и что можно упростить завтра.\n\nЗабота о семье начинается не с идеальности, а с устойчивости."
+
+CHANNEL_FORBIDDEN_PHRASES = (
+    "каждый ребёнок уникален", "важно помнить", "давайте разберёмся", "главное — сохранять спокойствие",
+    "главное - сохранять спокойствие", "это нормально", "в современном мире", "ни для кого не секрет",
+    "внешняя сторона семьи", "бешеный диссонанс", "полная безысходность", "жизнь внесла свои коррективы",
+    "в такие моменты понимаешь", "и тут я понял", "мораль этой истории", "каждая мама должна",
+    "хорошая мама должна", "хорошая мама обязана", "создайте атмосферу поддержки", "просто будьте рядом",
+    "уделите ребёнку внимание", "следите за состоянием", "это важная тема для родителей",
+    "это может быть стрессовым моментом", "непростой процесс", "серые тучи сгущались",
+    "ссоры временны, а дружба навсегда", "всё обязательно получится", "главное — любовь",
+    "главное - любовь", "семья — это самое важное", "семья - это самое важное", "каждый момент бесценен",
+    "детство проходит быстро",
+)
+
+CHANNEL_BAD_OPENING_PHRASES = (
+    "сегодня я хочу поговорить", "в современном мире родители", "каждый ребёнок уникален",
+    "ни для кого не секрет", "давайте разберёмся", "важно помнить", "главное — сохранять спокойствие",
+    "главное - сохранять спокойствие", "это может быть стрессовым моментом",
+    "гаджеты — важная тема для родителей", "гаджеты - важная тема для родителей",
+    "воспитание детей — непростой процесс", "воспитание детей - непростой процесс",
+)
+
+
+def channel_post_quality_issues(text, category):
+    """Автоматическая проверка перед публикацией: запрещённые шаблоны, обрыв текста, отсутствие конкретики."""
+    value = (text or "").strip()
+    if not value:
+        return ["пустой текст"]
+    low = value.lower()
+    issues = []
+    for phrase in CHANNEL_FORBIDDEN_PHRASES:
+        if phrase in low:
+            issues.append(f"запрещённая шаблонная фраза: «{phrase}»")
+    opening = low[:180]
+    for phrase in CHANNEL_BAD_OPENING_PHRASES:
+        if phrase in opening:
+            issues.append(f"шаблонное вступление: «{phrase}»")
+    if value[-1] not in ".!?…»\")":
+        issues.append("текст обрывается без завершающего знака препинания")
+    dialogue_pattern = re.search(
+        r"(?:«[^»]{3,90}»|\"[^\"]{3,90}\")\s*[—\-,]?\s*(?:сказал\w*|спросил\w*|заявил\w*|воскликнул\w*|"
+        r"ответил\w*|прошептал\w*|произнес\w*|произнёс\w*|эта фраза\s+(?:сегодня|вчера|на днях)?\s*"
+        r"(?:звучал\w*|прозвучал\w*))",
+        value, re.I,
+    )
+    if dialogue_pattern:
+        issues.append("похоже на выдуманный диалог или цитату, поданную как реальное событие")
+    if category != "DAD" and len(value) > 250:
+        has_digits = bool(re.search(r"\d", value))
+        has_list = bool(re.search(r"(?:^|\n)\s*(?:[-•]|\d+[.)])\s+\S", value))
+        has_quote = "«" in value or "'" in value
+        if not (has_digits or has_list or has_quote):
+            issues.append("нет конкретики: ни цифр, ни списка, ни готовой фразы для разговора")
+    return issues
 
 
 def is_ai_error_text(text):
@@ -3942,123 +5407,133 @@ def trim_channel_post_body(text, max_chars):
     return candidate.rstrip(" ,;:-") + "…"
 
 
-def parse_generated_channel_post(raw):
-    raw = clean_text(raw or "").strip()
-    raw = re.sub(r"^(?:ЗАГОЛОВОК|ТЕКСТ ПОСТА|ПОСТ)\s*:\s*", "", raw, flags=re.I)
-    lines = [line.strip() for line in raw.splitlines()]
-    while lines and re.fullmatch(r"(?:текст поста|пост|заголовок)\s*:?", lines[0], flags=re.I):
-        lines.pop(0)
-    raw = "\n".join(lines).strip()
-    title = "История из семейной жизни"
-    body = raw
-    if raw.startswith("ЗАГОЛОВОК:"):
-        first, _, rest = raw.partition("\n")
-        title = first.split(":", 1)[1].strip() or title
-        body = rest.strip()
-    elif "\n" in raw:
-        first, rest = raw.split("\n", 1)
-        if 4 <= len(first) <= 95:
-            title, body = first.strip(" —:•"), rest.strip()
-    body = re.sub(r"^(?:Текст поста|Пост)\s*:\s*", "", body, flags=re.I).strip()
-    return title[:100], body
+CHANNEL_ADAPTATION_SYSTEM_PROMPT = (
+    "Ты редактор канала «Мамин помощник». Тебе дают готовый, уже проверенный пост. "
+    "Разрешено ТОЛЬКО: слегка изменить вступление, поменять местами два-три абзаца (если "
+    "смысл не меняется), адаптировать обращение к читателю, немного сократить или "
+    "расширить текст, изменить финальный вопрос. Категорически запрещено: придумывать "
+    "новые факты, менять любые цифры и количества, менять рецепт, менять шаги "
+    "приготовления, менять медицинский смысл, добавлять личные истории или прямую речь, "
+    "добавлять статистику и исследования, менять итоговый смысл текста. Верни только "
+    "финальный текст поста без пояснений и без заголовка."
+)
 
 
-async def generate_channel_post(slot, theme, format_name, instruction, max_chars, with_bot_bridge=False):
-    history = channel_history_for_prompt()
-    bridge = (
-        "В конце добавь один естественный переход к конкретной функции бота — не продавай подписку напрямую. "
-        "Подходящие функции: персональный план «Сегодня», дневник сна, трекер кормлений, сводка к врачу, "
-        "недельный отчёт, тревожная кнопка «Ребёнку плохо», психолог. "
-        if with_bot_bridge else
-        "Не упоминай бот и не продавай ничего."
-    )
+def _channel_number_tokens(text):
+    return sorted(re.findall(r"\d+[.,]?\d*", text or ""))
+
+
+async def try_channel_ai_adaptation(category, item):
+    """Необязательная лёгкая AI-адаптация готового поста (раздел 7 задачи). Отключена по
+    умолчанию через CHANNEL_AI_ADAPTATION_ENABLED и не вызывается для рецептов и
+    медицинских материалов (см. channel_post_from_library). Адаптация принимается только
+    если цифры и объём текста не изменились и текст проходит тот же quality gate, что и
+    обычная библиотека — иначе используется исходный проверенный текст без изменений."""
+    original = item["body"]
     prompt = (
-        f"Время публикации: {slot}.\n"
-        f"Тема дня: {theme}.\n"
-        f"Формат: {format_name}.\n"
-        f"Задача: {instruction}.\n"
-        f"Ограничение: до {max_chars} знаков. Короткие абзацы, удобно читать одной рукой.\n"
-        f"{bridge}\n"
-        "Верни текст в формате:\nЗАГОЛОВОК: короткий цепляющий заголовок\nтекст поста\n\n"
-        "Недавние публикации, которые нельзя повторять:\n"
-        f"{history}"
+        f"Готовый пост рубрики «{item.get('format_name', '')}», тема: {item.get('topic', '')}.\n"
+        "Исходный текст:\n" + original + "\n\n"
+        "Сделай разрешённую лёгкую редакционную правку и верни только новый текст поста целиком."
     )
-    last_error = None
-    for _ in range(3):
-        raw = await ask_gpt(CHANNEL_SYSTEM_PROMPT, prompt)
-        if is_ai_error_text(raw):
-            last_error = raw
-            break
-        title, body = parse_generated_channel_post(raw)
-        body = trim_channel_post_body(body, max_chars)
-        if body and not is_channel_post_too_similar(title, body):
-            return title, body
-        prompt += "\nПредыдущий вариант оказался слишком похож на старые публикации. Выбери совершенно другой угол и примеры."
-
-    title, body = fallback_channel_post(slot, theme, format_name)
-    logging.error("Канал TG: AI-текст недоступен, опубликован резервный пост. Причина: %s", last_error or "нет уникального ответа")
     try:
-        owner_target = OWNER_ID or CHANNEL_REPORT_CHAT_ID
-        if owner_target:
-            await bot.send_message(owner_target, f"⚠️ Канал TG: AI-генерация недоступна. Для слота {slot} будет опубликован резервный пост.")
+        raw = await ask_gpt(CHANNEL_ADAPTATION_SYSTEM_PROMPT, prompt)
     except Exception as exc:
-        logging.error("Канал TG: не удалось уведомить владельца об ошибке AI: %s", exc)
-    return title, trim_channel_post_body(body, max_chars)
+        logging.warning("Канал TG: адаптация недоступна для %s: %s", item.get("id"), exc)
+        return None
+    if is_ai_error_text(raw):
+        return None
+    candidate = clean_text(raw or "").strip()
+    if not candidate:
+        return None
+    if _channel_number_tokens(candidate) != _channel_number_tokens(original):
+        logging.warning("Канал TG: адаптация %s изменила цифры, используется оригинал", item.get("id"))
+        return None
+    if not (0.5 * len(original) <= len(candidate) <= 1.8 * len(original)):
+        return None
+    if channel_post_quality_issues(candidate, category):
+        return None
+    return candidate
 
 
-def channel_funnel_for_post(theme="", title="", body="", format_name=""):
-    """Подбирает тематический мостик и CTA для каждого поста канала."""
-    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
+async def channel_post_from_library(slot, category, item):
+    """Готовит библиотечный пост к публикации: опциональная лёгкая AI-адаптация (см. флаг
+    CHANNEL_AI_ADAPTATION_ENABLED выше), затем защитная проверка тем же quality gate, что
+    и раньше. Если вариант не проходит проверку или похож на недавние публикации — берёт
+    другой готовый пост из той же рубрики вместо технического сообщения (раздел 8 задачи).
+    Возвращает (title, body, item) — item может быть заменён на резервный."""
+    candidate_item = item
+    max_chars = CHANNEL_LIBRARY_MAX_CHARS.get(category, 2000)
+    title = candidate_item.get("title") or ""
+    body = candidate_item["body"]
+    can_adapt = CHANNEL_AI_ADAPTATION_ENABLED and category != "REC" and not candidate_item.get("medical")
+    if can_adapt:
+        adapted = await try_channel_ai_adaptation(category, candidate_item)
+        if adapted:
+            body = adapted
+    body = trim_channel_post_body(body, max_chars)
+    tried_topics = {candidate_item["topic"]}
+    attempts = 0
+    while (channel_post_quality_issues(body, category) or is_channel_post_too_similar(title, body)) and attempts < 3:
+        rnd = random.Random(f"library-fallback:{slot}:{candidate_item['id']}:{attempts}")
+        next_item = select_channel_library_post(category, rnd, exclude_topics=tried_topics)
+        if not next_item:
+            break
+        candidate_item = next_item
+        tried_topics.add(candidate_item["topic"])
+        title = candidate_item.get("title") or ""
+        body = trim_channel_post_body(candidate_item["body"], max_chars)
+        attempts += 1
+    return title, body, candidate_item
 
-    rules = [
-        (("сон", "недосып", "засып", "пробуж"),
-         "🌙 Общие нормы не учитывают возраст и ваш режим. Получите бесплатный персональный разбор сна.",
-         "🌙 Разобрать сон ребёнка"),
-        (("корм", "гв", "груд", "прикорм", "питан", "смесь"),
-         "🥣 Получите рекомендацию по кормлению с учётом возраста и вашей ситуации.",
-         "🥣 Разобрать питание ребёнка"),
-        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"),
-         "🩺 Опишите наблюдения — помощник бесплатно соберёт важное и подготовит вопросы врачу.",
-         "🩺 Подготовить вопросы врачу"),
-        (("развит", "возраст", "игр", "заняти", "навык", "речь"),
-         "👶 Проверьте навык или поведение с учётом точного возраста ребёнка.",
-         "👶 Проверить развитие"),
-        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"),
-         "🤍 Опишите, что происходит. Первый персональный разбор поможет спокойно увидеть следующий шаг.",
-         "🤍 Разобрать мою ситуацию"),
-        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"),
-         "👨‍👩‍👧 Опишите ситуацию и получите спокойный план следующего разговора.",
-         "👨‍👩‍👧 Подготовить разговор"),
-        (("беремен", "род", "восстанов", "срок"),
-         "🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
-         "🤰 Открыть помощника"),
-    ]
-    for keywords, bridge, button in rules:
-        if any(word in text for word in keywords):
-            return bridge, button
+CHANNEL_CTA_CATALOG = {
+    "sleep": ("🌙 Общие нормы не учитывают возраст и ваш режим. Получите бесплатный персональный разбор сна.",
+              "🌙 Разобрать сон ребёнка", "channel_sleep"),
+    "feeding": ("🥣 Получите рекомендацию по кормлению с учётом возраста и вашей ситуации.",
+                "🥣 Разобрать питание ребёнка", "channel_feeding"),
+    "doctor": ("🩺 Опишите наблюдения — помощник бесплатно соберёт важное и подготовит вопросы врачу.",
+               "🩺 Подготовить вопросы врачу", "channel_doctor"),
+    "development": ("👶 Проверьте навык или поведение с учётом точного возраста ребёнка.",
+                     "👶 Проверить развитие", "channel_child"),
+    "psycho": ("🤍 Опишите, что происходит. Первый персональный разбор поможет спокойно увидеть следующий шаг.",
+               "🤍 Разобрать мою ситуацию", "channel_psycho"),
+    "family": ("👨‍👩‍👧 Опишите ситуацию и получите спокойный план следующего разговора.",
+               "👨‍👩‍👧 Подготовить разговор", "channel_family"),
+    "pregnancy": ("🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
+                  "🤰 Открыть помощника", "channel_pregnancy"),
+    "generic": ("✨ В «Мамином помощнике» можно получить подсказку именно для вашей ситуации и возраста ребёнка.",
+                "✨ Открыть помощника на сегодня", "channel_today"),
+}
 
-    return (
-        "✨ В «Мамином помощнике» можно получить подсказку именно для вашей ситуации и возраста ребёнка.",
-        "✨ Открыть помощника на сегодня",
-    )
+# Допустимые для CTA рубрики автопостинга и, для каждой рубрики, безопасный дефолт.
+# CTA выбирается ТОЛЬКО по metadata библиотечного поста (cta_allowed), без сканирования
+# текста по ключевым словам (раздел 10 задачи: "запрещено выбирать CTA по случайному
+# совпадению слова внутри текста"). Если у поста нет ни одного допустимого для его
+# рубрики cta_allowed — CTA не показывается вовсе (см. post_human_slot).
+CHANNEL_CTA_ALLOWED_BY_CATEGORY = {
+    "HEALTH": (("doctor", "sleep", "feeding"), "doctor"),
+    "WHATIF": (("sleep", "family", "psycho"), "psycho"),
+    "AGE": (("development",), "development"),
+    "MOM": (("psycho",), "psycho"),
+    "FAM": (("family",), "family"),
+    "SAVE": (("sleep", "feeding", "doctor", "development", "family"), "generic"),
+}
 
 
+def channel_cta_for_post(category, cta_allowed=()):
+    """Возвращает (текст-мостик, текст кнопки, payload) строго по метаданным поста:
+    первый ключ из разрешённых для рубрики, который также есть в cta_allowed поста."""
+    allowed_keys, default_key = CHANNEL_CTA_ALLOWED_BY_CATEGORY.get(category, ((), "generic"))
+    cta_allowed = cta_allowed or ()
+    for key in allowed_keys:
+        if key in cta_allowed:
+            return CHANNEL_CTA_CATALOG[key]
+    return CHANNEL_CTA_CATALOG[default_key]
 
-def channel_start_payload(theme="", title="", body="", format_name=""):
-    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
-    rules = [
-        (("сон", "недосып", "засып", "пробуж"), "channel_sleep"),
-        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "channel_feeding"),
-        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "channel_doctor"),
-        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "channel_psycho"),
-        (("беремен", "род", "восстанов", "срок"), "channel_pregnancy"),
-        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "channel_child"),
-        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"), "channel_family"),
-    ]
-    for keywords, payload in rules:
-        if any(word in text for word in keywords):
-            return payload
-    return "channel_today"
+
+def channel_has_allowed_cta(category, cta_allowed=()):
+    allowed_keys, _ = CHANNEL_CTA_ALLOWED_BY_CATEGORY.get(category, ((), "generic"))
+    cta_allowed = cta_allowed or ()
+    return any(key in cta_allowed for key in allowed_keys)
 
 
 def channel_deeplink(payload="channel"):
@@ -4075,36 +5550,20 @@ async def open_channel_destination_tg(message: Message, payload: str):
     user = get_user(message.from_user.id)
     if not user:
         return False
-    mode = user[0]
-    mapping = {
-        "channel_today": ("❓ Получить персональный ответ", "ask_question"),
-        "channel_sleep": ("🌙 Разобрать сон ребёнка", "funnel_sleep"),
-        "channel_feeding": ("🥣 Разобрать питание ребёнка", "funnel_feeding"),
-        "channel_doctor": ("🩺 Подготовить вопросы врачу", "funnel_doctor"),
-        "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
-        "channel_pregnancy": ("🤰 Задать вопрос по беременности", "funnel_pregnancy"),
-        "channel_child": ("👶 Проверить развитие", "funnel_development"),
-        "channel_family": ("👨‍👩‍👧 Подготовить разговор", "funnel_family"),
-    }
-    title, callback_data = mapping.get(payload, mapping["channel_today"])
-    await message.answer(
-        f"🤍 Ты пришла из канала «Я МАМА».\n\n{title} — открою нужный раздел сразу.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=title, callback_data=callback_data)
-        ]])
-    )
+    text, markup = channel_landing_tg(payload)
+    await message.answer(text, reply_markup=markup)
     return True
 
 
-async def publish_channel_post(slot, theme, format_name, title, body, cta_mode="none"):
-    if not title or not body or channel_slot_published_today(slot):
+async def publish_channel_post(slot, theme, format_name, title, body, cta_mode="none", category="", cta_allowed=None):
+    if not body or channel_slot_published_today(slot):
         return
-    final_text = f"{title}\n\n{body}".strip()
+    final_text = f"{title}\n\n{body}".strip() if title else body.strip()
     reply_markup = None
     if cta_mode == "bot":
-        bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
+        bridge_text, thematic_button, start_payload = channel_cta_for_post(category, cta_allowed or ())
         final_text += f"\n\n{bridge_text}"
-        reply_markup = channel_post_markup(thematic_button, channel_start_payload(theme, title, body, format_name))
+        reply_markup = channel_post_markup(thematic_button, start_payload)
     elif cta_mode == "comments":
         final_text += "\n\nА у вас было что-то похожее? Расскажите в комментариях 🤍"
     try:
@@ -4115,21 +5574,107 @@ async def publish_channel_post(slot, theme, format_name, title, body, cta_mode="
         logging.error(f"Канал: ошибка публикации {slot}: {e}")
 
 
-def _daily_human_choice(day_key, slot):
+CHANNEL_SLOTS = ("human_first", "human_second", "human_third")
+
+# Недельный шаблон из 7 паттернов (утро/день/вечер), покрывающий 21 пост по 8 рубрикам:
+# ~4 рецепта, ~4 воспитание и поведение, ~3 здоровье/сон/врач, ~3 сад/школа/по возрасту,
+# ~2 мама тоже человек, ~2 папин взгляд, ~2 бабушки и семья, ~1 сохрани-пригодится
+# (последний слот также резерв вместо личной истории, если у владельца нет свежих фактов).
+# Ни один день не состоит из двух одинаковых рубрик подряд, а рубрики вечера одного дня и
+# утра следующего никогда не совпадают ни при каком порядке перестановки по неделям.
+# Порядок дней внутри недели тасуется по seed на ISO-неделю.
+CHANNEL_DAY_PATTERNS = [
+    ("REC", "WHATIF", "MOM"),
+    ("REC", "HEALTH", "DAD"),
+    ("REC", "AGE", "FAM"),
+    ("REC", "WHATIF", "MOM"),
+    ("HEALTH", "AGE", "DAD"),
+    ("AGE", "FAM", "WHATIF"),
+    ("HEALTH", "SAVE", "WHATIF"),
+]
+
+
+def _daily_channel_format_plan(day_key):
+    dt = datetime.fromisoformat(day_key)
+    iso_year, iso_week, iso_weekday = dt.isocalendar()
+    patterns = list(CHANNEL_DAY_PATTERNS)
+    random.Random(f"tg-channel-week:{iso_year}-W{iso_week}").shuffle(patterns)
+    pattern = patterns[iso_weekday - 1]
+    return dict(zip(CHANNEL_SLOTS, pattern))
+
+
+def _channel_pick_for_slot(day_key, slot, category):
     rnd = random.Random(f"tg-human-channel:{day_key}:{slot}")
-    theme = rnd.choice(HUMAN_CHANNEL_THEMES)
-    format_name, instruction, max_chars, cta_mode = rnd.choice(HUMAN_CHANNEL_FORMATS)
-    return theme, format_name, instruction, max_chars, cta_mode
+    return select_channel_library_post(category, rnd)
+
+
+def _daily_channel_plan(day_key, categories_by_slot):
+    """CTA-ссылка — детерминированно 3-4 раза в неделю, только в уместных рубриках."""
+    dt = datetime.fromisoformat(day_key)
+    iso_year, iso_week, _ = dt.isocalendar()
+    slots = list(CHANNEL_SLOTS)
+    week_start = dt - timedelta(days=dt.weekday())
+    eligible_by_day = {}
+    for offset in range(7):
+        week_day = (week_start + timedelta(days=offset)).date().isoformat()
+        weekly_categories = _daily_channel_format_plan(week_day)
+        candidates = [
+            weekly_slot for weekly_slot in slots
+            if weekly_categories.get(weekly_slot) in ("HEALTH", "WHATIF", "AGE", "MOM", "FAM", "SAVE")
+        ]
+        if candidates:
+            eligible_by_day[week_day] = candidates
+    weekly_rnd = random.Random(f"tg-human-cta-week:{iso_year}-W{iso_week}")
+    weekly_days = list(eligible_by_day)
+    weekly_rnd.shuffle(weekly_days)
+    weekly_limit = min(len(weekly_days), 3 + int(weekly_rnd.random() < 0.5))
+    weekly_cta = {
+        weekly_day: weekly_rnd.choice(eligible_by_day[weekly_day])
+        for weekly_day in weekly_days[:weekly_limit]
+    }
+    cta_slot = weekly_cta.get(day_key)
+    rnd = random.Random(f"tg-human-question:{day_key}")
+    question_eligible = [s for s in slots if s != cta_slot and categories_by_slot.get(s) != "REC"]
+    question_slot = rnd.choice(question_eligible) if question_eligible and rnd.random() < 0.4 else None
+    return cta_slot, question_slot
 
 
 async def post_human_slot(slot):
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Europe/Moscow"))
     if channel_slot_published_today(slot):
         return
-    theme, format_name, instruction, max_chars, cta_mode = _daily_human_choice(now.date().isoformat(), slot)
-    title, body = await generate_channel_post(slot, theme, format_name, instruction, max_chars, with_bot_bridge=False)
-    await publish_channel_post(slot, theme, format_name, title, body, cta_mode)
-
+    day_key = now.date().isoformat()
+    categories_by_slot = _daily_channel_format_plan(day_key)
+    category = categories_by_slot[slot]
+    item = _channel_pick_for_slot(day_key, slot, category)
+    if not item:
+        logging.error("Канал TG: библиотека пуста для рубрики %s, публикация пропущена", category)
+        return
+    cta_slot, question_slot = _daily_channel_plan(day_key, categories_by_slot)
+    if slot == cta_slot:
+        cta_mode = "bot"
+    elif slot == question_slot:
+        cta_mode = "comments"
+    else:
+        cta_mode = "none"
+    if cta_mode == "bot" and not channel_has_allowed_cta(category, item.get("cta_allowed", [])):
+        tried_topics = {item["topic"]}
+        for attempt in range(6):
+            cta_item = select_channel_library_post(
+                category,
+                random.Random(f"tg-cta-library:{day_key}:{slot}:{attempt}"),
+                exclude_topics=tried_topics,
+            )
+            if not cta_item:
+                break
+            tried_topics.add(cta_item["topic"])
+            if channel_has_allowed_cta(category, cta_item.get("cta_allowed", [])):
+                item = cta_item
+                break
+    title, body, used_item = await channel_post_from_library(slot, category, item)
+    if cta_mode == "bot" and not channel_has_allowed_cta(category, used_item.get("cta_allowed", [])):
+        cta_mode = "none"
+    await publish_channel_post(slot, used_item["topic"], used_item["format_name"], title, body, cta_mode, category, used_item.get("cta_allowed", []))
 
 async def post_human_first():
     await post_human_slot("human_first")
@@ -4139,19 +5684,31 @@ async def post_human_second():
     await post_human_slot("human_second")
 
 
+async def post_human_third():
+    await post_human_slot("human_third")
+
+
 def schedule_daily_human_posts():
-    today = datetime.now().date()
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
     rnd = random.Random(f"tg-human-times:{today.isoformat()}")
-    first_minutes = rnd.randint(9 * 60 + 17, 14 * 60 + 20)
-    second_minutes = rnd.randint(16 * 60 + 41, 22 * 60 + 10)
-    for job_id in ("channel_human_first", "channel_human_second"):
+    windows = ((8 * 60 + 30, 11 * 60 + 30), (13 * 60 + 30, 16 * 60 + 30), (18 * 60, 21 * 60 + 30))
+    minutes = []
+    for lo, hi in windows:
+        candidates = [minute for minute in range(lo, hi + 1) if minute % 60 % 5 != 0]
+        minutes.append(rnd.choice(candidates))
+    job_ids = ("channel_human_first", "channel_human_second", "channel_human_third")
+    targets = (post_human_first, post_human_second, post_human_third)
+    for job_id in job_ids:
         try:
             scheduler.remove_job(job_id)
         except Exception:
             pass
-    scheduler.add_job(post_human_first, "date", run_date=datetime.combine(today, datetime.min.time()) + timedelta(minutes=first_minutes), id="channel_human_first", replace_existing=True, misfire_grace_time=30)
-    scheduler.add_job(post_human_second, "date", run_date=datetime.combine(today, datetime.min.time()) + timedelta(minutes=second_minutes), id="channel_human_second", replace_existing=True, misfire_grace_time=30)
-    logging.info("Канал TG: посты на сегодня запланированы на %02d:%02d и %02d:%02d", first_minutes//60, first_minutes%60, second_minutes//60, second_minutes%60)
+    for job_id, target, minute in zip(job_ids, targets, minutes):
+        scheduler.add_job(target, "date", run_date=datetime.combine(today, datetime.min.time()) + timedelta(minutes=minute), id=job_id, replace_existing=True, misfire_grace_time=30)
+    logging.info(
+        "Канал TG: посты на сегодня запланированы на %02d:%02d, %02d:%02d и %02d:%02d",
+        minutes[0] // 60, minutes[0] % 60, minutes[1] // 60, minutes[1] % 60, minutes[2] // 60, minutes[2] % 60,
+    )
 
 
 async def channel_weekly_editorial_report():
@@ -4168,7 +5725,8 @@ async def channel_weekly_editorial_report():
     ).fetchone()[0]
     bridges = conn.execute(
         "SELECT COUNT(*) FROM channel_posts "
-        "WHERE created_at>=? AND (slot='afternoon' OR (slot='evening' AND strftime('%w', created_at) IN ('1','4','5')))",
+        "WHERE created_at>=? AND slot IN ('human_first','human_second','human_third') "
+        "AND (text LIKE '%помощник%' OR text LIKE '%бот%' OR text LIKE '%разбор%')",
         (week_ago,),
     ).fetchone()[0]
     last_post = conn.execute(
@@ -4183,17 +5741,16 @@ async def channel_weekly_editorial_report():
         by_format[format_name] = by_format.get(format_name, 0) + count
 
     slot_labels = {
-        "morning": "Утренних постов",
-        "afternoon": "Полезных разборов",
-        "evening": "Вечерних постов",
-        "evening_poll": "Опросов",
+        "human_first": "Первых постов дня",
+        "human_second": "Вторых постов дня",
+        "human_third": "Третьих постов дня",
     }
     lines = [
         "📊 Отчёт канала за неделю",
         "",
         f"Опубликовано материалов: {total}",
     ]
-    for slot in ("morning", "afternoon", "evening", "evening_poll"):
+    for slot in ("human_first", "human_second", "human_third"):
         lines.append(f"{slot_labels[slot]}: {by_slot.get(slot, 0)}")
 
     if by_format:
@@ -4440,8 +5997,6 @@ async def feed_stats(call: CallbackQuery):
         f"Дай практические рекомендации."
     )
     await call.message.answer(answer, reply_markup=kb_mama_menu())
-    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
-        consume_credit(call.from_user.id, "feeding_report")
 
 # ─── ДНЕВНИК СНА ─────────────────────────────────────────────
 @dp.callback_query(F.data == "tracker_sleep")
@@ -4516,8 +6071,6 @@ async def sleep_analyze(call: CallbackQuery):
         f"есть ли проблемы и как их решить. Конкретные рекомендации."
     )
     await call.message.answer(answer, reply_markup=kb_mama_menu())
-    if ai_answer_success(answer) and get_user_plan(call.from_user.id) not in PRO_PLANS:
-        consume_credit(call.from_user.id, "sleep_report")
 
 # ─── ПРИВИВОЧНЫЙ КАЛЕНДАРЬ ───────────────────────────────────
 @dp.callback_query(F.data == "tracker_vaccines")
@@ -4875,9 +6428,6 @@ async def psycho_message(message: Message, state: FSMContext):
 @dp.message(PsychoStates.in_session, F.voice)
 async def psycho_voice(message: Message, state: FSMContext):
     """Голос тоже работает в сеансе психолога"""
-    if get_user_plan(message.from_user.id) not in PRO_PLANS:
-        await message.answer("🔒 Голосовые сообщения доступны в Про 💎", reply_markup=kb_premium())
-        return
     try:
         file = await bot.get_file(message.voice.file_id)
         file_path = f"/tmp/mama_psycho_{message.from_user.id}.ogg"
@@ -4956,6 +6506,7 @@ async def main():
     scheduler.start()
     logging.info("Мамин помощник запущен!")
     asyncio.create_task(check_payments_loop())
+    asyncio.create_task(heartbeat_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

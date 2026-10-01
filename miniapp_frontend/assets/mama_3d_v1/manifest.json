@@ -1,0 +1,123 @@
+{
+  "name": "MAMA_MINIAPP_3D_V1",
+  "version": "1.0.0",
+  "palette": [
+    "pastel pink",
+    "sky blue",
+    "warm cream"
+  ],
+  "background": "transparent",
+  "usage": "Telegram Mini App + MAX Mini App",
+  "assets": [
+    {
+      "file": "icons/icon-sleep-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 33896,
+      "quality": 82,
+      "purpose": "Сон"
+    },
+    {
+      "file": "icons/icon-feeding-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 30722,
+      "quality": 82,
+      "purpose": "Питание"
+    },
+    {
+      "file": "icons/icon-tantrum-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 31920,
+      "quality": 82,
+      "purpose": "Истерики и эмоции"
+    },
+    {
+      "file": "icons/icon-symptoms-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 30602,
+      "quality": 82,
+      "purpose": "Самочувствие"
+    },
+    {
+      "file": "icons/icon-kindergarten-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 33486,
+      "quality": 82,
+      "purpose": "Садик"
+    },
+    {
+      "file": "icons/icon-mom-support-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 42664,
+      "quality": 82,
+      "purpose": "Поддержка мамы"
+    },
+    {
+      "file": "icons/icon-ai-question-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 37264,
+      "quality": 82,
+      "purpose": "Вопрос специалисту"
+    },
+    {
+      "file": "icons/icon-history-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 36244,
+      "quality": 82,
+      "purpose": "История"
+    },
+    {
+      "file": "icons/icon-donate-heart-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 32084,
+      "quality": 82,
+      "purpose": "Поддержать проект"
+    },
+    {
+      "file": "icons/icon-school-3d.webp",
+      "size_px": [
+        512,
+        512
+      ],
+      "bytes": 10476,
+      "quality": 82,
+      "purpose": "Школа"
+    },
+    {
+      "file": "hero/hero-welcome-3d.webp",
+      "size_px": [
+        900,
+        675
+      ],
+      "bytes": 51520,
+      "quality": 82,
+      "purpose": "Welcome / Hero"
+    }
+  ]
+}

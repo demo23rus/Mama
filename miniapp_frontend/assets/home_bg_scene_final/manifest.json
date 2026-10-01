@@ -1,0 +1,17 @@
+{
+  "name": "MAMA_MINIAPP_HOME_BG_SCENE_FINAL",
+  "version": "1.0.0",
+  "asset": "home-bg-scene-final.webp",
+  "format": "WebP",
+  "size_px": [
+    1170,
+    2532
+  ],
+  "baseline_viewport": "390x844 @3x",
+  "purpose": "Warm cozy illustrated background for the Home screen of the Mama Mini App",
+  "recommended_css": {
+    "background-size": "cover",
+    "background-position": "center top",
+    "background-repeat": "no-repeat"
+  }
+}

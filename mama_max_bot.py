@@ -3,18 +3,25 @@ import os
 import sqlite3
 import logging
 import os
+import json
 import uuid
 import base64
 import hashlib
+import hmac
 import httpx
 import calendar
+import random
+import io
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from PIL import Image, ImageOps
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl, quote
 from openai import AsyncOpenAI
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from starlette.datastructures import UploadFile
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 import uvicorn
 import gspread
@@ -50,6 +57,7 @@ MAX_BOT_PUBLIC_URL = "https://max.ru/id232007136009_2_bot"
 MAX_CHANNEL_PUBLIC_URL = os.getenv("MAX_CHANNEL_PUBLIC_URL", "")
 MAX_BOT_DEEPLINK = MAX_BOT_PUBLIC_URL
 MAX_BOT_CHANNEL_LINK = MAX_BOT_PUBLIC_URL
+MINIAPP_URL = "https://maminpomoshnik.ru/app/"
 CHANNEL_VISUALS_ENABLED = (_ENV.get("CHANNEL_VISUALS_ENABLED") or os.getenv("CHANNEL_VISUALS_ENABLED") or "1") == "1"
 OPENAI_IMAGE_MODEL = _ENV.get("OPENAI_IMAGE_MODEL") or os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1"
 CHANNEL_IMAGE_SIZE = _ENV.get("CHANNEL_IMAGE_SIZE") or os.getenv("CHANNEL_IMAGE_SIZE") or "1024x1024"
@@ -69,6 +77,10 @@ ONE_TIME_PRODUCTS = {
 }
 PAID_PLANS = {"start", "pro", "pro_year"}
 PRO_PLANS = {"pro", "pro_year"}
+
+# ─── ЛИЧНЫЙ РАЗБОР СИТУАЦИИ (отдельная платная услуга, без кредитов и подписки) ──
+PERSONAL_REVIEW_PRICE_RUB = 690
+PERSONAL_REVIEW_PRODUCT_CODE = "personal_mom_review"
 
 PLAN_LIMITS = {
     "free": {"questions": 5, "psycho_messages": 15},
@@ -99,10 +111,73 @@ SALES_HEADERS = [
     "Тип", "Сумма", "Payment ID", "Дата окончания", "Статус"
 ]
 
+# Таблица PostGenius Users общая для нескольких независимых проектов (Aura,
+# МамаБот, MarketPro, AI Местный и др.) через один service account. Гвард не
+# даёт коду МамаБот MAX удалить/переименовать/массово очистить свой или чужой
+# лист — инициализация может только создать отсутствующий собственный лист.
+_BLOCKED_SPREADSHEET_METHODS = ("del_worksheet", "delete_worksheet", "duplicate_sheet", "batch_update")
+_BLOCKED_WORKSHEET_METHODS = ("clear", "batch_clear", "update_title", "delete_rows", "delete_columns", "delete_dimension")
+
+
+class _NoDeleteWorksheetGuard:
+    """Прокси над gspread.Worksheet, блокирующий удаление/переименование/очистку."""
+
+    def __init__(self, worksheet, spreadsheet_title):
+        object.__setattr__(self, "_wrapped", worksheet)
+        object.__setattr__(self, "_spreadsheet_title", spreadsheet_title)
+
+    def __getattr__(self, name):
+        if name in _BLOCKED_WORKSHEET_METHODS:
+            def _blocked(*args, **kwargs):
+                logging.error(
+                    "destructive_action_blocked: попытка вызвать %s() на листе %s (таблица %s) "
+                    "заблокирована — деструктивные операции над листами общей таблицы требуют "
+                    "отдельного owner-решения",
+                    name, self._wrapped.title, self._spreadsheet_title,
+                )
+                raise PermissionError(
+                    f"{name} is blocked: destructive worksheet operations require explicit owner sign-off"
+                )
+            return _blocked
+        target = getattr(self._wrapped, name)
+        return target
+
+
+class _NoDeleteSpreadsheetGuard:
+    """Прокси над gspread.Spreadsheet, блокирующий деструктивные операции и
+    оборачивающий возвращаемые листы в _NoDeleteWorksheetGuard."""
+
+    def __init__(self, spreadsheet):
+        object.__setattr__(self, "_wrapped", spreadsheet)
+
+    def __getattr__(self, name):
+        title = getattr(self._wrapped, "title", SPREADSHEET_ID_MAMA)
+        if name in _BLOCKED_SPREADSHEET_METHODS:
+            def _blocked(*args, **kwargs):
+                logging.error(
+                    "destructive_action_blocked: попытка вызвать %s() на таблице %s "
+                    "заблокирована — удаление/переименование листов требует отдельного "
+                    "owner-решения",
+                    name, title,
+                )
+                raise PermissionError(
+                    f"{name} is blocked: destructive worksheet operations require explicit owner sign-off"
+                )
+            return _blocked
+        target = getattr(self._wrapped, name)
+        if name in ("worksheet", "add_worksheet", "get_worksheet"):
+            def _wrapped_call(*args, **kwargs):
+                return _NoDeleteWorksheetGuard(target(*args, **kwargs), title)
+            return _wrapped_call
+        if name == "sheet1":
+            return _NoDeleteWorksheetGuard(target, title)
+        return target
+
+
 def _max_sheets_book():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_file(GOOGLE_CREDS_PATH, scopes=scopes)
-    return gspread.authorize(creds).open_by_key(SPREADSHEET_ID_MAMA)
+    return _NoDeleteSpreadsheetGuard(gspread.authorize(creds).open_by_key(SPREADSHEET_ID_MAMA))
 
 def _max_worksheet(book, title, headers):
     try:
@@ -209,6 +284,18 @@ def get_symptoms_list(user_id):
 # ========== ЛОГИ ==========
 logging.basicConfig(level=logging.INFO)
 
+HEARTBEAT_FILE = "/tmp/mama_max.heartbeat"
+
+async def heartbeat_loop():
+    """Обновляет heartbeat-файл для независимого watchdog."""
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "a", encoding="utf-8"):
+                os.utime(HEARTBEAT_FILE, None)
+        except Exception as exc:
+            logging.error("Не удалось обновить MAX heartbeat: %s", exc)
+        await asyncio.sleep(30)
+
 # ========== КЛИЕНТЫ AI ==========
 openai_client = AsyncOpenAI(api_key=OPENAI_KEY)
 
@@ -306,43 +393,53 @@ async def refresh_max_bot_identity():
 
 
 # ========== КНОПКИ ==========
-def start_buttons():
+def start_buttons(user_id=None):
     buttons = [
         [{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"}],
         [{"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}],
     ]
+    if MINIAPP_URL:
+        buttons.append([{"type": "link", "text": "📱 Открыть приложение", "url": MINIAPP_URL}])
     if MAX_CHANNEL_PUBLIC_URL:
         buttons.append([{"type": "link", "text": "📢 Наш канал", "url": MAX_CHANNEL_PUBLIC_URL}])
     buttons.append([
-        {"type": "callback", "text": "💎 Премиум", "payload": "pay_premium"},
+        {"type": "callback", "text": "❤️ Поддержать проект", "payload": "donate_menu"},
         {"type": "callback", "text": "🆘 Поддержка", "payload": "support_menu"},
     ])
-    return buttons
+    return _with_owner_button_max(buttons, user_id)
 
 
-def pregnant_menu_buttons():
-    return [
+def _with_owner_button_max(rows, user_id=None):
+    if OWNER_ID and int(user_id or 0) == OWNER_ID:
+        rows.append([{"type": "callback", "text": "👑 Кабинет владельца", "payload": "owner_cab:home"}])
+    return rows
+
+
+def pregnant_menu_buttons(user_id=None):
+    return _with_owner_button_max([
         [{"type":"callback","text":"✨ Сегодня","payload":"today_brief"}],
         [{"type":"callback","text":"🤰 Беременность","payload":"cat_pregnancy"}, {"type":"callback","text":"❤️ Здоровье","payload":"cat_preg_health"}],
         [{"type":"callback","text":"🧠 Для мамы","payload":"cat_mom_preg"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
-        [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
+        [{"type": "link", "text": "📱 Открыть приложение", "url": MINIAPP_URL}],
+        [{"type":"callback","text":"❤️ Поддержать проект","payload":"donate_menu"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
         [{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}],
         [{"type":"callback","text":"🔄 Изменить данные","payload":"change_data"}],
-    ]
+    ], user_id)
 
 
-def main_menu_buttons():
-    return [
+def main_menu_buttons(user_id=None):
+    return _with_owner_button_max([
         [{"type":"callback","text":"✨ Сегодня","payload":"today_brief"}],
         [{"type":"callback","text":"👶 Ребёнок","payload":"cat_child"}, {"type":"callback","text":"❤️ Здоровье","payload":"cat_health"}],
         [{"type":"callback","text":"📊 Трекеры","payload":"cat_trackers"}, {"type":"callback","text":"🧠 Для мамы","payload":"cat_mom"}],
         [{"type":"callback","text":"👨‍👩‍👧 Семья","payload":"cat_family"}, {"type":"callback","text":"📓 Мои данные","payload":"profile"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
-        [{"type":"callback","text":"💎 Премиум","payload":"pay_premium"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
+        [{"type": "link", "text": "📱 Открыть приложение", "url": MINIAPP_URL}],
+        [{"type":"callback","text":"❤️ Поддержать проект","payload":"donate_menu"}, {"type":"callback","text":"🆘 Поддержка","payload":"support_menu"}],
         [{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}],
         [{"type":"callback","text":"🔄 Изменить данные","payload":"change_data"}],
-    ]
+    ], user_id)
 
 
 def child_category_buttons():
@@ -354,9 +451,9 @@ def child_category_buttons():
         [{"type":"callback","text":"🌙 Режим дня","payload":"routine"}, {"type":"callback","text":"😴 Проблемы со сном","payload":"sleep"}],
         [{"type":"callback","text":"😢 Истерики и капризы","payload":"tantrums"}],
         [{"type":"callback","text":"📋 Первые дни с малышом","payload":"firstdays"}],
-        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"🌙 Разбор сна · Про / 199 ₽","payload":"buy_sleep_report"}],
-        [{"type":"callback","text":"📈 Отчёт за неделю · Про / 199 ₽","payload":"buy_weekly_report"}],
+        [{"type":"callback","text":"✨ ДОПОЛНИТЕЛЬНО","payload":"noop"}],
+        [{"type":"callback","text":"🌙 Разбор сна","payload":"sleep_analyze"}],
+        [{"type":"callback","text":"📈 Отчёт за неделю","payload":"weekly_report"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -367,10 +464,10 @@ def health_category_buttons():
         [{"type":"callback","text":"🚨 Ребёнку плохо","payload":"emergency"}],
         [{"type":"callback","text":"🌡 Здоровье","payload":"health"}, {"type":"callback","text":"💊 Лекарства","payload":"meds"}],
         [{"type":"callback","text":"🦷 Зубки","payload":"teeth"}],
-        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"🩺 Сводка врачу · Про / 149 ₽","payload":"doctor_prep"}],
-        [{"type":"callback","text":"📸 Анализ фото · Про / 99 ₽","payload":"photo_menu"}],
-        [{"type":"callback","text":"💉 Прививки · Старт","payload":"vaccines"}],
+        [{"type":"callback","text":"✨ ДОПОЛНИТЕЛЬНО","payload":"noop"}],
+        [{"type":"callback","text":"🩺 Сводка врачу","payload":"doctor_prep"}],
+        [{"type":"callback","text":"📸 Анализ фото","payload":"photo_menu"}],
+        [{"type":"callback","text":"💉 Прививки","payload":"vaccines"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -379,13 +476,13 @@ def tracker_category_buttons():
     return [
         [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"📓 Дневник малыша","payload":"diary"}],
-        [{"type":"callback","text":"🌱 ДОСТУПНО СО СТАРТ","payload":"noop"}],
-        [{"type":"callback","text":"📏 Рост и вес · Старт","payload":"growth"}, {"type":"callback","text":"🌡 Симптомы · Старт","payload":"symptoms"}],
-        [{"type":"callback","text":"🤱 Кормления · Старт","payload":"feeding"}, {"type":"callback","text":"🌙 Сон · Старт","payload":"sleep_log"}],
-        [{"type":"callback","text":"💎 ГЛУБОКИЙ АНАЛИЗ","payload":"noop"}],
-        [{"type":"callback","text":"🤱 Разбор кормлений · Про / 149 ₽","payload":"buy_feeding_report"}],
-        [{"type":"callback","text":"🌙 Разбор сна · Про / 199 ₽","payload":"buy_sleep_report"}],
-        [{"type":"callback","text":"📈 Отчёт за 7 дней · Про / 199 ₽","payload":"weekly_report"}],
+        [{"type":"callback","text":"📊 ТРЕКЕРЫ","payload":"noop"}],
+        [{"type":"callback","text":"📏 Рост и вес","payload":"growth"}, {"type":"callback","text":"🌡 Симптомы","payload":"symptoms"}],
+        [{"type":"callback","text":"🤱 Кормления","payload":"feeding"}, {"type":"callback","text":"🌙 Сон","payload":"sleep_log"}],
+        [{"type":"callback","text":"✨ ГЛУБОКИЙ АНАЛИЗ","payload":"noop"}],
+        [{"type":"callback","text":"🤱 Разбор кормлений","payload":"feed_stats"}],
+        [{"type":"callback","text":"🌙 Разбор сна","payload":"sleep_analyze"}],
+        [{"type":"callback","text":"📈 Отчёт за 7 дней","payload":"weekly_report"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -396,9 +493,9 @@ def mom_category_buttons():
         [{"type":"callback","text":"🧠 Эмоции мамы","payload":"emotions"}],
         [{"type":"callback","text":"🤱 Грудное вскармливание","payload":"breastfeeding"}],
         [{"type":"callback","text":"🏥 Восстановление мамы","payload":"recovery"}],
-        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"🧠 Мамин психолог · 15 бесплатно","payload":"psycho"}],
-        [{"type":"callback","text":"💰 Пособия и выплаты · Старт","payload":"benefits"}],
+        [{"type":"callback","text":"✨ ДОПОЛНИТЕЛЬНО","payload":"noop"}],
+        [{"type":"callback","text":"🧠 Мамин психолог","payload":"psycho"}],
+        [{"type":"callback","text":"💰 Пособия и выплаты","payload":"benefits"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -408,8 +505,8 @@ def family_category_buttons():
         [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"👨‍👩‍👧 Отношения в семье","payload":"family"}],
         [{"type":"callback","text":"📓 Дневник малыша","payload":"diary"}],
-        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"📈 Недельный отчёт · Про / 199 ₽","payload":"weekly_report"}],
+        [{"type":"callback","text":"✨ ДОПОЛНИТЕЛЬНО","payload":"noop"}],
+        [{"type":"callback","text":"📈 Недельный отчёт","payload":"weekly_report"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -429,8 +526,8 @@ def preg_health_category_buttons():
     return [
         [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"❓ Задать вопрос","payload":"ask"}],
-        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"📸 Анализы и УЗИ · Про / 99 ₽","payload":"photo_menu"}],
+        [{"type":"callback","text":"✨ ДОПОЛНИТЕЛЬНО","payload":"noop"}],
+        [{"type":"callback","text":"📸 Анализы и УЗИ","payload":"photo_menu"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -439,9 +536,9 @@ def preg_mom_category_buttons():
     return [
         [{"type":"callback","text":"🆓 БЕСПЛАТНО","payload":"noop"}],
         [{"type":"callback","text":"🧠 Эмоциональная поддержка","payload":"emotions"}],
-        [{"type":"callback","text":"💎 РАСШИРЕННЫЕ ВОЗМОЖНОСТИ","payload":"noop"}],
-        [{"type":"callback","text":"🧠 Мамин психолог · 15 бесплатно","payload":"psycho"}],
-        [{"type":"callback","text":"💰 Пособия и выплаты · Старт","payload":"benefits"}],
+        [{"type":"callback","text":"✨ ДОПОЛНИТЕЛЬНО","payload":"noop"}],
+        [{"type":"callback","text":"🧠 Мамин психолог","payload":"psycho"}],
+        [{"type":"callback","text":"💰 Пособия и выплаты","payload":"benefits"}],
         [{"type":"callback","text":"🔙 Главное меню","payload":"back_menu"}],
     ]
 
@@ -462,6 +559,21 @@ def upgrade_buttons(plan="any"):
         [{"type":"callback","text":"🔙 В меню","payload":"back_menu"}],
     ]
 
+DONATE_AMOUNTS = [
+    (99, "99 ₽ — Сказать спасибо"),
+    (199, "199 ₽ — Поддержать развитие"),
+    (499, "499 ₽ — Большое спасибо"),
+    (990, "990 ₽ — Помочь проекту расти"),
+]
+DONATE_MIN_AMOUNT = 10
+DONATE_MAX_AMOUNT = 100000
+
+def kb_donate_menu():
+    buttons = [[{"type": "callback", "text": label, "payload": f"donate_amt_{amount}"}] for amount, label in DONATE_AMOUNTS]
+    buttons.append([{"type": "callback", "text": "Другая сумма", "payload": "donate_amt_custom"}])
+    buttons.append([{"type": "callback", "text": "Назад", "payload": "back_menu"}])
+    return buttons
+
 def psycho_buttons():
     return [
         [{"type": "callback", "text": "🔄 Новый разговор", "payload": "psycho_new"},
@@ -470,6 +582,7 @@ def psycho_buttons():
 
 # ========== БАЗА ДАННЫХ ==========
 DB = "/root/mama_max.db"
+TG_DB_PATH = "/root/mama.db"
 
 def db_connect():
     conn = sqlite3.connect(DB, timeout=15)
@@ -556,8 +669,14 @@ def init_db():
         platform TEXT NOT NULL, user_id INTEGER NOT NULL, product_code TEXT NOT NULL,
         amount TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'RUB', ends_at TEXT DEFAULT ''
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS support_payments (
+        payment_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, platform TEXT NOT NULL,
+        amount TEXT NOT NULL, currency TEXT NOT NULL DEFAULT 'RUB', status TEXT NOT NULL DEFAULT 'pending',
+        variant TEXT NOT NULL DEFAULT '', source TEXT DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_sales_user_date ON sales_events(user_id, created_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_support_payments_user ON support_payments(user_id, created_at)")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_counters (user_id INTEGER NOT NULL, counter TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,counter))""")
     c.execute("""CREATE TABLE IF NOT EXISTS usage_periods (
         user_id INTEGER PRIMARY KEY, plan TEXT NOT NULL DEFAULT 'free',
@@ -607,6 +726,23 @@ def init_db():
         lock_key TEXT PRIMARY KEY, created_at TEXT NOT NULL
     )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_command_locks_created ON command_locks(created_at)")
+    # MAX API адресует приватный чат по chat_id, который отличается от user_id и
+    # ранее нигде не сохранялся — из-за этого проактивная рассылка была невозможна.
+    c.execute("""CREATE TABLE IF NOT EXISTS max_user_chats (
+        user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL,
+        first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_update_type TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_max_user_chats_chat ON max_user_chats(chat_id)")
+    c.execute("""CREATE TABLE IF NOT EXISTS feedback_campaign_likes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_key TEXT NOT NULL, platform TEXT NOT NULL,
+        user_id INTEGER NOT NULL, created_at TEXT NOT NULL,
+        UNIQUE(campaign_key, platform, user_id)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS broadcast_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, broadcast_key TEXT NOT NULL, platform TEXT NOT NULL,
+        user_id INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT DEFAULT '', ts TEXT NOT NULL,
+        UNIQUE(broadcast_key, platform, user_id)
+    )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_diary_user_created ON diary(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_growth_user_created ON growth(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_symptoms_user_created ON symptoms(user_id, created_at)")
@@ -788,6 +924,12 @@ def referral_link_max(user_id):
     return f"{MAX_BOT_PUBLIC_URL}?start=ref_{int(user_id)}"
 
 
+def referral_link_tg(user_id):
+    # Тот же формат deep link, что и referral_link_tg в mama_bot.py (отдельный процесс,
+    # без общего импорта) — @MaminPomoshnikAI_bot, ref_<referrer_user_id> в start-параметре.
+    return f"https://t.me/MaminPomoshnikAI_bot?start=ref_{int(user_id)}"
+
+
 def save_pending_payment(payment_id,user_id,plan,amount=None):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now().isoformat(); amount=amount or info["amount"]
     with db_connect() as conn:
@@ -801,6 +943,7 @@ def mark_payment_canceled(payment_id):
     now=datetime.now().isoformat()
     with db_connect() as conn:
         conn.execute("UPDATE payments SET status='canceled',raw_status='canceled',updated_at=? WHERE payment_id=?",(now,payment_id)); conn.execute("DELETE FROM pending_payments WHERE payment_id=?",(payment_id,))
+        conn.execute("UPDATE support_payments SET status='canceled',updated_at=? WHERE payment_id=?",(now,payment_id))
 
 def process_subscription_payment(payment_id,user_id,plan):
     plan=_normalize_plan(plan); info=PLAN_CATALOG[plan]; now=datetime.now(); conn=db_connect()
@@ -893,7 +1036,8 @@ def plan_rank(plan):
 
 
 def has_plan_access(user_id, minimum="start"):
-    return plan_rank(get_user_plan(user_id)) >= plan_rank(minimum)
+    # Проект бесплатный: весь функционал доступен всем без тарифа.
+    return True
 
 
 def get_credit(user_id, product_code):
@@ -919,13 +1063,16 @@ def consume_credit(user_id, product_code):
 
 
 def can_use_product(user_id, product_code):
-    return get_user_plan(user_id) in PRO_PLANS or get_credit(user_id,product_code)>0
+    # Проект бесплатный: разовые разборы и отчёты доступны без покупки.
+    return True
 
 
 def question_limit_for(user_id):
-    base = PLAN_LIMITS[get_user_plan(user_id)]["questions"]
-    return None if base is None else int(base) + get_referral_bonus_questions(user_id)
-def psycho_limit_for(user_id): return PLAN_LIMITS[get_user_plan(user_id)]["psycho_messages"]
+    # Проект бесплатный: лимит AI-вопросов снят для всех тарифов.
+    return None
+def psycho_limit_for(user_id):
+    # Проект бесплатный: лимит поддерживающего диалога снят для всех тарифов.
+    return None
 
 
 FUNNEL_QUESTION_PROMPTS = {
@@ -933,11 +1080,112 @@ FUNNEL_QUESTION_PROMPTS = {
     "funnel_feeding": "🥣 Опиши вопрос о питании или кормлении: возраст ребёнка, тип питания и что именно вызывает сомнения.",
     "funnel_development": "👶 Напиши возраст ребёнка и навык или поведение, которое хочешь проверить по возрасту.",
     "funnel_tantrum": "🧠 Опиши последнюю истерику: возраст, что произошло перед ней и как ребёнок успокоился.",
+    "funnel_garden": "🎒 Опиши, что происходит с садиком: возраст ребёнка, как давно ходит, когда тяжелее всего и что уже пробовали.",
+    "funnel_school": "📚 Опиши ситуацию со школой, уроками или оценками: возраст ребёнка, что вызывает конфликт и как он обычно заканчивается.",
+    "funnel_gadgets": "📱 Опиши ситуацию с гаджетами: возраст ребёнка, сколько экранного времени сейчас и из-за чего чаще всего спорите.",
+    "funnel_grandma": "👵 Опиши ситуацию с бабушками или родственниками: о чём спор, где нужна граница и какого разговора ты хочешь.",
     "funnel_doctor": "🩺 Опиши симптомы и наблюдения. Я помогу собрать важное и подготовить вопросы врачу. Диагноз бот не ставит.",
     "funnel_mom": "🤍 Расскажи, что сейчас даётся тяжелее всего. Я помогу спокойно разобрать ситуацию по шагам.",
     "funnel_family": "👨‍👩‍👧 Опиши семейную ситуацию и чего ты хочешь добиться в следующем разговоре.",
     "funnel_pregnancy": "🤰 Напиши срок беременности и вопрос, который сейчас волнует больше всего.",
 }
+
+
+CHANNEL_LANDING = {
+    "channel_today": {
+        "title": "Получить персональный ответ",
+        "free": "Ответьте на один вопрос — получите короткий план по вашей ситуации.",
+        "button": "Задать вопрос",
+        "payload": "ask",
+    },
+    "channel_doctor": {
+        "title": "Ребёнок заболел — подготовить вопросы врачу",
+        "free": "Сейчас помогу собрать симптомы, что записать перед приёмом и какие вопросы задать врачу.",
+        "button": "Подготовить вопросы врачу",
+        "payload": "funnel_doctor",
+    },
+    "channel_sleep": {
+        "title": "Плохо спит — разобрать режим",
+        "free": "Ответьте на несколько вопросов — получите первичный разбор режима и 2–3 идеи, что попробовать сегодня.",
+        "button": "Разобрать сон ребёнка",
+        "payload": "funnel_sleep",
+    },
+    "channel_tantrum": {
+        "title": "Истерики и поведение — получить план действий",
+        "free": "Сначала бесплатно разберём ситуацию: что делать родителю, чего лучше не делать и что сказать ребёнку.",
+        "button": "Понять, что делать при истерике",
+        "payload": "funnel_tantrum",
+    },
+    "channel_garden": {
+        "title": "Не хочет в садик — понять, что делать",
+        "free": "Соберём короткий чек-лист адаптации, вопросы воспитателю и способ облегчить утро.",
+        "button": "Разобрать адаптацию к садику",
+        "payload": "funnel_garden",
+    },
+    "channel_school": {
+        "title": "Школа, уроки, оценки — получить подсказки",
+        "free": "Получите короткий план по одной ситуации, вопросы ребёнку после школы и идею, как снизить конфликт.",
+        "button": "Получить подсказки по школе",
+        "payload": "funnel_school",
+    },
+    "channel_feeding": {
+        "title": "Что приготовить ребёнку",
+        "free": "Подберём 1–3 идеи завтрака, перекуса или ужина и простой рецепт из доступных продуктов.",
+        "button": "Получить подсказку по питанию",
+        "payload": "funnel_feeding",
+    },
+    "channel_psycho": {
+        "title": "Мама устала — поговорить с помощником",
+        "free": "Можно начать с бесплатных сообщений психологическому помощнику и собрать короткий план разгрузки на день.",
+        "button": "Поговорить с психологическим помощником",
+        "payload": "psycho",
+    },
+    "channel_grandma": {
+        "title": "Бабушки и воспитание — договориться без ссоры",
+        "free": "Соберём готовые фразы для разговора и способ обозначить границы без конфликта.",
+        "button": "Подготовить разговор",
+        "payload": "funnel_grandma",
+    },
+    "channel_gadgets": {
+        "title": "Гаджеты и экранное время",
+        "free": "Соберём короткий план семейных правил, чтобы телефон не превращался в постоянную войну.",
+        "button": "Составить правила экранного времени",
+        "payload": "funnel_gadgets",
+    },
+    "channel_child": {
+        "title": "Понять развитие ребёнка по возрасту",
+        "free": "Опишите возраст и навык — получите спокойную подсказку, что обычно важно проверить.",
+        "button": "Проверить развитие",
+        "payload": "funnel_development",
+    },
+    "channel_family": {
+        "title": "Семейная ситуация — подготовить разговор",
+        "free": "Разберём, что важно сказать, где поставить границу и как не усиливать конфликт.",
+        "button": "Подготовить разговор",
+        "payload": "funnel_family",
+    },
+    "channel_pregnancy": {
+        "title": "Беременность — получить подсказку по сроку",
+        "free": "Напишите срок и вопрос — получите понятный бесплатный ответ с учётом беременности.",
+        "button": "Задать вопрос по беременности",
+        "payload": "funnel_pregnancy",
+    },
+}
+
+
+def channel_landing_max(payload):
+    item = CHANNEL_LANDING.get(payload, CHANNEL_LANDING["channel_today"])
+    text = (
+        f"{item['title']}\n\n"
+        f"{item['free']}\n\n"
+        "Это не заменяет врача или специалиста, но поможет не забыть важное.\n\n"
+        "Ответ бесплатный — как и все остальные функции «Маминого помощника»."
+    )
+    buttons = [
+        [{"type": "callback", "text": item["button"], "payload": item["payload"]}],
+        [{"type": "callback", "text": "Все функции Маминого помощника", "payload": "back_menu"}],
+    ]
+    return text, buttons
 
 
 def _question_next_action_max(question_text, pregnant=False):
@@ -946,6 +1194,10 @@ def _question_next_action_max(question_text, pregnant=False):
         (("сон", "засып", "просып", "режим"), "🌙 Ещё вопрос о сне", "funnel_sleep"),
         (("корм", "питан", "прикорм", "смесь", "гв"), "🥣 Уточнить питание", "funnel_feeding"),
         (("истер", "каприз", "плач", "поведен"), "🧠 Понять поведение", "funnel_tantrum"),
+        (("сад", "адаптац", "воспитател"), "🎒 Разобрать садик", "funnel_garden"),
+        (("школ", "урок", "оцен"), "📚 Разобрать школу", "funnel_school"),
+        (("гаджет", "телефон", "экран", "мультик"), "📱 Настроить правила", "funnel_gadgets"),
+        (("бабуш", "дедуш", "родствен", "границ"), "👵 Подготовить разговор", "funnel_grandma"),
         (("развит", "речь", "навык", "возраст"), "👶 Проверить развитие", "funnel_development"),
         (("врач", "температур", "сып", "симптом", "болит", "лекар"), "🩺 Подготовить вопросы врачу", "funnel_doctor"),
         (("муж", "пап", "отношен", "семь"), "👨‍👩‍👧 Разобрать семью", "funnel_family"),
@@ -958,27 +1210,22 @@ def _question_next_action_max(question_text, pregnant=False):
 
 
 def build_question_funnel_max(user_id, question_text=""):
-    plan=get_user_plan(user_id); limit=question_limit_for(user_id); used=get_request_count(user_id)
-    remaining=None if limit is None else max(0,limit-used)
+    # Проект бесплатный: без счётчика оставшихся вопросов и без цен.
     user=get_user(user_id); pregnant=user.get("birth_date","").startswith("pdr:")
     next_label,next_payload=_question_next_action_max(question_text,pregnant)
-    if plan=="free":
-        if remaining==4:
-            text="🤍 Ответ готов. Бесплатных персональных разборов осталось: 4 из 5."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
-        elif remaining==3:
-            text="🤍 Осталось 3 бесплатных разбора. Можно продолжить со сном, питанием, развитием, здоровьем или семейной ситуацией."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
-        elif remaining==2:
-            text="🤍 Осталось 2 бесплатных разбора. В «Старт» доступно 30 вопросов на 30 дней и основные трекеры."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}],[{"type":"callback","text":"🌱 Старт — 190 ₽","payload":"pay_plan_start"}]]
-        elif remaining==1:
-            text="🤍 Остался 1 бесплатный разбор. Используй его для вопроса, который тревожит сильнее всего."; buttons=[[{"type":"callback","text":"❓ Задать последний вопрос","payload":next_payload}],[{"type":"callback","text":"💎 Посмотреть возможности","payload":"pay_premium"}]]
-        else:
-            text="🤍 Бесплатные разборы закончились. Продолжить можно с тарифа «Старт» за 190 ₽ или получить бонус за приглашение подруги."; buttons=[[{"type":"callback","text":"🌱 Продолжить — 190 ₽","payload":"pay_plan_start"}],[{"type":"callback","text":"💎 Выбрать тариф","payload":"pay_premium"}],[{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}]]
-    elif plan=="start":
-        text=f"✨ Использовано {used} из 30 вопросов тарифа «Старт»."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
-        if remaining is not None and remaining<=6:
-            text+=" В «Про» вопросы без лимита и доступны расширенные отчёты."; buttons.append([{"type":"callback","text":"💎 Перейти на Про — 390 ₽","payload":"pay_plan_pro"}])
-    else:
-        text="✨ Готово. Можно продолжить с ещё одним вопросом."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
+    text="✨ Готово. Можно продолжить с ещё одним вопросом."; buttons=[[{"type":"callback","text":next_label,"payload":next_payload}]]
+    lower_question = (question_text or "").lower()
+    soft_offer = ""
+    if any(word in lower_question for word in ("врач", "температур", "сып", "симптом", "болит", "лекар")):
+        soft_offer = "Если нужно, бот может собрать полную сводку для врача по вашим ответам — это бесплатно."
+    elif any(word in lower_question for word in ("сон", "засып", "просып", "режим")):
+        soft_offer = "Если проблема повторяется, можно сделать подробный разбор сна с учётом возраста и режима."
+    elif any(word in lower_question for word in ("корм", "питан", "прикорм", "смесь", "гв", "рецепт", "ужин", "завтрак")):
+        soft_offer = "Если нужна более точная картина, можно продолжить разбор питания или кормлений."
+    elif any(word in lower_question for word in ("истер", "каприз", "поведен", "сад", "школ", "урок", "оцен", "гаджет", "телефон", "экран", "бабуш", "границ")):
+        soft_offer = "Если ситуация повторяется часто, её можно разобрать подробнее с персональным планом."
+    if soft_offer:
+        text += "\n\n" + soft_offer
     if MAX_CHANNEL_PUBLIC_URL: buttons.append([{"type":"link","text":"📣 Вернуться в канал","url":MAX_CHANNEL_PUBLIC_URL}])
     return text,buttons
 
@@ -996,8 +1243,8 @@ def increment_usage_counter(user_id,counter):
 
 
 def can_show_marketing_offer(user_id, offer_type, global_hours=24, repeat_hours=72):
-    if get_user_plan(user_id) in PRO_PLANS:
-        return False
+    # Проект бесплатный: больше не предлагаем купить тариф.
+    return False
     conn = db_connect()
     try:
         rows = conn.execute(
@@ -1040,13 +1287,7 @@ async def maybe_send_marketing_offer(chat_id, user_id, offer_type, text, buttons
 
 
 def callback_feature(payload):
-    if payload=="doctor_prep": return ("product","doctor_report")
-    if payload=="weekly_report": return ("product","weekly_report")
-    if payload=="sleep_analyze": return ("product","sleep_report")
-    if payload=="feed_stats": return ("product","feeding_report")
-    if payload in {"photo_menu","photo_skin","photo_food","photo_package","photo_stool","photo_analysis","photo_uzi","photo_med_preg"}: return ("product","photo_analysis")
-    if payload in {"growth","growth_add","growth_analyze","symptoms","symptom_add","symptom_analyze","feeding","feed_left","feed_right","feed_bottle","sleep_log","sleep_start","sleep_end","vaccines","vaccines_create","vaccines_done","vaccines_info","benefits","ben_birth","ben_15","ben_3","ben_matcap","ben_decree","ben_multi","ben_personal"} or payload.startswith("vac_"):
-        return ("plan","start")
+    # Проект бесплатный: ни один callback больше не требует тарифа или покупки.
     return None
 
 def get_recent_family_data(user_id, days=7):
@@ -1628,6 +1869,82 @@ def process_commercial_payment(payment_id,user_id,product_code):
     finally: conn.close()
 
 
+async def send_donate_confirm(chat_id, amount, variant):
+    amount_label = f"{amount:.0f}" if amount == int(amount) else f"{amount:.2f}"
+    await send_message(
+        chat_id,
+        "Вы поддерживаете развитие бесплатного проекта «Мамин помощник». "
+        "Оплата добровольная и не открывает дополнительных функций — они уже доступны всем.",
+        [[{"type": "callback", "text": f"Оплатить {amount_label} ₽", "payload": f"donate_confirm:{variant}:{amount:.2f}"}],
+         [{"type": "callback", "text": "Назад", "payload": "donate_menu"}]],
+    )
+
+
+async def create_support_payment(user_id, amount):
+    amount_str = f"{amount:.2f}"
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.yookassa.ru/v3/payments",
+            json={
+                "amount": {"value": amount_str, "currency": "RUB"},
+                "confirmation": {"type": "redirect", "return_url": "https://maminpomoshnik.ru/payment/success"},
+                "capture": True,
+                "description": "Добровольная поддержка развития цифрового сервиса",
+                "receipt": {"customer": {"email": "6038484@mail.ru"}, "items": [{
+                    "description": "Добровольная поддержка развития цифрового сервиса", "quantity": "1.00",
+                    "amount": {"value": amount_str, "currency": "RUB"}, "vat_code": 1,
+                    "payment_subject": "service", "payment_mode": "full_payment"
+                }]},
+                "metadata": {"user_id": user_id, "product_code": "support_project", "product_type": "support"}
+            },
+            headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
+            auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET),
+        )
+        if not r.is_success:
+            raise RuntimeError(f"ЮКасса: {r.status_code} {r.text[:300]}")
+        return r.json()
+
+
+def save_support_payment(payment_id, user_id, amount, variant, platform="max"):
+    amount_str = f"{amount:.2f}"
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO pending_payments(payment_id,user_id,plan,created_at) VALUES (?,?,?,?)", (payment_id, user_id, "support_project", now))
+        conn.execute(
+            "INSERT OR IGNORE INTO payments(payment_id,user_id,platform,product_type,product_code,amount,currency,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (payment_id, user_id, platform, "support", "support_project", amount_str, "RUB", "pending", now, now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO support_payments(payment_id,user_id,platform,amount,currency,status,variant,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (payment_id, user_id, platform, amount_str, "RUB", "pending", variant, "main_menu", now, now),
+        )
+
+
+def process_support_payment(payment_id, user_id):
+    """Идемпотентно фиксирует добровольный платёж поддержки. Не выдаёт кредиты, не активирует подписку."""
+    now_iso = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM processed_payments WHERE payment_id=?", (payment_id,)).fetchone():
+            conn.rollback(); return False, None
+        row = conn.execute("SELECT amount FROM payments WHERE payment_id=?", (payment_id,)).fetchone()
+        amount = row[0] if row else "0.00"
+        conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)", (payment_id, user_id, "support_project", now_iso))
+        conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?", (now_iso, payment_id))
+        conn.execute("UPDATE support_payments SET status='processed',updated_at=? WHERE payment_id=?", (now_iso, payment_id))
+        conn.execute(
+            "INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",
+            (payment_id, now_iso, "max", user_id, "support_project", amount, "RUB", ""),
+        )
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+        conn.commit(); return True, amount
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
 async def check_payments_loop():
     while True:
         await asyncio.sleep(15)
@@ -1638,6 +1955,40 @@ async def check_payments_loop():
                         r=await client.get(f"https://api.yookassa.ru/v3/payments/{payment_id}",auth=(YOOKASSA_SHOP_ID,YOOKASSA_SECRET))
                         payment=r.json()
                     if payment.get("status")=="succeeded":
+                        if product_code == "support_project":
+                            processed, amount = process_support_payment(payment_id, user_id)
+                            if not processed: continue
+                            log_analytics_event("support_payment_success", user_id, "support_project", amount)
+                            await send_message(
+                                user_id,
+                                "Спасибо за поддержку ❤️ Благодаря вам «Мамин помощник» сможет развиваться и оставаться бесплатным для родителей.",
+                                [[{"type": "callback", "text": "Вернуться в главное меню", "payload": "back_menu"}]],
+                            )
+                            try:
+                                await send_message(OWNER_ID, f"💛 Поддержка проекта (MAX)\n\nUser ID: {user_id}\nСумма: {amount} ₽\nPayment ID: {payment_id}")
+                            except Exception as exc:
+                                logging.error(f"Ошибка уведомления владельца о поддержке MAX: {exc}")
+                            continue
+                        if product_code == PERSONAL_REVIEW_PRODUCT_CODE:
+                            processed, review_id = process_personal_review_payment_max(payment_id, user_id)
+                            if not processed: continue
+                            log_analytics_event("personal_review_payment_success", user_id, PERSONAL_REVIEW_PRODUCT_CODE, payment_id)
+                            try:
+                                await send_message(user_id, "Заявка принята ✅\n\nЛичный разбор готовит автор проекта. Ответ придёт сюда, в этот чат.")
+                            except Exception as exc:
+                                logging.error(f"Ошибка уведомления клиента о заявке на разбор (MAX): {exc}")
+                            try:
+                                await send_message(
+                                    OWNER_ID,
+                                    f"🧩 Новая заявка на личный разбор (MAX) №{review_id} — {PERSONAL_REVIEW_PRICE_RUB} ₽\nUser ID: {user_id}\nPayment ID: {payment_id}",
+                                    [
+                                        [{"type": "callback", "text": "Открыть заявку", "payload": f"pr_open:{review_id}"}],
+                                        [{"type": "callback", "text": "Взять в работу", "payload": f"pr_take:{review_id}"}],
+                                    ],
+                                )
+                            except Exception as exc:
+                                logging.error(f"Ошибка уведомления владельца о заявке на разбор (MAX): {exc}")
+                            continue
                         processed,end,product_type=process_commercial_payment(payment_id,user_id,product_code)
                         if not processed: continue
                         info=PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
@@ -1652,6 +2003,19 @@ async def check_payments_loop():
                         await send_message(OWNER_ID,f"💳 Новая продажа MAX\n\nUser ID: {user_id}\nПродукт: {info['name']}\nСумма: {info['amount']} ₽\nPayment ID: {payment_id}")
                     elif payment.get("status")=="canceled":
                         mark_payment_canceled(payment_id)
+                        if product_code == "support_project":
+                            log_analytics_event("support_payment_failed", user_id, "support_project")
+                            try:
+                                await send_message(user_id, "Оплата не завершена. Все функции «Маминого помощника» по-прежнему доступны бесплатно.")
+                            except Exception as exc:
+                                logging.error(f"Ошибка уведомления об отмене поддержки MAX: {exc}")
+                        elif product_code == PERSONAL_REVIEW_PRODUCT_CODE:
+                            mark_personal_review_canceled_max(payment_id)
+                            log_analytics_event("personal_review_payment_failed", user_id, PERSONAL_REVIEW_PRODUCT_CODE, payment_id)
+                            try:
+                                await send_message(user_id, "Оплата не завершена. Заявка на личный разбор не оформлена — попробуйте ещё раз из мини-приложения.")
+                            except Exception as exc:
+                                logging.error(f"Ошибка уведомления об отмене заявки на разбор (MAX): {exc}")
                 except Exception as e:
                     logging.error(f"Ошибка проверки платежа {payment_id}: {e}")
         except Exception as e:
@@ -1675,7 +2039,7 @@ PSYCHO_SYSTEM = (
 
 WELCOME_TEXT = """👋 Привет, {name}!
 
-Я Мамин Помощник — личный AI-помощник для беременности, ребёнка и поддержки мамы.
+Я Мамин Помощник — бесплатный личный AI-помощник для беременности, ребёнка и поддержки мамы.
 
 Подскажу по возрасту, помогу вести трекеры, подготовиться к врачу и разобраться в сложной ситуации.
 
@@ -1730,12 +2094,257 @@ def release_persistent_command_lock(lock_key):
         conn.execute("DELETE FROM command_locks WHERE lock_key=?", (lock_key,))
 
 
+def owner_home_text_max():
+    return "👑 Кабинет владельца «Мамин помощник»\n\nВыберите раздел:"
+
+
+def owner_cabinet_buttons_max():
+    return [
+        [{"type": "callback", "text": "📊 Сегодня", "payload": "owner_cab:today"},
+         {"type": "callback", "text": "💰 Продажи", "payload": "owner_cab:sales"}],
+        [{"type": "callback", "text": "👥 Пользователи", "payload": "owner_cab:users"},
+         {"type": "callback", "text": "📈 Воронка", "payload": "owner_cab:funnel"}],
+        [{"type": "callback", "text": "🎯 Источники рекламы", "payload": "owner_cab:sources"},
+         {"type": "callback", "text": "📣 Реклама", "payload": "owner_cab:ads"}],
+        [{"type": "callback", "text": "⚠️ Ошибки", "payload": "owner_cab:errors"},
+         {"type": "callback", "text": "💬 Обратная связь", "payload": "owner_cab:feedback"}],
+        [{"type": "callback", "text": "📤 Рассылка", "payload": "owner_cab:broadcast"}],
+        [{"type": "callback", "text": "📄 Экспорт / Google-таблица", "payload": "owner_cab:export"}],
+        [{"type": "callback", "text": "🧪 Проверка бота", "payload": "owner_cab:check"}],
+        [{"type": "callback", "text": "🏠 В обычное меню", "payload": "back_menu"}],
+    ]
+
+
+def owner_back_buttons_max():
+    return [[{"type": "callback", "text": "◀️ Назад", "payload": "owner_cab:home"},
+             {"type": "callback", "text": "🏠 В обычное меню", "payload": "back_menu"}]]
+
+
+def _owner_conn_max(path):
+    conn = sqlite3.connect(path, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _owner_table_exists_max(conn, table):
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def _owner_scalar_max(path, sql, params=(), default=0):
+    try:
+        with _owner_conn_max(path) as conn:
+            return conn.execute(sql, params).fetchone()[0] or default
+    except Exception:
+        return default
+
+
+def _owner_sales_max(path, since):
+    try:
+        with _owner_conn_max(path) as conn:
+            if _owner_table_exists_max(conn, "sales_events"):
+                rows = conn.execute("SELECT product_code, amount FROM sales_events WHERE created_at>=?", (since,)).fetchall()
+            else:
+                rows = conn.execute("SELECT product_code, amount FROM payments WHERE status IN ('processed','succeeded') AND updated_at>=?", (since,)).fetchall()
+        products = {}
+        total = 0.0
+        for row in rows:
+            total += float(row["amount"] or 0)
+            code = row["product_code"] or "unknown"
+            products[code] = products.get(code, 0) + 1
+        return len(rows), total, products
+    except Exception:
+        return 0, 0.0, {}
+
+
+def _owner_event_count_max(path, since, names=None, source_prefix=None):
+    try:
+        with _owner_conn_max(path) as conn:
+            if not _owner_table_exists_max(conn, "analytics_events"):
+                return 0
+            sql = "SELECT COUNT(*) FROM analytics_events WHERE created_at>=?"
+            params = [since]
+            if names:
+                sql += " AND event_name IN (%s)" % ",".join("?" for _ in names)
+                params.extend(names)
+            if source_prefix:
+                sql += " AND source LIKE ?"
+                params.append(source_prefix + "%")
+            return conn.execute(sql, params).fetchone()[0] or 0
+    except Exception:
+        return 0
+
+
+def _owner_top_sources_max(path, since, limit=3):
+    try:
+        with _owner_conn_max(path) as conn:
+            if not _owner_table_exists_max(conn, "analytics_events"):
+                return []
+            return conn.execute(
+                "SELECT COALESCE(NULLIF(source,''),'organic') source, COUNT(*) cnt "
+                "FROM analytics_events WHERE created_at>=? AND (source LIKE 'channel_%' OR source LIKE 'ref_%') "
+                "GROUP BY source ORDER BY cnt DESC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+    except Exception:
+        return []
+
+
+def _owner_user_counts_max(path, platform):
+    if platform == "tg":
+        today_sql = "SELECT COUNT(*) FROM users WHERE created_at>=?"
+        complete_sql = "SELECT COUNT(*) FROM users WHERE COALESCE(mode,'')<>'' AND COALESCE(date_value,'')<>''"
+        pregnant_sql = "SELECT COUNT(*) FROM users WHERE mode='pregnant'"
+        mama_sql = "SELECT COUNT(*) FROM users WHERE mode='mama'"
+    else:
+        today_sql = "SELECT COUNT(*) FROM users WHERE registered_at>=?"
+        complete_sql = "SELECT COUNT(*) FROM users WHERE COALESCE(birth_date,'')<>''"
+        pregnant_sql = "SELECT COUNT(*) FROM users WHERE birth_date LIKE 'pdr:%'"
+        mama_sql = "SELECT COUNT(*) FROM users WHERE COALESCE(birth_date,'')<>'' AND birth_date NOT LIKE 'pdr:%'"
+    today = datetime.now().date().isoformat()
+    week = (datetime.now() - timedelta(days=7)).isoformat()
+    month = (datetime.now() - timedelta(days=30)).isoformat()
+    return {
+        "total": _owner_scalar_max(path, "SELECT COUNT(*) FROM users"),
+        "today": _owner_scalar_max(path, today_sql, (today,)),
+        "week": _owner_scalar_max(path, today_sql, (week,)),
+        "month": _owner_scalar_max(path, today_sql, (month,)),
+        "complete": _owner_scalar_max(path, complete_sql),
+        "pregnant": _owner_scalar_max(path, pregnant_sql),
+        "mama": _owner_scalar_max(path, mama_sql),
+    }
+
+
+def _owner_product_lines_max(products):
+    names = {**{k: v["name"] for k, v in PLAN_CATALOG.items()}, **{k: v["name"] for k, v in ONE_TIME_PRODUCTS.items()}}
+    if not products:
+        return "нет"
+    return ", ".join(f"{names.get(k, k)}: {v}" for k, v in sorted(products.items(), key=lambda item: (-item[1], item[0]))[:8])
+
+
+def owner_report_max(section):
+    now = datetime.now()
+    today = now.date().isoformat()
+    week = (now - timedelta(days=7)).isoformat()
+    month = (now - timedelta(days=30)).isoformat()
+    dbs = [("TG", TG_DB_PATH), ("MAX", DB)]
+    if section == "today":
+        tg = _owner_user_counts_max(TG_DB_PATH, "tg")
+        mx = _owner_user_counts_max(DB, "max")
+        sales = [_owner_sales_max(path, today) for _, path in dbs]
+        pay_count = sum(item[0] for item in sales)
+        pay_sum = sum(item[1] for item in sales)
+        top_rows = []
+        for label, path in dbs:
+            top_rows.extend((label, r["source"], r["cnt"]) for r in _owner_top_sources_max(path, today))
+        top = "\n".join(f"• {src} ({label}): {cnt}" for label, src, cnt in top_rows[:3]) or "нет данных"
+        scenarios = ["doctor", "sleep", "feeding", "psycho", "tantrum", "garden", "school", "gadgets", "grandma"]
+        scen = "\n".join(
+            f"{key}: {sum(_owner_event_count_max(path, today, names=('free_result_started','funnel_question_opened'), source_prefix=f'channel_{key}') for _, path in dbs)}"
+            for key in scenarios
+        )
+        return (
+            "📊 Сегодня\n\n"
+            f"Новые TG: {tg['today']}\nНовые MAX: {mx['today']}\nВсего новых: {tg['today'] + mx['today']}\n"
+            f"Активных по событиям: {sum(_owner_event_count_max(path, today) for _, path in dbs)}\n"
+            f"Рекламные payload: {sum(_owner_event_count_max(path, today, source_prefix='channel_') for _, path in dbs)}\n"
+            f"Оплат: {pay_count}\nСумма: {pay_sum:.0f} ₽\n"
+            f"Ошибки: {sum(_owner_event_count_max(path, today, names=('error_logged',)) for _, path in dbs)}\n\n"
+            f"Топ источников:\n{top}\n\nБесплатные сценарии:\n{scen}"
+        )
+    if section == "sales":
+        lines = ["💰 Продажи"]
+        for label, since in (("Сегодня", today), ("7 дней", week), ("30 дней", month)):
+            sales = [_owner_sales_max(path, since) for _, path in dbs]
+            count = sum(item[0] for item in sales)
+            amount = sum(item[1] for item in sales)
+            products = {}
+            for _, _, prod in sales:
+                for k, v in prod.items():
+                    products[k] = products.get(k, 0) + v
+            lines.append(f"\n{label}: {count} оплат, {amount:.0f} ₽, средний чек {(amount / count if count else 0):.0f} ₽\nПродукты: {_owner_product_lines_max(products)}")
+        tg30 = _owner_sales_max(TG_DB_PATH, month)
+        mx30 = _owner_sales_max(DB, month)
+        lines.append(f"\nПлатформы 30 дней: TG {tg30[0]} / {tg30[1]:.0f} ₽, MAX {mx30[0]} / {mx30[1]:.0f} ₽")
+        return "\n".join(lines)
+    if section == "users":
+        tg = _owner_user_counts_max(TG_DB_PATH, "tg")
+        mx = _owner_user_counts_max(DB, "max")
+        paid = sum(_owner_scalar_max(path, "SELECT COUNT(*) FROM subscriptions WHERE plan IN ('start','pro','pro_year') AND COALESCE(sub_end,'')<>''") for _, path in dbs)
+        one_time = sum(_owner_scalar_max(path, "SELECT COUNT(DISTINCT user_id) FROM purchases") for _, path in dbs)
+        return (
+            "👥 Пользователи\n\n"
+            f"Всего: {tg['total'] + mx['total']} (TG {tg['total']}, MAX {mx['total']})\n"
+            f"Новые: сегодня {tg['today'] + mx['today']}, 7 дней {tg['week'] + mx['week']}, 30 дней {tg['month'] + mx['month']}\n"
+            f"Активные: сегодня {sum(_owner_event_count_max(path, today) for _, path in dbs)}, 7 дней {sum(_owner_event_count_max(path, week) for _, path in dbs)}\n"
+            f"Беременные: {tg['pregnant'] + mx['pregnant']}\nМамы: {tg['mama'] + mx['mama']}\n"
+            f"Профиль заполнен: {tg['complete'] + mx['complete']}\nБез завершённого профиля: {tg['total'] + mx['total'] - tg['complete'] - mx['complete']}\n"
+            f"Платные тарифы: {paid}\nРазовые покупки: {one_time}"
+        )
+    if section == "funnel":
+        steps = [("Перешёл по ссылке", ("channel_click", "ad_payload_opened")), ("Start / bot_started", ("user_start",)), ("Профиль заполнен", ("profile_completed",)), ("Бесплатный сценарий", ("free_result_started", "funnel_question_opened")), ("Бесплатный результат", ("free_result_completed",)), ("Платный оффер", ("paid_offer_shown",)), ("Нажал оплату", ("payment_clicked",)), ("Оплатил", ("payment_success", "payment_succeeded"))]
+        return "\n".join(["📈 Воронка за 30 дней"] + [f"{title}: {sum(_owner_event_count_max(path, month, names=names) for _, path in dbs)}" for title, names in steps])
+    if section == "sources":
+        sources = {}
+        for _, path in dbs:
+            for row in _owner_top_sources_max(path, month, 20):
+                sources[row["source"]] = sources.get(row["source"], 0) + row["cnt"]
+        lines = ["🎯 Источники рекламы за 30 дней"]
+        if not sources:
+            lines.append("Данных по источникам пока нет.")
+        for src, cnt in sorted(sources.items(), key=lambda item: (-item[1], item[0]))[:15]:
+            paid = sum(_owner_event_count_max(path, month, names=("payment_success", "payment_succeeded"), source_prefix=src) for _, path in dbs)
+            lines.append(f"• {src}: входов {cnt}, оплат {paid}, конверсия {(paid / cnt * 100 if cnt else 0):.1f}%")
+        return "\n".join(lines)
+    if section == "ads":
+        topics = [("врач", "channel_doctor"), ("сон", "channel_sleep"), ("питание", "channel_feeding"), ("психолог", "channel_psycho"), ("истерики", "channel_tantrum"), ("садик", "channel_garden"), ("школа", "channel_school"), ("гаджеты", "channel_gadgets"), ("бабушки", "channel_grandma")]
+        lines = ["📣 Реклама", "Telegram:"]
+        for title, payload in topics:
+            lines.append(f"• {title}: https://t.me/MaminPomoshnikAI_bot?start={payload}")
+            lines.append(f"  ya/vk/land: {payload}_ya1 | {payload}_vk1 | {payload}_land1")
+        if MAX_BOT_PUBLIC_URL:
+            lines.append("\nMAX:")
+            lines.extend(f"• {title}: {MAX_BOT_PUBLIC_URL}?start={payload}" for title, payload in topics)
+        return "\n".join(lines)
+    if section == "errors":
+        return f"⚠️ Ошибки\n\nСегодня: {sum(_owner_event_count_max(path, today, names=('error_logged',)) for _, path in dbs)}\nЗа 7 дней: {sum(_owner_event_count_max(path, week, names=('error_logged',)) for _, path in dbs)}\n\nSystemd journal из бота не читается."
+    if section == "feedback":
+        lines = ["💬 Обратная связь"]
+        try:
+            with _owner_conn_max(DB) as conn:
+                rows = conn.execute("SELECT created_at, review FROM reviews ORDER BY id DESC LIMIT 10").fetchall()
+                lines.extend(f"• {r['created_at'][:16]}: {str(r['review'])[:160]}" for r in rows)
+        except Exception:
+            pass
+        if len(lines) == 1:
+            lines.append("Свежих отзывов не найдено.")
+        return "\n".join(lines)
+    if section == "broadcast":
+        return f"📤 Рассылка\n\nРассылка пока в безопасном режиме.\nПотенциальные получатели: TG {_owner_user_counts_max(TG_DB_PATH, 'tg')['total']}, MAX {_owner_user_counts_max(DB, 'max')['total']}.\n\nМассовая отправка из этого кабинета не выполняется."
+    if section == "export":
+        return "📄 Экспорт / Google-таблица\n\nИнтеграция Google Sheets уже есть для пользователей/продаж/отзывов.\nОтдельный экспорт кабинета подключается отдельной задачей.\nЛисты: Mama TG, Mama MAX, Продажи, Реклама, Ошибки, Воронка."
+    if section == "check":
+        return f"🧪 Проверка бота\n\nMAX version: {APP_VERSION}\nMAX health: /health настроен\nProduction TG: /root/mama_bot.py\nProduction MAX: /root/mama_max_bot.py\n\nПерезапуск сервисов из кабинета не выполняется."
+    return owner_home_text_max()
+
+
 async def process_command(chat_id, user_id, text, username="", first_name=""):
+    command_text = text.strip()
+    if command_text.startswith("/") and get_user(user_id, username, first_name).get("step") == "fb2026_suggest":
+        set_step(user_id, "idle")
+    if command_text.startswith("/") and get_user(user_id, username, first_name).get("step") == "cf2026_feedback":
+        set_step(user_id, "idle")
+
     # Служебная команда доступна всем и помогает узнать реальный MAX user_id.
-    if text.strip().lower() in ("/my_id", "/myid"):
+    if command_text.lower() in ("/my_id", "/myid"):
         await send_message(chat_id, f"Ваш MAX user_id: {user_id}")
         return
-    normalized_command = text.strip().lower()
+    if command_text.lower() in ("/owner", "/admin", "owner", "admin"):
+        if user_id != OWNER_ID:
+            await send_message(chat_id, "Недоступно")
+            return
+        await send_message(chat_id, owner_home_text_max(), owner_cabinet_buttons_max())
+        return
+    normalized_command = command_text.lower()
     if normalized_command in ("/test_channel_visual", "test_channel_visual"):
         if user_id != OWNER_ID:
             await send_message(chat_id, "Команда доступна только владельцу.")
@@ -1758,6 +2367,13 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         await send_message(chat_id, "✅ Приветственный пост опубликован. Закрепи его в канале вручную." if ok else "❌ Не удалось опубликовать приветственный пост.")
         return
     if text.strip().lower() == "/reset_me":
+        await send_message(chat_id,
+            "⚠️ Это удалит ваш профиль и сохранённые данные в боте. Платёжный журнал не удаляется.\n\nУдалить данные?",
+            [[{"type": "callback", "text": "Удалить данные", "payload": "reset_me_confirm"}],
+             [{"type": "callback", "text": "Отмена", "payload": "reset_me_cancel"}]])
+        return
+
+    if text.strip().lower() == "/reset_me_now_legacy_disabled":
         tables = [
             "diary", "growth", "symptoms", "psycho_history", "vaccinations",
             "subscriptions", "limits", "user_credits", "marketing_offers",
@@ -1820,12 +2436,25 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         plan, _ = get_subscription(user_id)
         asyncio.create_task(asyncio.to_thread(sheets_log_visit, user_id, first_name, username, plan))
         if birth_date.startswith("pdr:"):
-            await send_message(chat_id, f"🤰 Ты {m_label}\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
+            await send_message(chat_id, f"🤰 Ты {m_label}\n\nЧем могу помочь? 💕", pregnant_menu_buttons(user_id))
         elif birth_date:
-            await send_message(chat_id, f"Привет, {name}! 🤍\n\nЧем могу помочь?", main_menu_buttons())
+            await send_message(chat_id, f"Привет, {name}! 🤍\n\nЧем могу помочь?", main_menu_buttons(user_id))
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
-                start_buttons())
+                start_buttons(user_id))
+        return
+
+    if step == "donate_custom_amount":
+        set_step(user_id, "idle")
+        raw = (text or "").replace(",", ".").strip()
+        try:
+            amount = float(raw)
+        except ValueError:
+            amount = None
+        if amount is None or not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+            await send_message(chat_id, f"Пожалуйста, введи сумму от {DONATE_MIN_AMOUNT} до {DONATE_MAX_AMOUNT} рублей, например: 250", kb_donate_menu())
+            return
+        await send_donate_confirm(chat_id, round(amount, 2), "custom")
         return
 
     # Психолог
@@ -1895,10 +2524,6 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         set_step(user_id, "idle")
         plan, _ = get_subscription(user_id)
         limit = question_limit_for(user_id)
-        if limit is not None and get_request_count(user_id) >= limit:
-            log_analytics_event("paywall_seen", user_id, "questions_limit", f"used={get_request_count(user_id)};limit={limit}")
-            await send_message(chat_id, "🤍 Бесплатные персональные разборы закончились. Продолжить можно с тарифа «Старт» или получить бонус за приглашение подруги.", [[{"type":"callback","text":"🌱 Продолжить — 190 ₽","payload":"pay_plan_start"}],[{"type":"callback","text":"💎 Выбрать тариф","payload":"pay_premium"}],[{"type":"callback","text":"🎁 Пригласить подругу","payload":"invite_friend"}]])
-            return
         context = f"Ребёнку {m_label}." if months is not None else f"Беременная {m_label}." if weeks_preg else ""
         log_analytics_event("request_started", user_id, "personal_question", text[:300])
         await send_message(chat_id, "⏳ Думаю...")
@@ -1927,21 +2552,14 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         conn.execute("UPDATE users SET birth_date=?, step='idle', pending_start='' WHERE user_id=?", (text, user_id))
         conn.commit()
         conn.close()
+        log_analytics_event("profile_completed", user_id, pending_start)
         lbl = age_label(m)
-        await send_message(chat_id, f"✅ Малышу {lbl}\n\nЧем могу помочь? 💕", main_menu_buttons())
         if pending_start:
-            route = {
-                "channel_today": ("❓ Получить персональный ответ", "ask"),
-                "channel_sleep": ("🌙 Сон и режим", "sleep_log"),
-                "channel_feeding": ("🤱 Кормления и питание", "feeding"),
-                "channel_doctor": ("🩺 Подготовка к врачу", "doctor_prep"),
-                "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
-                "channel_pregnancy": ("🏥 Восстановление мамы", "recovery"),
-                "channel_child": ("👶 Развитие ребёнка", "development"),
-                "channel_family": ("👨‍👩‍👧 Семья", "family"),
-            }.get(pending_start)
-            if route:
-                await send_message(chat_id, route[0], [[{"type": "callback", "text": route[0], "payload": route[1]}]])
+            await send_message(chat_id, f"✅ Малышу {lbl}")
+            landing_text, landing_buttons = channel_landing_max(pending_start)
+            await send_message(chat_id, landing_text, landing_buttons)
+        else:
+            await send_message(chat_id, f"✅ Малышу {lbl}\n\nЧем могу помочь? 💕", main_menu_buttons(user_id))
         return
 
     # Ввод ПДР
@@ -1956,20 +2574,13 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         conn.execute("UPDATE users SET birth_date=?, step='idle', pending_start='' WHERE user_id=?", (f"pdr:{text}", user_id))
         conn.commit()
         conn.close()
-        await send_message(chat_id, f"✅ Ты на {w} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
+        log_analytics_event("profile_completed", user_id, pending_start)
         if pending_start:
-            route = {
-                "channel_today": ("❓ Получить персональный ответ", "ask"),
-                "channel_sleep": ("🌙 Разобрать сон ребёнка", "funnel_sleep"),
-                "channel_feeding": ("🥣 Разобрать питание ребёнка", "funnel_feeding"),
-                "channel_doctor": ("🩺 Подготовить вопросы врачу", "funnel_doctor"),
-                "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
-                "channel_pregnancy": ("🤰 Задать вопрос по беременности", "funnel_pregnancy"),
-                "channel_child": ("👶 Проверить развитие", "funnel_development"),
-                "channel_family": ("👨‍👩‍👧 Подготовить разговор", "funnel_family"),
-            }.get(pending_start)
-            if route:
-                await send_message(chat_id, route[0], [[{"type": "callback", "text": route[0], "payload": route[1]}]])
+            await send_message(chat_id, f"✅ Ты на {w} неделе беременности")
+            landing_text, landing_buttons = channel_landing_max(pending_start)
+            await send_message(chat_id, landing_text, landing_buttons)
+        else:
+            await send_message(chat_id, f"✅ Ты на {w} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons(user_id))
         return
 
     # Ввод роста
@@ -2060,6 +2671,50 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
         await send_message(chat_id, "💡 Спасибо за идею! Мы обязательно рассмотрим её 🤍", main_menu_buttons())
         return
 
+    if step == "fb2026_suggest" and text.strip().startswith("/"):
+        set_step(user_id, "idle")
+        await send_message(
+            chat_id,
+            "Команда не записана как предложение.",
+            main_menu_buttons(user_id) if birth_date else start_buttons(user_id),
+        )
+        return
+
+    if step == "fb2026_suggest":
+        set_step(user_id, "idle")
+        try:
+            await send_message(OWNER_ID,
+                "💡 Новое предложение\n\nПлатформа: MAX\n"
+                f"Имя: {first_name or '—'}\nUsername: {username or '—'}\nUser ID: {user_id}\nПредложение:\n{text}")
+        except Exception as exc:
+            logging.error("fb2026 suggestion owner notify error: %s", exc)
+        save_review(user_id, username, first_name, f"ПРЕДЛОЖЕНИЕ (feedback_features_2026_09): {text}")
+        asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, first_name, username, f"ПРЕДЛОЖЕНИЕ: {text}"))
+        await send_message(chat_id, "Спасибо ❤️ Предложение отправлено. Я обязательно его прочитаю.", main_menu_buttons())
+        return
+
+    if step == "cf2026_feedback" and text.strip().startswith("/"):
+        set_step(user_id, "idle")
+        await send_message(
+            chat_id,
+            "Команда не записана как отзыв.",
+            main_menu_buttons(user_id) if birth_date else start_buttons(user_id),
+        )
+        return
+
+    if step == "cf2026_feedback":
+        set_step(user_id, "idle")
+        try:
+            await send_message(OWNER_ID,
+                "🥣 Отзыв о «Прикорм 6+»\n\nПлатформа: MAX\n"
+                f"Имя: {first_name or '—'}\nUsername: {username or '—'}\nUser ID: {user_id}\n\nОтзыв:\n{text}")
+        except Exception as exc:
+            logging.error("cf2026 feedback owner notify error: %s", exc)
+        save_review(user_id, username, first_name, f"ОТЗЫВ О ПРИКОРМ 6+ ({CF_CAMPAIGN_KEY}): {text}")
+        asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, first_name, username, f"ОТЗЫВ (Прикорм 6+): {text}"))
+        await send_message(chat_id, "Спасибо ❤️ Ваше мнение отправлено. Оно поможет сделать «Прикорм 6+» полезнее.", main_menu_buttons())
+        return
+
     if step == "support_write":
         current_step = step
         set_step(user_id, "idle")
@@ -2081,10 +2736,10 @@ async def process_command(chat_id, user_id, text, username="", first_name=""):
     # Если режим не выбран
     if not birth_date:
         await send_message(chat_id, WELCOME_TEXT.format(name=name),
-            start_buttons())
+            start_buttons(user_id))
         return
 
-    menu = pregnant_menu_buttons() if birth_date.startswith("pdr:") else main_menu_buttons()
+    menu = pregnant_menu_buttons(user_id) if birth_date.startswith("pdr:") else main_menu_buttons(user_id)
     await send_message(chat_id, "Выбери действие из меню 👇", menu)
 
 
@@ -2108,6 +2763,137 @@ def save_channel_poll_vote(user_id, payload):
 
 async def process_callback(chat_id, user_id, payload, first_name=""):
     get_user(user_id, "", first_name)
+    if payload.startswith("owner_cab:"):
+        if user_id != OWNER_ID:
+            await send_message(chat_id, "Недоступно")
+            return
+        section = payload.split(":", 1)[1]
+        if section == "home":
+            await send_message(chat_id, owner_home_text_max(), owner_cabinet_buttons_max())
+        else:
+            await send_message(chat_id, owner_report_max(section), owner_back_buttons_max())
+        return
+
+    if payload.startswith("pr_open:"):
+        if not OWNER_ID or user_id != OWNER_ID:
+            await send_message(chat_id, "Недоступно")
+            return
+        try:
+            review_id = int(payload.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await send_message(chat_id, "Некорректная заявка")
+            return
+        row = get_personal_review_max(review_id)
+        if not row:
+            await send_message(chat_id, "Заявка не найдена")
+            return
+        reply_label = "Email" if row["preferred_reply"] == "email" else "MAX"
+        lines = [
+            f"Заявка №{review_id} — {_pr_status_label_max(row['status'])}",
+            f"User ID: {row['user_id']}",
+            f"Способ ответа: {reply_label}",
+        ]
+        if row["preferred_reply"] == "email" and row["email"]:
+            lines.append(f"Email клиента: {row['email']}")
+        lines.append("")
+        lines.append("Текст ситуации:")
+        lines.append(row["situation_text"])
+        buttons = None
+        if row["status"] == "paid":
+            buttons = [[{"type": "callback", "text": "Взять в работу", "payload": f"pr_take:{review_id}"}]]
+        await send_message(chat_id, "\n".join(lines), buttons)
+        return
+
+    if payload.startswith("pr_take:"):
+        if not OWNER_ID or user_id != OWNER_ID:
+            await send_message(chat_id, "Недоступно")
+            return
+        try:
+            review_id = int(payload.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await send_message(chat_id, "Некорректная заявка")
+            return
+        ok = take_personal_review_max(review_id)
+        if not ok:
+            row = get_personal_review_max(review_id)
+            current = _pr_status_label_max(row["status"]) if row else "не найдена"
+            await send_message(chat_id, f"Уже {current}")
+            return
+        set_step(user_id, f"pr_voice_{review_id}")
+        await send_message(chat_id, f"Заявка №{review_id} взята в работу. Отправь одно голосовое сообщение с ответом — оно будет привязано к этой заявке.")
+        return
+
+    if payload.startswith("pr_rerecord:"):
+        if not OWNER_ID or user_id != OWNER_ID:
+            await send_message(chat_id, "Недоступно")
+            return
+        try:
+            review_id = int(payload.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await send_message(chat_id, "Некорректная заявка")
+            return
+        row = get_personal_review_max(review_id)
+        if not row or row["status"] != "in_review":
+            await send_message(chat_id, "Заявка недоступна для перезаписи")
+            return
+        set_step(user_id, f"pr_voice_{review_id}")
+        await send_message(chat_id, f"Хорошо, пришли новое голосовое для заявки №{review_id}.")
+        return
+
+    if payload.startswith("pr_send:"):
+        if not OWNER_ID or user_id != OWNER_ID:
+            await send_message(chat_id, "Недоступно")
+            return
+        try:
+            review_id = int(payload.split(":", 1)[1])
+        except (IndexError, ValueError):
+            await send_message(chat_id, "Некорректная заявка")
+            return
+        row = get_personal_review_max(review_id)
+        if not row or row["status"] != "in_review" or not row["answer_path"]:
+            await send_message(chat_id, "Заявка не готова к отправке")
+            return
+        client_user_id = row["user_id"]
+        preferred_reply = row["preferred_reply"]
+        voice_path = row["answer_path"]
+        if not os.path.exists(voice_path):
+            await send_message(chat_id, f"Голосовой файл заявки №{review_id} не найден на сервере — запиши заново.")
+            return
+        if preferred_reply == "email":
+            delivered = mark_personal_review_answered_max(review_id)
+            if not delivered:
+                await send_message(chat_id, "Ответ уже был отправлен")
+                return
+            await send_message(
+                chat_id,
+                f"Заявка №{review_id}: клиент выбрал ответ по email.\n"
+                f"Email клиента: {row['email'] or '—'}\n\n"
+                "Голосовое сохранено — отправь его на почту клиента вручную. Ниже пересылаю запись для удобства.",
+            )
+            try:
+                owner_chat_id = get_saved_max_chat_id(user_id) or chat_id
+                await send_personal_review_voice_max(owner_chat_id, voice_path)
+            except Exception as exc:
+                logging.error(f"Не удалось переслать голосовое владельцу MAX для заявки {review_id}: {exc}")
+        else:
+            try:
+                client_chat_id = get_saved_max_chat_id(client_user_id) or client_user_id
+                sent = await send_personal_review_voice_max(client_chat_id, voice_path)
+                if not sent:
+                    raise RuntimeError("MAX не подтвердил доставку файла")
+                await send_message(client_chat_id, "Ваш разбор готов 🎧")
+            except Exception as exc:
+                logging.error(f"Не удалось отправить голосовое клиенту MAX по заявке {review_id}: {exc}")
+                await send_message(chat_id, f"Не удалось отправить сообщение клиенту (заявка №{review_id}): {exc}")
+                return
+            delivered = mark_personal_review_answered_max(review_id)
+            if not delivered:
+                await send_message(chat_id, "Ответ уже был отправлен")
+                return
+            await send_message(chat_id, f"Готово — ответ отправлен клиенту (заявка №{review_id}).")
+        log_analytics_event("personal_review_answered", client_user_id, PERSONAL_REVIEW_PRODUCT_CODE, str(review_id))
+        return
+
     name = first_name or "мама"
     user = get_user(user_id)
     birth_date = user.get("birth_date", "")
@@ -2143,7 +2929,7 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "channel_open_bot":
         await send_message(user_id,
             "🤍 Ты пришла из канала «Я МАМА». Здесь можно получить персональный план, вести трекеры и задать вопрос с учётом возраста ребёнка.",
-            pregnant_menu_buttons() if birth_date.startswith("pdr:") else main_menu_buttons() if birth_date else start_buttons())
+            pregnant_menu_buttons(user_id) if birth_date.startswith("pdr:") else main_menu_buttons(user_id) if birth_date else start_buttons(user_id))
         return
 
     if payload.startswith("channel_poll_"):
@@ -2154,27 +2940,108 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "noop":
         return
 
+    if payload == "donate_menu":
+        log_analytics_event("support_open", user_id)
+        await send_message(
+            chat_id,
+            "Поддержать проект\n\n"
+            "«Мамин помощник» остаётся бесплатным для всех родителей. Если проект оказался полезен, "
+            "вы можете поддержать его развитие любой удобной суммой. Это добровольная благодарность — "
+            "все функции доступны и без оплаты.",
+            kb_donate_menu(),
+        )
+        return
+
+    if payload.startswith("donate_amt_"):
+        variant = payload.replace("donate_amt_", "", 1)
+        if variant == "custom":
+            log_analytics_event("support_custom", user_id)
+            set_step(user_id, "donate_custom_amount")
+            await send_message(chat_id, f"Введи сумму в рублях (от {DONATE_MIN_AMOUNT} до {DONATE_MAX_AMOUNT}):")
+            return
+        try:
+            amount = float(variant)
+        except ValueError:
+            return
+        if not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+            return
+        log_analytics_event(f"support_amount_{variant}", user_id)
+        await send_donate_confirm(chat_id, amount, variant)
+        return
+
+    if payload.startswith("donate_confirm:"):
+        try:
+            _, variant, amount_str = payload.split(":", 2)
+            amount = float(amount_str)
+        except (ValueError, IndexError):
+            await send_message(chat_id, "Не удалось определить сумму. Попробуй ещё раз.", kb_donate_menu())
+            return
+        if not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+            await send_message(chat_id, "Некорректная сумма.", kb_donate_menu())
+            return
+        try:
+            payment = await create_support_payment(user_id, amount)
+            payment_id = payment.get("id", "")
+            pay_url = payment.get("confirmation", {}).get("confirmation_url", "")
+            if not payment_id or not pay_url:
+                raise RuntimeError("ЮКасса не вернула ссылку или id")
+            save_support_payment(payment_id, user_id, amount, variant, "max")
+            log_analytics_event("support_payment_created", user_id, variant, amount_str)
+            await send_message(
+                chat_id,
+                "Спасибо! Нажми кнопку ниже, чтобы завершить оплату.",
+                [[{"type": "link", "text": f"💳 Оплатить {amount:.0f} ₽", "url": pay_url}],
+                 [{"type": "callback", "text": "Назад", "payload": "donate_menu"}]],
+            )
+        except Exception as exc:
+            logging.error(f"Ошибка создания платежа поддержки MAX: {exc}")
+            await send_message(chat_id, "Не удалось создать платёж. Попробуй позже.", kb_donate_menu())
+        return
+
+    if payload == "reset_me_cancel":
+        await send_message(chat_id, "Отменено. Данные не удалены.")
+        return
+
+    if payload == "reset_me_confirm":
+        tables = [
+            "diary", "growth", "symptoms", "psycho_history", "vaccinations",
+            "subscriptions", "limits", "user_credits", "marketing_offers",
+            "pending_payments", "reviews", "users"
+        ]
+        conn = db_connect()
+        try:
+            for table in tables:
+                try:
+                    conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+                except sqlite3.OperationalError:
+                    pass
+            conn.commit()
+        finally:
+            conn.close()
+        await send_message(chat_id, "✅ Ваш профиль и тестовые данные сброшены. Отправьте /start для новой регистрации.")
+        return
+
     if payload == "back_menu":
         set_step(user_id, "idle")
         if birth_date and birth_date.startswith("pdr:"):
             weeks_cur = calc_pregnancy_weeks(birth_date.replace("pdr:", ""))
-            await send_message(chat_id, f"🤰 Ты на {weeks_cur} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
+            await send_message(chat_id, f"🤰 Ты на {weeks_cur} неделе беременности\n\nЧем могу помочь? 💕", pregnant_menu_buttons(user_id))
         elif birth_date:
-            await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons())
+            await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons(user_id))
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
-                start_buttons())
+                start_buttons(user_id))
         return
 
     if payload == "main_menu":
         set_step(user_id, "idle")
         if birth_date.startswith("pdr:"):
-            await send_message(chat_id, f"🤰 Ты {m_label}\n\nЧем могу помочь? 💕", pregnant_menu_buttons())
+            await send_message(chat_id, f"🤰 Ты {m_label}\n\nЧем могу помочь? 💕", pregnant_menu_buttons(user_id))
         elif birth_date:
-            await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons())
+            await send_message(chat_id, f"Чем могу помочь? 💕", main_menu_buttons(user_id))
         else:
             await send_message(chat_id, WELCOME_TEXT.format(name=name),
-                start_buttons())
+                start_buttons(user_id))
         return
 
     if payload == "cat_child":
@@ -2249,12 +3116,9 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             "🎁 Пригласить подругу\n\n"
             "Отправь ей личную ссылку:\n"
             f"{link}\n\n"
-            "За первый запуск — 1 дополнительный AI-вопрос. За первую оплату — 7 дней тарифа Про.\n\n"
-            "Не более 5 бонусов за запуск в месяц. Самоприглашения и повторные регистрации не учитываются.\n\n"
+            "Все функции «Маминого помощника» и так доступны бесплатно — приглашение просто помогает больше мам узнать о проекте.\n\n"
             f"Приглашено: {invited}\n"
-            f"Бонусов начислено: {start_rewards}\n"
-        f"Доступно AI-вопросов: {available_bonus}\n"
-            f"Наград Про: {payment_rewards}"
+            f"Бонусов начислено: {start_rewards}"
         )
         await send_message(chat_id, text, [
             [{"type":"link","text":"📤 Открыть ссылку","url":link}],
@@ -2414,7 +3278,6 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         await send_message(chat_id, "🩺 Сводка к педиатру\n\n" + answer,
             [[{"type": "callback", "text": "📈 Отчёт за 7 дней", "payload": "weekly_report"}],
              [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
-        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "doctor_report")
         return
 
     if payload == "weekly_report":
@@ -2439,7 +3302,6 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         await send_message(chat_id, "📈 Ваши 7 дней\n\n" + answer,
             [[{"type": "callback", "text": "🩺 Подготовить к врачу", "payload": "doctor_prep"}],
              [{"type": "callback", "text": "🔙 В меню", "payload": "back_menu"}]])
-        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "weekly_report")
         return
 
     # ─── БЕРЕМЕННЫЙ РАЗДЕЛ ───────────────────────────────────
@@ -2522,6 +3384,45 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
     if payload == "review":
         set_step(user_id, "review")
         await send_message(chat_id, "⭐ Напиши свой отзыв о боте 💕", back_button())
+        return
+
+    if payload == "fb2026:suggest":
+        set_step(user_id, "fb2026_suggest")
+        await send_message(chat_id,
+            "💬 Напишите одним сообщением, какую функцию или возможность вы хотели бы добавить "
+            "в «Мамин Помощник».\n\nМожно написать совсем коротко — я обязательно прочитаю ❤️")
+        return
+
+    if payload == "cf2026:feedback":
+        set_step(user_id, "cf2026_feedback")
+        await send_message(chat_id,
+            "💬 Напишите одним сообщением, как вам новый раздел «Прикорм 6+».\n\n"
+            "Что понравилось? Чего не хватает? Что стоит сделать удобнее?\n\n"
+            "Я обязательно прочитаю ❤️")
+        return
+
+    if payload == "fb2026:like":
+        with db_connect() as conn:
+            row = conn.execute("SELECT username, first_name FROM users WHERE user_id=?", (user_id,)).fetchone()
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO feedback_campaign_likes(campaign_key, platform, user_id, created_at) VALUES (?, 'max', ?, ?)",
+                (FEEDBACK_CAMPAIGN_KEY, user_id, datetime.now().isoformat()),
+            )
+            already = cur.rowcount == 0
+        if already:
+            await send_message(chat_id, "Спасибо ❤️ Ваш ответ уже получен.")
+            return
+        fb_username = (row[0] if row else "") or ""
+        fb_first_name = (row[1] if row else "") or first_name or ""
+        try:
+            await send_message(OWNER_ID,
+                "❤️ Положительная обратная связь\n\nПлатформа: MAX\n"
+                f"Имя: {fb_first_name or '—'}\nUsername: {fb_username or '—'}\nUser ID: {user_id}\nОтвет: Всё нравится")
+        except Exception as exc:
+            logging.error("fb2026 like owner notify error: %s", exc)
+        save_review(user_id, fb_username, fb_first_name, "ПОЛОЖИТЕЛЬНАЯ ОБРАТНАЯ СВЯЗЬ (feedback_features_2026_09): Всё нравится")
+        asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, fb_first_name, fb_username, "Всё нравится (кампания feedback_features_2026_09)"))
+        await send_message(chat_id, "Спасибо ❤️ Очень приятно это знать. Такие сообщения действительно помогают продолжать развивать приложение.")
         return
 
     # ─── БЕСПЛАТНЫЕ РАЗДЕЛЫ ──────────────────────────────────
@@ -2888,8 +3789,6 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             f"Ребёнку {m_label}. Журнал кормлений:\n{data_str}\n\n"
             f"Проанализируй: достаточно ли кормлений по нормам ВОЗ, правильные ли интервалы, достаточная ли продолжительность. Дай практические рекомендации.")
         await send_message(chat_id, answer, back_button())
-        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS:
-            consume_credit(user_id, "feeding_report")
         return
 
     for feed_type in ["feed_left", "feed_right", "feed_bottle"]:
@@ -2943,7 +3842,6 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
             f"сколько часов спит суммарно, правильные ли интервалы бодрствования, "
             f"есть ли проблемы и как их решить. Конкретные рекомендации.")
         await send_message(chat_id, answer, back_button())
-        if ai_answer_success(answer) and get_user_plan(user_id) not in PRO_PLANS: consume_credit(user_id, "sleep_report")
         return
 
     if payload == "sleep_start":
@@ -3129,36 +4027,12 @@ async def process_callback(chat_id, user_id, payload, first_name=""):
         await send_message(chat_id, "❓ Расскажи о своей ситуации:\n\nРаботаешь или нет, какой по счёту ребёнок, замужем или нет, регион.")
         return
 
-    if payload in {"pay_premium", "premium_info"}:
+    if payload in {"pay_premium", "premium_info"} or payload.startswith("pay_plan_") or payload.startswith("buy_"):
+        # Старые тарифные ссылки/кнопки больше не продают функционал — он бесплатный.
         await send_message(chat_id,
-            "💎 Премиум-возможности\n\n"
-            "🌱 Старт\n"
-            "Трекеры роста, симптомов, кормлений и сна, прививки, пособия, 30 AI-вопросов и 50 сообщений поддержки.\n\n"
-            "💎 Про\n"
-            "Всё из Старт + Мамин психолог, анализ фото, сводка врачу, разбор сна и кормлений, недельный отчёт.\n\n"
-            "🛒 Отдельные решения без подписки:\n"
-            "Фото — 99 ₽ · Сводка врачу — 149 ₽ · Кормления — 149 ₽ · Сон — 199 ₽ · Отчёт — 199 ₽.",
-            upgrade_buttons())
-        return
-
-    if payload.startswith("pay_plan_") or payload.startswith("buy_"):
-        product_code = payload.replace("pay_plan_", "", 1) if payload.startswith("pay_plan_") else payload.replace("buy_", "", 1)
-        try:
-            info = PLAN_CATALOG.get(product_code) or ONE_TIME_PRODUCTS[product_code]
-            payment = await create_payment(user_id, product_code)
-            payment_id = payment.get("id", "")
-            pay_url = payment.get("confirmation", {}).get("confirmation_url", "")
-            if not payment_id or not pay_url:
-                raise RuntimeError("ЮКасса не вернула ссылку или id")
-            save_commercial_payment(payment_id,user_id,product_code)
-            amount_int=int(float(info["amount"]))
-            await send_message(chat_id,
-                f"{info['name']}\n\nСтоимость: {amount_int} ₽. После оплаты доступ активируется автоматически.",
-                [[{"type":"link","text":f"💳 Оплатить {amount_int} ₽","url":pay_url}],
-                 [{"type":"callback","text":"🔙 К тарифам","payload":"premium_info"}]])
-        except Exception as exc:
-            logging.error("Ошибка создания платежа MAX: %s", exc)
-            await send_message(chat_id,"Не удалось создать платёж. Попробуйте позже.",upgrade_buttons())
+            "Все текущие функции «Маминого помощника» теперь доступны бесплатно.",
+            [[{"type": "callback", "text": "❤️ Поддержать проект", "payload": "donate_menu"}],
+             [{"type": "callback", "text": "🏠 Вернуться в главное меню", "payload": "back_menu"}]])
         return
 
     await send_message(chat_id, "Выбери действие из меню 👇", main_menu_buttons())
@@ -3177,7 +4051,7 @@ async def process_photo(chat_id, user_id, photo_url):
         "photo_med_preg": "med_preg"
     }
     photo_type = type_map.get(step)
-    use_photo_credit = get_user_plan(user_id) not in PRO_PLANS
+    use_photo_credit = False  # Проект бесплатный: старые кредиты за анализ фото больше не расходуются
     if not photo_type:
         await send_message(chat_id, "Сначала выбери тип анализа фото в меню.", back_button())
         return
@@ -3264,52 +4138,136 @@ async def process_photo(chat_id, user_id, photo_url):
 # Редакционная система MAX-канала: 3 публикации в день,
 # память тем, защита от повторов, опросы и мягкие переходы в личный чат бота.
 
-WEEKLY_EDITORIAL = {
-    0: "организация недели, режим семьи и снижение бытового хаоса",
-    1: "развитие ребёнка без сравнений и лишней тревоги",
-    2: "здоровье понятным языком и безопасные алгоритмы действий",
-    3: "сон, режим и восстановление всей семьи",
-    4: "эмоции мамы, чувство вины, усталость и отношения",
-    5: "семейная жизнь, папа, бабушки, прогулки и простые игры",
-    6: "итоги недели, наблюдения, полезные привычки и подготовка к новой неделе",
+# 3 поста в день, 8 рубрик практического родительского контента (без ежедневных
+# выдуманных семейных историй). Категории: REC рецепт, WHATIF воспитание/поведение,
+# HEALTH здоровье-сон-врач, AGE сад/школа/развитие по возрасту, MOM мама тоже человек,
+# DAD папин взгляд (короткое наблюдение, не сюжет), FAM бабушки-дедушки-семья,
+# SAVE сохрани-пригодится (также резерв вместо личной истории без фактов владельца).
+# Темы и форматы вращаются по дням и сохраняются в БД, чтобы канал не повторялся.
+
+CHANNEL_CONTENT_LIBRARY_PATH = "/root/mama_channel_content.json"
+
+# Редакционная архитектура: свободная AI-генерация поста с нуля больше не используется.
+# Основа каждой публикации — заранее написанный и вручную проверенный материал из
+# библиотеки CHANNEL_CONTENT_LIBRARY_PATH (минимум 120 готовых постов, общая с ботом в
+# Telegram). AI-адаптация (лёгкая правка вступления/порядка абзацев/CTA-фразы)
+# необязательна и по умолчанию выключена — надёжный дефолт после FINAL_FAIL свободной
+# генерации в предыдущей задаче (JOB_20260711_175411). Включать только после отдельной
+# проверки владельцем.
+CHANNEL_AI_ADAPTATION_ENABLED = False
+
+CHANNEL_LIBRARY_MAX_CHARS = {
+    "REC": 1800, "WHATIF": 1200, "HEALTH": 1200, "AGE": 1200,
+    "MOM": 1100, "DAD": 650, "FAM": 1100, "SAVE": 1100,
 }
 
-MORNING_FORMATS = [
-    "короткое тёплое напоминание без наставлений",
-    "одна маленькая задача на день",
-    "поддерживающая мысль для уставшей мамы",
-    "мини-практика на две минуты",
-    "разрешение не быть идеальной",
-]
+# Рубрика -> все format_name, которые ей присваиваются (для анти-повтора по истории
+# публикаций: get_recent_channel_posts хранит только slot/theme/format_name/text).
+CHANNEL_FORMAT_NAMES_BY_CATEGORY = {
+    "REC": ("рецепт",),
+    "WHATIF": ("что делать, если", "поговорим честно"),
+    "HEALTH": ("здоровье и сон",),
+    "AGE": ("по возрасту",),
+    "MOM": ("мама тоже человек",),
+    "DAD": ("папин взгляд",),
+    "FAM": ("семья и бабушки",),
+    "SAVE": ("сохрани, пригодится",),
+}
 
-DAY_FORMATS = [
-    "сохраняемый чек-лист",
-    "миф или правда с объяснением",
-    "одна ситуация для трёх возрастов",
-    "разбор частой ошибки без осуждения",
-    "пошаговый алгоритм действий",
-    "короткий разбор вопроса мамы",
-    "что нормально, а что стоит обсудить со специалистом",
-    "три практических шага на сегодня",
-]
+_channel_content_library_cache = None
 
-EVENING_FORMATS = [
-    "короткая история с узнаваемой ситуацией",
-    "вопрос для самопроверки",
-    "мини-кейс до и после использования трекера",
-    "подборка из трёх полезных наблюдений",
-    "мягкая демонстрация одной функции бота",
-]
+
+def load_channel_content_library():
+    """Загружает и кеширует библиотеку готовых постов из CHANNEL_CONTENT_LIBRARY_PATH."""
+    global _channel_content_library_cache
+    if _channel_content_library_cache is None:
+        with open(CHANNEL_CONTENT_LIBRARY_PATH, "r", encoding="utf-8") as f:
+            _channel_content_library_cache = json.load(f)
+    return _channel_content_library_cache
+
+
+def channel_library_by_category(category):
+    return [item for item in load_channel_content_library() if item.get("category") == category]
+
+
+def _recent_channel_topics(limit=45):
+    return {theme_ for _, theme_, _, _ in get_recent_channel_posts(limit) if theme_}
+
+
+def _recent_channel_topics_for_category(category, limit):
+    format_names = CHANNEL_FORMAT_NAMES_BY_CATEGORY.get(category, ())
+    rows = get_recent_channel_posts(limit)
+    return [theme_ for _, theme_, f, _ in rows if f in format_names and theme_]
+
+
+def select_channel_library_post(category, rnd, exclude_topics=()):
+    """Выбирает готовый пост из библиотеки: не повторяет тему/id до полного цикла
+    рубрики и не повторяет тему за последние 45 публикаций (раздел 9 задачи)."""
+    pool = channel_library_by_category(category)
+    if not pool:
+        return None
+    cycle_len = max(len(pool) - 1, 0)
+    recent_in_category = _recent_channel_topics_for_category(category, limit=cycle_len + 45 + 5)
+    banned_topics = set(recent_in_category[:cycle_len]) | _recent_channel_topics(45) | set(exclude_topics)
+    candidates = [item for item in pool if item["topic"] not in banned_topics]
+    if not candidates:
+        candidates = [item for item in pool if item["topic"] not in exclude_topics] or list(pool)
+    return rnd.choice(candidates)
 
 CHANNEL_SYSTEM_PROMPT = (
-    "Ты редактор полезного канала «Я МАМА» в MAX для беременных и родителей детей до 7 лет. "
-    "Пиши живо, тепло и естественно, без ощущения нейросетевой статьи. "
-    "Не изображай врача и не придумывай истории реальных подписчиц. "
-    "Не вставляй несуществующие исследования, ссылки, точные проценты или спорные медицинские дозировки. "
-    "Медицинские темы подавай осторожно: объясняй общие ориентиры, красные флаги и необходимость очной помощи. "
-    "Не используй канцелярит, длинное вступление, хэштеги и фразы «важно помнить», «давайте разберёмся». "
-    "Каждый пост должен иметь одну ясную мысль и практическую пользу. "
-    "Не повторяй темы и формулировки из истории публикаций."
+    "Ты ведёшь канал «Мамин помощник» в MAX — полезно о детях, семье и родительской жизни простыми человеческими "
+    "словами. Твой голос — это голос отца троих дочерей, но ты не обязан быть героем каждого поста и не должен "
+    "ежедневно сочинять события своей семьи: тебе запрещено выдумывать конкретные биографические события автора, "
+    "жены и дочерей. Настоящие личные истории — отдельная серия и не твоя задача. "
+    "Пиши простым разговорным русским языком, обращайся к читателям напрямую, абзацы разной длины, лёгкий юмор "
+    "и самоирония уместны, конкретика и практическая польза обязательны, переходы между мыслями естественные. "
+    "Каждый пост должен звучать так, будто его написал живой человек, а не нейросеть и не редакция. "
+    "Запрещено: сочинять ежедневные истории семьи автора; придумывать прямую речь детей; указывать возраст детей "
+    "в скобках вроде «старшая (11 лет)»; служебные заголовки-названия формата («История дня», «Семейная история», "
+    "«Полезный пост», «Ситуация из жизни»); название рубрики в тексте поста; сценические ремарки в скобках; "
+    "искусственные диалоги; обязательный счастливый финал; мораль в конце; высокопарные метафоры; журнальный или "
+    "канцелярский язык; странные литературные обороты; образ идеального и мудрого отца; одинаковая композиция "
+    "каждый день; фальшивые исследования и статистика; советы, приписанные врачам или психологам без источника; "
+    "диагнозы; назначение лечения; гарантированный результат. "
+    "Особенно запрещены фразы: «И тут я понял…», «В такие моменты понимаешь…», «Ссоры временны, а дружба навсегда», "
+    "«Как важно создавать пространство…», «Жизнь внесла свои коррективы», «Серые тучи сгущались», «Мораль этой "
+    "истории», «Каждая мама должна», «Важно помнить», «Давайте разберёмся», «По мнению экспертов» без конкретного "
+    "проверенного источника, «каждый ребёнок уникален», «главное — сохранять спокойствие», «это нормально», "
+    "«в современном мире», «ни для кого не секрет», «внешняя сторона семьи», «бешеный диссонанс», «полная "
+    "безысходность», «хорошая мама должна», «хорошая мама обязана», «это важная тема для родителей», «это может "
+    "быть стрессовым моментом», «непростой процесс». "
+    "Не давай советы без конкретики вроде «просто будьте рядом», «уделите ребёнку внимание», «создайте атмосферу "
+    "поддержки», «следите за состоянием» — если даёшь такой совет, сразу поясни, что именно делать: что сказать, "
+    "что сделать руками, сколько минут, что именно наблюдать. Вместо «поддержите ребёнка» пиши «сядьте рядом», "
+    "«скажите, что будет происходить», «предложите выбрать игрушку» — конкретное действие вместо общего лозунга. "
+    "Не начинай пост с общих фраз вроде «Сегодня я хочу поговорить о важной теме», «В современном мире родители "
+    "часто сталкиваются», «Давайте разберёмся», «Важно помнить», «Гаджеты — важная тема для родителей», "
+    "«Воспитание детей — непростой процесс». Начинай сразу с конкретной ситуации, вопроса или факта, как будто "
+    "читатель уже в середине разговора, например: «Если ребёнок боится уколов, фраза 'не бойся' часто не "
+    "помогает», «Ребёнок снова говорит, что не хочет в садик», «Этот ужин можно приготовить за 25 минут». "
+    "Ты — мужчина, отец троих дочерей, ведущий канала, а не герой каждого текста: фразы вроде «с тремя детьми "
+    "быстро понимаешь одну вещь…», «мне как папе это тоже знакомо» уместны изредка и только по смыслу, не в "
+    "каждом посте; формальные вставки авторства без содержания («я сам это чувствую», «на мой взгляд» без "
+    "продолжения мысли) запрещены. "
+    "Никогда не выдумывай сцены и цитаты, поданные как реальные сегодняшние или вчерашние события — что "
+    "сказала бабушка, жена, ребёнок или сосед, что случилось только что дома у автора. Готовая фраза для "
+    "разговора с ребёнком — это совет читателю, что сказать («скажите: 'я рядом'»), а не цитата в кавычках "
+    "с припиской «сказала», «заявила», «эта фраза сегодня звучала» — так писать запрещено. "
+    "Каждый пост обязан дать читателю конкретный результат: чек-лист, последовательность действий, рецепт, "
+    "готовую фразу для разговора с ребёнком, вопросы врачу, понятное правило или наблюдение. Если после текста "
+    "нельзя ответить, что именно читатель узнал, сохранил или сможет попробовать — текст не годится. "
+    "Не заканчивай пост фразами «всё обязательно получится», «главное — любовь», «семья — это самое важное», "
+    "«каждый момент бесценен», «детство проходит быстро» — заверши конкретным выводом, вопросом, предложением "
+    "сохранить пост или уместным по теме CTA. "
+    "Про здоровье пиши только информационно и организационно: наблюдения, дневник симптомов, вопросы врачу, режим "
+    "сна, напоминание обратиться за медицинской помощью — без диагнозов, без дозировок, без замены врача. Точные "
+    "возрастные нормы, нормы сна, экранного времени и другие цифры без проверенного источника не выдумывай — "
+    "используй осторожные формулировки вроде «ориентируйтесь на рекомендации своего педиатра» или «нормы "
+    "индивидуальны и зависят от ситуации». "
+    "Не придумывай реальные даты, города, новости, исследования или статистику. Не обрывай текст на середине слова "
+    "или фразы. Каждый пост должен отличаться от недавних по теме, началу и структуре — не используй одинаковое "
+    "начало и одну и ту же композицию постоянно. Один естественный вопрос читателям или просьба поделиться опытом "
+    "уместны не в каждом посте, а изредка и по смыслу."
 )
 
 
@@ -3357,45 +4315,92 @@ def normalize_for_similarity(text):
     return " ".join(re.sub(r"[^а-яёa-z0-9 ]", " ", (text or "").lower()).split())
 
 
-def is_channel_post_too_similar(title, text, threshold=0.66):
+def is_channel_post_too_similar(title, text, threshold=0.66, edge_threshold=0.8):
+    """Сравнивает не только общий текст, но и начало/конец — против повтора сюжета, героя и развязки."""
     from difflib import SequenceMatcher
     candidate = normalize_for_similarity(f"{title} {text}")[:1200]
     if not candidate:
         return True
-    for old_title, _, _, old_text in get_recent_channel_posts(20):
+    candidate_body = normalize_for_similarity(text)
+    candidate_start = candidate_body[:220]
+    candidate_end = candidate_body[-220:]
+    for old_title, _, _, old_text in get_recent_channel_posts(35):
         previous = normalize_for_similarity(f"{old_title} {old_text}")[:1200]
         if previous and SequenceMatcher(None, candidate, previous).ratio() >= threshold:
+            return True
+        old_body = normalize_for_similarity(old_text)
+        old_start = old_body[:220]
+        old_end = old_body[-220:]
+        if old_start and candidate_start and SequenceMatcher(None, candidate_start, old_start).ratio() >= edge_threshold:
+            return True
+        if old_end and candidate_end and SequenceMatcher(None, candidate_end, old_end).ratio() >= edge_threshold:
             return True
     return False
 
 
-def fallback_channel_post(slot, theme, format_name):
-    """Резервный пост, чтобы канал не останавливался при недоступности AI."""
-    theme_low = (theme or "").lower()
-    if "сон" in theme_low:
-        subject = "сон ребёнка"
-        action = "Сегодня отметьте время засыпания и пробуждения — даже две записи уже полезнее, чем попытка вспомнить всё вечером."
-    elif any(x in theme_low for x in ("питан", "корм", "гв", "прикорм")):
-        subject = "питание и кормления"
-        action = "Сегодня запишите хотя бы одно кормление: время, продолжительность и то, как чувствовал себя малыш."
-    elif any(x in theme_low for x in ("здоров", "симптом", "врач")):
-        subject = "здоровье ребёнка"
-        action = "Если что-то настораживает, запишите время появления симптома, температуру и изменения в поведении — это поможет врачу увидеть картину точнее."
-    elif any(x in theme_low for x in ("эмоц", "устал", "тревог", "мам")):
-        subject = "состояние мамы"
-        action = "Выберите сегодня одно действие, которое действительно уменьшит нагрузку: попросить о помощи, перенести необязательное дело или отдохнуть 15 минут без чувства вины."
-    elif any(x in theme_low for x in ("развит", "игр", "речь")):
-        subject = "развитие ребёнка"
-        action = "Проведите десять спокойных минут без телефона: поговорите, назовите предметы вокруг или повторите любимую игру малыша."
-    else:
-        subject = "спокойный день с ребёнком"
-        action = "Не пытайтесь сделать всё идеально. Выберите одно важное дело для ребёнка и одно маленькое действие для себя."
+def looks_like_full_recipe(text):
+    """Грубая проверка: рецепт должен содержать количества и шаги, а не просто идею блюда."""
+    import re
+    value = (text or "").lower()
+    has_quantity = bool(re.search(r"\d+\s*(г\b|мл|ст\.?\s*л|ч\.?\s*л|шт\b|стакан|минут|мин\b|градус|°)", value))
+    has_steps = value.count("\n") >= 3 or len(re.findall(r"\d+[.)]", value)) >= 3
+    return bool(has_quantity and has_steps and len(text or "") >= 400)
 
-    if slot in ("08:00", "morning"):
-        return "Один спокойный шаг на сегодня", f"Сегодняшняя тема — {subject}.\n\n{action}\n\nМаленькие повторяющиеся действия дают больше пользы, чем редкие идеальные дни."
-    if slot in ("13:00", "afternoon"):
-        return "Практичный ориентир для мамы", f"Когда дел много, полезно опираться не на память, а на простую систему.\n\nТема дня: {subject}.\n\n1. Зафиксируйте один важный факт.\n2. Отметьте, что изменилось по сравнению со вчера.\n3. Запишите один вопрос, который стоит обсудить со специалистом или близкими.\n4. Не делайте выводов по одному эпизоду — смотрите на динамику.\n\n{action}"
-    return "День не обязан быть идеальным", f"Сегодня мы говорили про {subject}.\n\nВечером достаточно ответить себе на два вопроса: что сегодня получилось и что можно упростить завтра.\n\nЗабота о семье начинается не с идеальности, а с устойчивости."
+
+CHANNEL_FORBIDDEN_PHRASES = (
+    "каждый ребёнок уникален", "важно помнить", "давайте разберёмся", "главное — сохранять спокойствие",
+    "главное - сохранять спокойствие", "это нормально", "в современном мире", "ни для кого не секрет",
+    "внешняя сторона семьи", "бешеный диссонанс", "полная безысходность", "жизнь внесла свои коррективы",
+    "в такие моменты понимаешь", "и тут я понял", "мораль этой истории", "каждая мама должна",
+    "хорошая мама должна", "хорошая мама обязана", "создайте атмосферу поддержки", "просто будьте рядом",
+    "уделите ребёнку внимание", "следите за состоянием", "это важная тема для родителей",
+    "это может быть стрессовым моментом", "непростой процесс", "серые тучи сгущались",
+    "ссоры временны, а дружба навсегда", "всё обязательно получится", "главное — любовь",
+    "главное - любовь", "семья — это самое важное", "семья - это самое важное", "каждый момент бесценен",
+    "детство проходит быстро",
+)
+
+CHANNEL_BAD_OPENING_PHRASES = (
+    "сегодня я хочу поговорить", "в современном мире родители", "каждый ребёнок уникален",
+    "ни для кого не секрет", "давайте разберёмся", "важно помнить", "главное — сохранять спокойствие",
+    "главное - сохранять спокойствие", "это может быть стрессовым моментом",
+    "гаджеты — важная тема для родителей", "гаджеты - важная тема для родителей",
+    "воспитание детей — непростой процесс", "воспитание детей - непростой процесс",
+)
+
+
+def channel_post_quality_issues(text, category):
+    """Автоматическая проверка перед публикацией: запрещённые шаблоны, обрыв текста, отсутствие конкретики."""
+    import re
+    value = (text or "").strip()
+    if not value:
+        return ["пустой текст"]
+    low = value.lower()
+    issues = []
+    for phrase in CHANNEL_FORBIDDEN_PHRASES:
+        if phrase in low:
+            issues.append(f"запрещённая шаблонная фраза: «{phrase}»")
+    opening = low[:180]
+    for phrase in CHANNEL_BAD_OPENING_PHRASES:
+        if phrase in opening:
+            issues.append(f"шаблонное вступление: «{phrase}»")
+    if value[-1] not in ".!?…»\")":
+        issues.append("текст обрывается без завершающего знака препинания")
+    dialogue_pattern = re.search(
+        r"(?:«[^»]{3,90}»|\"[^\"]{3,90}\")\s*[—\-,]?\s*(?:сказал\w*|спросил\w*|заявил\w*|воскликнул\w*|"
+        r"ответил\w*|прошептал\w*|произнес\w*|произнёс\w*|эта фраза\s+(?:сегодня|вчера|на днях)?\s*"
+        r"(?:звучал\w*|прозвучал\w*))",
+        value, re.I,
+    )
+    if dialogue_pattern:
+        issues.append("похоже на выдуманный диалог или цитату, поданную как реальное событие")
+    if category != "DAD" and len(value) > 250:
+        has_digits = bool(re.search(r"\d", value))
+        has_list = bool(re.search(r"(?:^|\n)\s*(?:[-•]|\d+[.)])\s+\S", value))
+        has_quote = "«" in value or "'" in value
+        if not (has_digits or has_list or has_quote):
+            issues.append("нет конкретики: ни цифр, ни списка, ни готовой фразы для разговора")
+    return issues
 
 
 def trim_channel_post_body(text, max_chars):
@@ -3432,114 +4437,130 @@ def trim_channel_post_body(text, max_chars):
     return candidate.rstrip(" ,;:-") + "…"
 
 
-def parse_generated_channel_post(raw):
-    raw = (raw or "").replace("**", "").strip()
-    title = "Полезное для мамы"
-    body = raw
-    if raw.startswith("ЗАГОЛОВОК:"):
-        first, _, rest = raw.partition("\n")
-        title = first.replace("ЗАГОЛОВОК:", "", 1).strip() or title
-        body = rest.strip()
-    elif "\n" in raw:
-        first, rest = raw.split("\n", 1)
-        if len(first) <= 90:
-            title = first.strip(" —:•") or title
-            body = rest.strip()
-    return title[:100], body
+CHANNEL_ADAPTATION_SYSTEM_PROMPT = (
+    "Ты редактор канала «Мамин помощник» в MAX. Тебе дают готовый, уже проверенный пост. "
+    "Разрешено ТОЛЬКО: слегка изменить вступление, поменять местами два-три абзаца (если "
+    "смысл не меняется), адаптировать обращение к читателю, немного сократить или "
+    "расширить текст, изменить финальный вопрос. Категорически запрещено: придумывать "
+    "новые факты, менять любые цифры и количества, менять рецепт, менять шаги "
+    "приготовления, менять медицинский смысл, добавлять личные истории или прямую речь, "
+    "добавлять статистику и исследования, менять итоговый смысл текста. Верни только "
+    "финальный текст поста без пояснений и без заголовка."
+)
 
 
-async def generate_channel_post(slot, theme, format_name, instruction, max_chars, with_bot_bridge=False):
-    history = channel_history_for_prompt()
-    bridge = (
-        "В конце добавь один естественный переход к конкретной функции личного бота — не продавай подписку напрямую. "
-        "Подходящие функции: персональный план «Сегодня», дневник сна, трекер кормлений, сводка к врачу, "
-        "недельный отчёт, тревожная кнопка «Ребёнку плохо», психолог. "
-        if with_bot_bridge else
-        "Не упоминай бот и не продавай ничего."
-    )
+def _channel_number_tokens(text):
+    import re
+    return sorted(re.findall(r"\d+[.,]?\d*", text or ""))
+
+
+async def try_channel_ai_adaptation(category, item):
+    """Необязательная лёгкая AI-адаптация готового поста (раздел 7 задачи). Отключена по
+    умолчанию через CHANNEL_AI_ADAPTATION_ENABLED и не вызывается для рецептов и
+    медицинских материалов (см. channel_post_from_library). Адаптация принимается только
+    если цифры и объём текста не изменились и текст проходит тот же quality gate, что и
+    обычная библиотека — иначе используется исходный проверенный текст без изменений."""
+    original = item["body"]
     prompt = (
-        f"Время публикации: {slot}.\n"
-        f"Тема дня: {theme}.\n"
-        f"Формат: {format_name}.\n"
-        f"Задача: {instruction}.\n"
-        f"Ограничение: до {max_chars} знаков. Короткие абзацы, удобно читать одной рукой.\n"
-        f"{bridge}\n"
-        "Верни текст в формате:\nЗАГОЛОВОК: короткий цепляющий заголовок\nтекст поста\n\n"
-        "Недавние публикации, которые нельзя повторять:\n"
-        f"{history}"
+        f"Готовый пост рубрики «{item.get('format_name', '')}», тема: {item.get('topic', '')}.\n"
+        "Исходный текст:\n" + original + "\n\n"
+        "Сделай разрешённую лёгкую редакционную правку и верни только новый текст поста целиком."
     )
-    last_error = None
-    for _ in range(3):
-        try:
-            raw = await generate_text(CHANNEL_SYSTEM_PROMPT, prompt, model="gpt-4o-mini")
-        except Exception as exc:
-            last_error = str(exc)
+    raw = await generate_text(CHANNEL_ADAPTATION_SYSTEM_PROMPT, prompt, model="gpt-4o-mini")
+    if not ai_answer_success(raw):
+        return None
+    candidate = clean_text(raw or "").strip()
+    if not candidate:
+        return None
+    if _channel_number_tokens(candidate) != _channel_number_tokens(original):
+        logging.warning("Канал MAX: адаптация %s изменила цифры, используется оригинал", item.get("id"))
+        return None
+    if not (0.5 * len(original) <= len(candidate) <= 1.8 * len(original)):
+        return None
+    if channel_post_quality_issues(candidate, category):
+        return None
+    return candidate
+
+
+async def channel_post_from_library(slot, category, item):
+    """Готовит библиотечный пост к публикации: опциональная лёгкая AI-адаптация (см. флаг
+    CHANNEL_AI_ADAPTATION_ENABLED выше), затем защитная проверка тем же quality gate, что
+    и раньше. Если вариант не проходит проверку или похож на недавние публикации — берёт
+    другой готовый пост из той же рубрики вместо технического сообщения (раздел 8 задачи).
+    Возвращает (title, body, item) — item может быть заменён на резервный."""
+    candidate_item = item
+    max_chars = CHANNEL_LIBRARY_MAX_CHARS.get(category, 1800)
+    title = candidate_item.get("title") or ""
+    body = candidate_item["body"]
+    can_adapt = CHANNEL_AI_ADAPTATION_ENABLED and category != "REC" and not candidate_item.get("medical")
+    if can_adapt:
+        adapted = await try_channel_ai_adaptation(category, candidate_item)
+        if adapted:
+            body = adapted
+    body = trim_channel_post_body(body, max_chars)
+    tried_topics = {candidate_item["topic"]}
+    attempts = 0
+    while (channel_post_quality_issues(body, category) or is_channel_post_too_similar(title, body)) and attempts < 3:
+        rnd = random.Random(f"library-fallback:{slot}:{candidate_item['id']}:{attempts}")
+        next_item = select_channel_library_post(category, rnd, exclude_topics=tried_topics)
+        if not next_item:
             break
-        title, body = parse_generated_channel_post(raw)
-        body = trim_channel_post_body(body, max_chars)
-        if body and not is_channel_post_too_similar(title, body):
-            return title, body
-        prompt += "\nПредыдущий вариант оказался слишком похож на старые публикации. Выбери совершенно другой угол и примеры."
+        candidate_item = next_item
+        tried_topics.add(candidate_item["topic"])
+        title = candidate_item.get("title") or ""
+        body = trim_channel_post_body(candidate_item["body"], max_chars)
+        attempts += 1
+    return title, body, candidate_item
 
-    title, body = fallback_channel_post(slot, theme, format_name)
-    logging.error("Канал MAX: AI-текст недоступен, опубликован резервный пост. Причина: %s", last_error or "нет уникального ответа")
-    try:
-        await send_message(OWNER_ID, f"⚠️ Канал MAX: AI-генерация недоступна. Для слота {slot} будет опубликован резервный пост.")
-    except Exception as exc:
-        logging.error("Канал MAX: не удалось уведомить владельца об ошибке AI: %s", exc)
-    return title, trim_channel_post_body(body, max_chars)
+CHANNEL_CTA_CATALOG = {
+    "sleep": ("🌙 Общие нормы не учитывают возраст и ваш режим. Получите бесплатный персональный разбор сна.",
+              "🌙 Разобрать сон ребёнка", "channel_sleep"),
+    "feeding": ("🥣 Получите рекомендацию по кормлению с учётом возраста и вашей ситуации.",
+                "🥣 Разобрать питание ребёнка", "channel_feeding"),
+    "doctor": ("🩺 Опишите наблюдения — помощник бесплатно соберёт важное и подготовит вопросы врачу.",
+               "🩺 Подготовить вопросы врачу", "channel_doctor"),
+    "development": ("👶 Проверьте навык или поведение с учётом точного возраста ребёнка.",
+                     "👶 Проверить развитие", "channel_child"),
+    "psycho": ("🤍 Опишите, что происходит. Первый персональный разбор поможет спокойно увидеть следующий шаг.",
+               "🤍 Разобрать мою ситуацию", "channel_psycho"),
+    "family": ("👨‍👩‍👧 Опишите ситуацию и получите спокойный план следующего разговора.",
+               "👨‍👩‍👧 Подготовить разговор", "channel_family"),
+    "pregnancy": ("🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
+                  "🤰 Открыть помощника", "channel_pregnancy"),
+    "generic": ("✨ В «Мамином помощнике» можно получить подсказку именно для вашей ситуации и возраста ребёнка.",
+                "✨ Открыть помощника на сегодня", "channel_today"),
+}
 
-
-def channel_funnel_for_post(theme="", title="", body="", format_name=""):
-    """Подбирает тематический мостик и CTA для каждого поста MAX-канала."""
-    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
-    rules = [
-        (("сон", "недосып", "засып", "пробуж"),
-         "🌙 Общие нормы не учитывают возраст и ваш режим. Получите бесплатный персональный разбор сна.",
-         "🌙 Разобрать сон ребёнка"),
-        (("корм", "гв", "груд", "прикорм", "питан", "смесь"),
-         "🥣 Получите рекомендацию по кормлению с учётом возраста и вашей ситуации.",
-         "🥣 Разобрать питание ребёнка"),
-        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"),
-         "🩺 Опишите наблюдения — помощник бесплатно соберёт важное и подготовит вопросы врачу.",
-         "🩺 Подготовить вопросы врачу"),
-        (("развит", "возраст", "игр", "заняти", "навык", "речь"),
-         "👶 Проверьте навык или поведение с учётом точного возраста ребёнка.",
-         "👶 Проверить развитие"),
-        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"),
-         "🤍 Опишите, что происходит. Первый персональный разбор поможет спокойно увидеть следующий шаг.",
-         "🤍 Разобрать мою ситуацию"),
-        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"),
-         "👨‍👩‍👧 Опишите ситуацию и получите спокойный план следующего разговора.",
-         "👨‍👩‍👧 Подготовить разговор"),
-        (("беремен", "род", "восстанов", "срок"),
-         "🤰 Получите персональную подсказку для вашего срока или этапа восстановления.",
-         "🤰 Открыть помощника"),
-    ]
-    for keywords, bridge, button in rules:
-        if any(word in text for word in keywords):
-            return bridge, button
-    return (
-        "✨ В «Мамином помощнике» можно получить подсказку именно для вашей ситуации и возраста ребёнка.",
-        "✨ Открыть помощника на сегодня",
-    )
+# Допустимые для CTA рубрики автопостинга и, для каждой рубрики, безопасный дефолт.
+# CTA выбирается ТОЛЬКО по metadata библиотечного поста (cta_allowed), без сканирования
+# текста по ключевым словам (раздел 10 задачи: "запрещено выбирать CTA по случайному
+# совпадению слова внутри текста"). Если у поста нет ни одного допустимого для его
+# рубрики cta_allowed — CTA не показывается вовсе (см. post_max_slot).
+CHANNEL_CTA_ALLOWED_BY_CATEGORY = {
+    "HEALTH": (("doctor", "sleep", "feeding"), "doctor"),
+    "WHATIF": (("sleep", "family", "psycho"), "psycho"),
+    "AGE": (("development",), "development"),
+    "MOM": (("psycho",), "psycho"),
+    "FAM": (("family",), "family"),
+    "SAVE": (("sleep", "feeding", "doctor", "development", "family"), "generic"),
+}
 
 
-def channel_start_payload(theme="", title="", body="", format_name=""):
-    text = " ".join([theme or "", title or "", body or "", format_name or ""]).lower()
-    rules = [
-        (("сон", "недосып", "засып", "пробуж"), "channel_sleep"),
-        (("корм", "гв", "груд", "прикорм", "питан", "смесь"), "channel_feeding"),
-        (("врач", "симптом", "здоров", "температур", "сып", "лекар", "боле", "педиатр"), "channel_doctor"),
-        (("истер", "каприз", "эмоц", "устал", "тревог", "вина", "психолог", "выгор"), "channel_psycho"),
-        (("беремен", "род", "восстанов", "срок"), "channel_pregnancy"),
-        (("развит", "возраст", "игр", "заняти", "навык", "речь"), "channel_child"),
-        (("отношен", "муж", "пап", "семь", "бабуш", "партн", "близост"), "channel_family"),
-    ]
-    for keywords, payload in rules:
-        if any(word in text for word in keywords):
-            return payload
-    return "channel_today"
+def channel_cta_for_post(category, cta_allowed=()):
+    """Возвращает (текст-мостик, текст кнопки, payload) строго по метаданным поста:
+    первый ключ из разрешённых для рубрики, который также есть в cta_allowed поста."""
+    allowed_keys, default_key = CHANNEL_CTA_ALLOWED_BY_CATEGORY.get(category, ((), "generic"))
+    cta_allowed = cta_allowed or ()
+    for key in allowed_keys:
+        if key in cta_allowed:
+            return CHANNEL_CTA_CATALOG[key]
+    return CHANNEL_CTA_CATALOG[default_key]
+
+
+def channel_has_allowed_cta(category, cta_allowed=()):
+    allowed_keys, _ = CHANNEL_CTA_ALLOWED_BY_CATEGORY.get(category, ((), "generic"))
+    cta_allowed = cta_allowed or ()
+    return any(key in cta_allowed for key in allowed_keys)
 
 
 def max_bot_deeplink(payload="channel_today"):
@@ -3554,8 +4575,8 @@ def channel_open_button(text="✨ Открыть помощника на сег�
     return [[{"type": "link", "text": text, "url": max_bot_deeplink(payload)}]]
 
 
-async def send_to_channel(text, buttons=None, bot_button_text="✨ Открыть помощника на сегодня", image_payload=None, start_payload="channel_today"):
-    """Отправляет пост с обязательной кликабельной кнопкой и резервной ссылкой, при наличии — с изображением."""
+async def send_to_channel(text, buttons=None, bot_button_text="✨ Открыть помощника на сегодня", image_payload=None, start_payload="channel_today", force_bot_button=True):
+    """Отправляет пост в канал. Кнопка-ссылка на бота добавляется только если force_bot_button=True (не на каждый пост)."""
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
     raw_text = (text or "").strip()
     final_text = raw_text[:MAX_TEXT_LIMIT].rstrip()
@@ -3567,7 +4588,7 @@ async def send_to_channel(text, buttons=None, bot_button_text="✨ Открыт�
         for button in row
         if isinstance(button, dict)
     )
-    if MAX_BOT_PUBLIC_URL and not has_bot_link_button:
+    if force_bot_button and MAX_BOT_PUBLIC_URL and not has_bot_link_button:
         final_buttons.append([
             {"type": "link", "text": bot_button_text, "url": max_bot_deeplink(start_payload)}
         ])
@@ -3604,29 +4625,14 @@ async def send_to_channel(text, buttons=None, bot_button_text="✨ Открыт�
         return False
 
 
-def _scheduled_slot_window_ok(slot, tolerance_seconds=300):
-    """Разрешает плановый запуск только рядом с точным временем, без поздних misfire-запусков."""
-    schedule = {"morning": (8, 0), "afternoon": (13, 0), "evening": (20, 0)}
-    if slot not in schedule:
-        return True
-    now = datetime.now(ZoneInfo("Europe/Moscow"))
-    hour, minute = schedule[slot]
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    delta = abs((now - target).total_seconds())
-    if delta > tolerance_seconds:
-        logging.warning("Канал: поздний/ранний запуск %s пропущен, отклонение %.0f сек.", slot, delta)
-        return False
-    return True
-
-
 def _channel_publish_lock_key(slot):
     """Одна публикация на слот и дату; блокирует дубли всего поста, а не генерацию картинки отдельно."""
     today = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
     return f"max_channel_publish:{today}:{slot}"
 
 
-async def publish_channel_post(slot, theme, format_name, title, body, with_button=True, button_text=None):
-    if not title or not body:
+async def publish_channel_post(slot, theme, format_name, title, body, cta_mode="none", category="", cta_allowed=None):
+    if not body:
         logging.warning("Канал: публикация %s пропущена — не удалось получить уникальный текст", slot)
         return
 
@@ -3635,24 +4641,32 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
         logging.warning("Канал: повторная публикация полностью заблокирована slot=%s", slot)
         return
 
-    bridge_text, thematic_button = channel_funnel_for_post(theme, title, body, format_name)
-    final_button_text = button_text or thematic_button
-    start_payload = channel_start_payload(theme, title, body, format_name)
-    final_text = f"{title}\n\n{body}\n\n{bridge_text}".strip()
+    final_text = f"{title}\n\n{body}".strip() if title else body.strip()
+    want_button = False
+    button_text = "✨ Открыть помощника на сегодня"
+    start_payload = "channel_today"
+    if cta_mode == "bot":
+        bridge_text, thematic_button, start_payload = channel_cta_for_post(category, cta_allowed or ())
+        final_text += f"\n\n{bridge_text}"
+        button_text = thematic_button
+        want_button = True
+    elif cta_mode == "question":
+        final_text += "\n\nА у вас было что-то похожее? Расскажите, интересно 🤍"
 
     try:
         ok = await send_to_channel(
             final_text,
             None,
-            final_button_text,
+            button_text,
             image_payload=None,
             start_payload=start_payload,
+            force_bot_button=want_button,
         )
         if ok:
             save_channel_post(slot, theme, format_name, title, final_text)
             logging.info(
                 "Канал: опубликовано %s | %s | %s | CTA=%s | start=%s | image=disabled",
-                slot, format_name, title, final_button_text, start_payload,
+                slot, format_name, title, cta_mode, start_payload,
             )
             return
 
@@ -3663,101 +4677,144 @@ async def publish_channel_post(slot, theme, format_name, title, body, with_butto
         logging.exception("Канал: ошибка публикации %s, блокировка снята: %s", slot, exc)
 
 
-async def post_morning():
-    if not _scheduled_slot_window_ok("morning"):
-        return
-    if channel_slot_published_today("morning"):
-        logging.info("Канал: утренний пост уже опубликован сегодня, повтор пропущен")
-        return
-    today = datetime.now(ZoneInfo("Europe/Moscow"))
-    theme = WEEKLY_EDITORIAL[today.weekday()]
-    format_name = MORNING_FORMATS[today.date().toordinal() % len(MORNING_FORMATS)]
-    title, body = await generate_channel_post(
-        "08:00", theme, format_name,
-        "Создай короткий утренний пост на 350–650 знаков. Он должен поддержать маму и дать одно маленькое выполнимое действие на сегодня.",
-        700, with_bot_bridge=False,
-    )
-    await publish_channel_post("morning", theme, format_name, title, body)
+MAX_CHANNEL_SLOTS = ("max_first", "max_second", "max_third")
+
+# Тот же принцип, что и в Telegram: недельный шаблон из 7 паттернов (утро/день/вечер) на 21 пост
+# по 8 рубрикам — ~4 рецепта, ~4 воспитание и поведение, ~3 здоровье/сон/врач, ~3 сад/школа/по
+# возрасту, ~2 мама тоже человек, ~2 папин взгляд, ~2 бабушки и семья, ~1 сохрани-пригодится
+# (резерв вместо личной истории без свежих фактов владельца). Порядок дней внутри недели тасуется
+# по seed на ISO-неделю; рубрики утра и вечера соседних дней никогда не совпадают ни при каком
+# порядке перестановки.
+MAX_CHANNEL_DAY_PATTERNS = [
+    ("REC", "WHATIF", "MOM"),
+    ("REC", "HEALTH", "DAD"),
+    ("REC", "AGE", "FAM"),
+    ("REC", "WHATIF", "MOM"),
+    ("HEALTH", "AGE", "DAD"),
+    ("AGE", "FAM", "WHATIF"),
+    ("HEALTH", "SAVE", "WHATIF"),
+]
 
 
-async def post_afternoon():
-    if not _scheduled_slot_window_ok("afternoon"):
-        return
-    if channel_slot_published_today("afternoon"):
-        logging.info("Канал: дневной пост уже опубликован сегодня, повтор пропущен")
-        return
-    today = datetime.now(ZoneInfo("Europe/Moscow"))
-    theme = WEEKLY_EDITORIAL[today.weekday()]
-    format_name = DAY_FORMATS[(today.date().toordinal() + today.weekday()) % len(DAY_FORMATS)]
-    title, body = await generate_channel_post(
-        "13:00", theme, format_name,
-        "Создай главный полезный материал дня на 1000–1800 знаков. Дай конкретный алгоритм, чек-лист или разбор ситуации. Материал должен хотеться сохранить или переслать. Не перегружай теорией.",
-        1900, with_bot_bridge=False,
-    )
-    await publish_channel_post("afternoon", theme, format_name, title, body)
+def _daily_max_format_plan(day_key):
+    dt = datetime.fromisoformat(day_key)
+    iso_year, iso_week, iso_weekday = dt.isocalendar()
+    patterns = list(MAX_CHANNEL_DAY_PATTERNS)
+    random.Random(f"max-channel-week:{iso_year}-W{iso_week}").shuffle(patterns)
+    pattern = patterns[iso_weekday - 1]
+    return dict(zip(MAX_CHANNEL_SLOTS, pattern))
 
 
-async def post_evening_poll():
-    if channel_slot_published_today("evening_poll"):
-        logging.info("Канал: вечерний опрос уже публиковался сегодня, повтор пропущен")
-        return
-    today = datetime.now(ZoneInfo("Europe/Moscow"))
-    polls = {
-        2: ("health", "Что сейчас тревожит вас сильнее всего?", [
-            ("sleep", "Сон ребёнка"), ("food", "Питание или прикорм"),
-            ("health", "Здоровье"), ("fatigue", "Моя усталость"),
-        ]),
-        6: ("week", "Что было самым сложным на этой неделе?", [
-            ("sleep", "Недосып"), ("tantrums", "Капризы ребёнка"),
-            ("time", "Нехватка времени"), ("anxiety", "Тревога и чувство вины"),
-        ]),
+def _daily_max_choice(day_key, slot, category):
+    rnd = random.Random(f"max-human-channel:{day_key}:{slot}")
+    return select_channel_library_post(category, rnd)
+
+
+def _daily_max_channel_plan(day_key, categories_by_slot):
+    """CTA-ссылка — детерминированно 3-4 раза в неделю, только в уместных рубриках."""
+    dt = datetime.fromisoformat(day_key)
+    iso_year, iso_week, _ = dt.isocalendar()
+    slots = list(MAX_CHANNEL_SLOTS)
+    week_start = dt - timedelta(days=dt.weekday())
+    eligible_by_day = {}
+    for offset in range(7):
+        week_day = (week_start + timedelta(days=offset)).date().isoformat()
+        weekly_categories = _daily_max_format_plan(week_day)
+        candidates = [
+            weekly_slot for weekly_slot in slots
+            if weekly_categories.get(weekly_slot) in ("HEALTH", "WHATIF", "AGE", "MOM", "FAM", "SAVE")
+        ]
+        if candidates:
+            eligible_by_day[week_day] = candidates
+    weekly_rnd = random.Random(f"max-human-cta-week:{iso_year}-W{iso_week}")
+    weekly_days = list(eligible_by_day)
+    weekly_rnd.shuffle(weekly_days)
+    weekly_limit = min(len(weekly_days), 3 + int(weekly_rnd.random() < 0.5))
+    weekly_cta = {
+        weekly_day: weekly_rnd.choice(eligible_by_day[weekly_day])
+        for weekly_day in weekly_days[:weekly_limit]
     }
-    poll_data = polls.get(today.weekday())
-    if not poll_data:
-        logging.warning("Канал: для weekday=%s вечерний опрос не настроен", today.weekday())
-        return
-    poll_key_base, question, options = poll_data
-    poll_key = f"{poll_key_base}{today.strftime('%y%m%d')}"
-    buttons = [[{
-        "type": "link",
-        "text": label,
-        "url": max_bot_deeplink(f"channel_poll_{poll_key}_{key}"),
-    }] for key, label in options]
-    poll_bridge, poll_button = channel_funnel_for_post(
-        WEEKLY_EDITORIAL[today.weekday()], question, " ".join(label for _, label in options), "опрос"
-    )
-    image_payload = None
-    start_payload = channel_start_payload(WEEKLY_EDITORIAL[today.weekday()], question, " ".join(label for _, label in options), "опрос")
-    ok = await send_to_channel(
-        f"📊 {question}\n\nВыберите один вариант — ответ сохранится анонимно для других участников.\n\n{poll_bridge}",
-        buttons,
-        poll_button,
-        image_payload=image_payload,
-        start_payload=start_payload,
-    )
-    if ok:
-        save_channel_post("evening_poll", WEEKLY_EDITORIAL[today.weekday()], "опрос", question, " | ".join(label for _, label in options))
-        logging.info("Канал: опубликован опрос | %s | image=%s", question, "yes" if image_payload else "no")
+    cta_slot = weekly_cta.get(day_key)
+    rnd = random.Random(f"max-human-question:{day_key}")
+    question_eligible = [s for s in slots if s != cta_slot and categories_by_slot.get(s) != "REC"]
+    question_slot = rnd.choice(question_eligible) if question_eligible and rnd.random() < 0.4 else None
+    return cta_slot, question_slot
 
 
-async def post_evening():
-    if not _scheduled_slot_window_ok("evening"):
+async def post_max_slot(slot):
+    if channel_slot_published_today(slot):
         return
-    if channel_slot_published_today("evening") or channel_slot_published_today("evening_poll"):
-        logging.info("Канал: вечерняя публикация уже была сегодня, повтор пропущен")
+    day_key = datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    categories_by_slot = _daily_max_format_plan(day_key)
+    category = categories_by_slot[slot]
+    item = _daily_max_choice(day_key, slot, category)
+    if not item:
+        logging.error("Канал MAX: библиотека пуста для рубрики %s, публикация пропущена", category)
         return
-    today = datetime.now(ZoneInfo("Europe/Moscow"))
-    if today.weekday() in (2, 6):
-        await post_evening_poll()
-        return
-    theme = WEEKLY_EDITORIAL[today.weekday()]
-    format_name = EVENING_FORMATS[(today.date().toordinal() * 3) % len(EVENING_FORMATS)]
-    title, body = await generate_channel_post(
-        "20:00", theme, format_name,
-        "Создай вечерний пост на 550–1000 знаков. Он должен вызывать узнавание, реакцию или желание ответить себе на вопрос. Не повторяй дневной материал и не пиши длинную лекцию.",
-        1100, with_bot_bridge=False,
+    cta_slot, question_slot = _daily_max_channel_plan(day_key, categories_by_slot)
+    if slot == cta_slot:
+        cta_mode = "bot"
+    elif slot == question_slot:
+        cta_mode = "question"
+    else:
+        cta_mode = "none"
+    if cta_mode == "bot" and not channel_has_allowed_cta(category, item.get("cta_allowed", [])):
+        tried_topics = {item["topic"]}
+        for attempt in range(6):
+            cta_item = select_channel_library_post(
+                category,
+                random.Random(f"max-cta-library:{day_key}:{slot}:{attempt}"),
+                exclude_topics=tried_topics,
+            )
+            if not cta_item:
+                break
+            tried_topics.add(cta_item["topic"])
+            if channel_has_allowed_cta(category, cta_item.get("cta_allowed", [])):
+                item = cta_item
+                break
+    title, body, used_item = await channel_post_from_library(slot, category, item)
+    if cta_mode == "bot" and not channel_has_allowed_cta(category, used_item.get("cta_allowed", [])):
+        cta_mode = "none"
+    await publish_channel_post(slot, used_item["topic"], used_item["format_name"], title, body, cta_mode, category, used_item.get("cta_allowed", []))
+
+async def post_max_first():
+    await post_max_slot("max_first")
+
+
+async def post_max_second():
+    await post_max_slot("max_second")
+
+
+async def post_max_third():
+    await post_max_slot("max_third")
+
+
+_max_channel_scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+
+
+def schedule_daily_max_posts():
+    today = datetime.now(ZoneInfo("Europe/Moscow")).date()
+    rnd = random.Random(f"max-human-times:{today.isoformat()}")
+    windows = ((8 * 60 + 30, 11 * 60 + 30), (13 * 60 + 30, 16 * 60 + 30), (18 * 60, 21 * 60 + 30))
+    minutes = []
+    for lo, hi in windows:
+        candidates = [minute for minute in range(lo, hi + 1) if minute % 60 % 5 != 0]
+        minutes.append(rnd.choice(candidates))
+    tz = ZoneInfo("Europe/Moscow")
+    midnight = datetime.combine(today, datetime.min.time(), tzinfo=tz)
+    job_ids = ("mama_max_channel_first", "mama_max_channel_second", "mama_max_channel_third")
+    targets = (post_max_first, post_max_second, post_max_third)
+    for job_id in job_ids:
+        try:
+            _max_channel_scheduler.remove_job(job_id)
+        except Exception:
+            pass
+    for job_id, target, minute in zip(job_ids, targets, minutes):
+        _max_channel_scheduler.add_job(target, "date", run_date=midnight + timedelta(minutes=minute), id=job_id, replace_existing=True, misfire_grace_time=30)
+    logging.info(
+        "Канал MAX: посты на сегодня запланированы на %02d:%02d, %02d:%02d и %02d:%02d",
+        minutes[0] // 60, minutes[0] % 60, minutes[1] // 60, minutes[1] % 60, minutes[2] // 60, minutes[2] % 60,
     )
-    await publish_channel_post("evening", theme, format_name, title, body)
 
 
 async def channel_weekly_editorial_report():
@@ -3769,28 +4826,20 @@ async def channel_weekly_editorial_report():
     ).fetchall()
     total = conn.execute("SELECT COUNT(*) FROM channel_posts WHERE created_at>=?", (week_ago,)).fetchone()[0]
     last_post = conn.execute("SELECT created_at, slot, title FROM channel_posts ORDER BY created_at DESC LIMIT 1").fetchone()
-    vote_rows = conn.execute(
-        "SELECT poll_key, option_key, COUNT(*) FROM channel_poll_votes WHERE created_at>=? GROUP BY poll_key, option_key ORDER BY poll_key, COUNT(*) DESC",
-        (week_ago,),
-    ).fetchall()
     conn.close()
 
     by_slot, by_format = {}, {}
     for slot, format_name, count in rows:
         by_slot[slot] = by_slot.get(slot, 0) + count
         by_format[format_name] = by_format.get(format_name, 0) + count
-    slot_labels = {"morning": "Утренних постов", "afternoon": "Полезных разборов", "evening": "Вечерних постов", "evening_poll": "Опросов"}
+    slot_labels = {"max_first": "Первых постов дня", "max_second": "Вторых постов дня", "max_third": "Третьих постов дня"}
     lines = ["📊 Отчёт MAX-канала за неделю", "", f"Опубликовано материалов: {total}"]
-    for slot in ("morning", "afternoon", "evening", "evening_poll"):
+    for slot in ("max_first", "max_second", "max_third"):
         lines.append(f"{slot_labels[slot]}: {by_slot.get(slot, 0)}")
     if by_format:
         lines.extend(["", "Форматы:"])
         for format_name, count in sorted(by_format.items(), key=lambda item: (-item[1], item[0])):
             lines.append(f"• {format_name} — {count}")
-    if vote_rows:
-        lines.extend(["", "Ответы в опросах:"])
-        for poll_key, option_key, count in vote_rows:
-            lines.append(f"• {poll_key}: {option_key} — {count}")
     if last_post:
         created_at, slot, title = last_post
         try: created_label = datetime.fromisoformat(created_at).strftime("%d.%m.%Y %H:%M")
@@ -3802,13 +4851,10 @@ async def channel_weekly_editorial_report():
 
 
 async def channel_posting_loop():
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler as _APScheduler
-    scheduler = _APScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(post_morning, "cron", hour=8, minute=0, id="mama_channel_morning", replace_existing=True, coalesce=True, misfire_grace_time=30, max_instances=1)
-    scheduler.add_job(post_afternoon, "cron", hour=13, minute=0, id="mama_channel_afternoon", replace_existing=True, coalesce=True, misfire_grace_time=30, max_instances=1)
-    scheduler.add_job(post_evening, "cron", hour=20, minute=0, id="mama_channel_evening", replace_existing=True, coalesce=True, misfire_grace_time=30, max_instances=1)
-    scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="mama_channel_weekly_report", replace_existing=True, coalesce=True, misfire_grace_time=60, max_instances=1)
-    scheduler.start()
+    schedule_daily_max_posts()
+    _max_channel_scheduler.add_job(schedule_daily_max_posts, "cron", hour=0, minute=12, id="mama_max_channel_daily_planner", replace_existing=True, coalesce=True, max_instances=1)
+    _max_channel_scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="mama_channel_weekly_report", replace_existing=True, coalesce=True, misfire_grace_time=60, max_instances=1)
+    _max_channel_scheduler.start()
     while True:
         await asyncio.sleep(3600)
 
@@ -3824,10 +4870,6 @@ async def startup():
     identity_ok = await refresh_max_bot_identity()
     if identity_ok and MAX_BOT_DEEPLINK:
         logging.info("Публичная ссылка MAX-бота для канала: %s", MAX_BOT_DEEPLINK)
-        try:
-            await send_message(OWNER_ID, f"✅ Ссылка канала на бота настроена:\n{MAX_BOT_DEEPLINK}\n\nОна будет публиковаться и текстом, и кнопкой.")
-        except Exception as exc:
-            logging.warning("Не удалось отправить владельцу диагностическую ссылку: %s", exc)
     else:
         logging.error("Публичная ссылка MAX-бота не определена в MAX_BOT_PUBLIC_URL.")
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
@@ -3840,6 +4882,7 @@ async def startup():
         logging.error(f"Ошибка регистрации webhook: {e}")
     asyncio.create_task(check_payments_loop())
     asyncio.create_task(channel_posting_loop())
+    asyncio.create_task(heartbeat_loop())
     logging.info("Мамин Помощник MAX запущен!")
 
 
@@ -3941,6 +4984,372 @@ def _run_webhook_task(coro, label):
     task.add_done_callback(_done)
     return task
 
+
+def save_max_chat_id(user_id, chat_id, update_type):
+    """Сохраняет соответствие user_id -> chat_id, полученное из реального входящего апдейта.
+    chat_id для приватного чата в MAX API отличается от user_id и без этого сохранения
+    проактивная отправка (POST /messages?chat_id=) для уже известных пользователей невозможна.
+    Ошибка записи не должна ронять обработку вебхука."""
+    if not user_id or not chat_id or chat_id == CHANNEL_ID:
+        return
+    try:
+        now = datetime.now().isoformat()
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO max_user_chats(user_id, chat_id, first_seen_at, updated_at, last_update_type) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id, "
+                "updated_at=excluded.updated_at, last_update_type=excluded.last_update_type",
+                (user_id, chat_id, now, now, update_type),
+            )
+    except Exception:
+        logging.error("save_max_chat_id: ошибка записи chat_id (update_type=%s)", update_type)
+
+
+def get_saved_max_chat_id(user_id):
+    """Возвращает приватный chat_id MAX для проактивной отправки, если он уже известен."""
+    if not user_id:
+        return None
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT chat_id FROM max_user_chats WHERE user_id=?", (user_id,)).fetchone()
+        return row[0] if row else None
+    except Exception:
+        logging.error("get_saved_max_chat_id: ошибка чтения chat_id для user_id=%s", user_id)
+        return None
+
+
+# Одноразовая безадресная доставка объявления о бесплатной модели тем MAX-пользователям,
+# чей исторический chat_id не восстановлен, — срабатывает при их следующем обращении.
+# Строго привязано к одному broadcast_key, легко отключается флагом ниже.
+MAX_PENDING_BROADCAST_ENABLED = True
+MAX_PENDING_BROADCAST_KEY = "mama_free_announcement_20260727"
+MAX_PENDING_BROADCAST_TEXT = (
+    "Дорогие родители! ❤️\n\n"
+    "Рады поделиться хорошей новостью: все текущие функции «Маминого помощника» "
+    "теперь доступны бесплатно.\n\n"
+    "Вы можете без подписки и обязательной оплаты пользоваться всеми разделами "
+    "помощника: задавать вопросы, вести трекеры, получать разборы сна и кормлений, "
+    "составлять сводки, пользоваться чек-листами и другими полезными возможностями.\n\n"
+    "Мы хотим, чтобы «Мамин помощник» действительно помогал родителям каждый день "
+    "— спокойно, понятно и без лишних ограничений.\n\n"
+    "Открывайте помощника и пользуйтесь всеми функциями бесплатно 🌿"
+)
+MAX_PENDING_BROADCAST_BUTTONS = [
+    [{"type": "callback", "text": "Открыть Мамин помощник", "payload": "main_menu"}],
+    [{"type": "callback", "text": "❤️ Поддержать проект", "payload": "donate_menu"}],
+]
+
+
+def _claim_max_broadcast(user_id, broadcast_key=MAX_PENDING_BROADCAST_KEY):
+    """Атомарно claim'ит право на отправку: no-op, если уже 'sent' или уже claimed
+    другим параллельным событием. Без await между проверкой и записью — гонки внутри
+    процесса исключены. broadcast_key параметризован, чтобы функцию можно было
+    переиспользовать для других одноразовых кампаний без дублирования логики."""
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO broadcast_log(broadcast_key, platform, user_id, status, error_code, ts) "
+            "VALUES (?, 'max', ?, 'claimed', '', ?) "
+            "ON CONFLICT(broadcast_key, platform, user_id) DO UPDATE SET status='claimed', ts=excluded.ts "
+            "WHERE broadcast_log.status NOT IN ('sent', 'claimed', 'forbidden')",
+            (broadcast_key, user_id, now),
+        )
+        return cur.rowcount == 1
+
+
+def _mark_max_broadcast(user_id, status, error_code="", broadcast_key=MAX_PENDING_BROADCAST_KEY):
+    now = datetime.now().isoformat()
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE broadcast_log SET status=?, error_code=?, ts=? "
+                "WHERE broadcast_key=? AND platform='max' AND user_id=?",
+                (status, str(error_code)[:200], now, broadcast_key, user_id),
+            )
+    except Exception:
+        logging.error("_mark_max_broadcast: ошибка обновления статуса broadcast_log")
+
+
+def _feedback_broadcast_status_max(user_id, broadcast_key):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT status FROM broadcast_log WHERE broadcast_key=? AND platform='max' AND user_id=?",
+            (broadcast_key, user_id),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def _claim_existing_max_broadcast(user_id, broadcast_key):
+    """Claims only a pre-created campaign marker. This prevents a current-user
+    one-off campaign from leaking to users who register after the campaign run."""
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE broadcast_log SET status='claimed', error_code='', ts=? "
+            "WHERE broadcast_key=? AND platform='max' AND user_id=? "
+            "AND status NOT IN ('sent', 'claimed', 'forbidden')",
+            (now, broadcast_key, user_id),
+        )
+        return cur.rowcount == 1
+
+
+def _ensure_feedback_campaign_snapshot_max(audience):
+    """Creates the campaign audience snapshot only on the first manual run."""
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM broadcast_log WHERE broadcast_key=? AND platform='max' LIMIT 1",
+            (FEEDBACK_CAMPAIGN_KEY,),
+        ).fetchone()
+        if exists:
+            return
+        conn.executemany(
+            "INSERT OR IGNORE INTO broadcast_log(broadcast_key, platform, user_id, status, error_code, ts) "
+            "VALUES (?, 'max', ?, 'pending', '', ?)",
+            [(FEEDBACK_CAMPAIGN_KEY, user_id, now) for user_id in audience],
+        )
+
+
+async def _send_max_once(chat_id, text, buttons):
+    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
+    payload = {"text": text, "attachments": [{"type": "inline_keyboard", "payload": {"buttons": buttons}}]}
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(f"{MAX_API}/messages?chat_id={chat_id}", json=payload, headers=headers)
+        if r.is_success:
+            return "sent", ""
+        if r.status_code == 403:
+            return "forbidden", str(r.status_code)
+        if r.status_code == 404:
+            return "chat_not_found", str(r.status_code)
+        if r.status_code == 429:
+            return "rate_limited", str(r.status_code)
+        return "temp_error", str(r.status_code)
+    except Exception:
+        return "temp_error", "exception"
+
+
+async def maybe_deliver_pending_max_broadcast(user_id, chat_id):
+    """Не более одного раза доставляет отложенное объявление broadcast_key пользователю,
+    как только у него появился валидный chat_id (текущее сообщение/callback/старт).
+    Не блокирует и не задерживает основной ответ (запускается отдельной задачей)."""
+    if not MAX_PENDING_BROADCAST_ENABLED or not user_id or not chat_id or chat_id == CHANNEL_ID:
+        return
+    try:
+        if not _claim_max_broadcast(user_id):
+            return
+        result, error_code = await _send_max_once(chat_id, MAX_PENDING_BROADCAST_TEXT, MAX_PENDING_BROADCAST_BUTTONS)
+        if result == "rate_limited" or (result == "temp_error" and error_code != "exception"):
+            await asyncio.sleep(3)
+            result, error_code = await _send_max_once(chat_id, MAX_PENDING_BROADCAST_TEXT, MAX_PENDING_BROADCAST_BUTTONS)
+        _mark_max_broadcast(user_id, result, error_code)
+    except Exception:
+        logging.error("maybe_deliver_pending_max_broadcast: непредвиденная ошибка")
+        try:
+            _mark_max_broadcast(user_id, "temp_error", "exception")
+        except Exception:
+            pass
+
+
+# ─── ОДНОРАЗОВАЯ РАССЫЛКА ОБРАТНОЙ СВЯЗИ (campaign: feedback_features_2026_09) ──
+# MAX адресует приватный чат только по уже известному chat_id (см. max_user_chats выше).
+# Для пользователей без сохранённого chat_id доставка невозможна активным batch-циклом —
+# используем тот же проверенный паттерн "доставить при следующем обращении", что и для
+# MAX_PENDING_BROADCAST выше. Это не периодическая рассылка: сообщение уходит максимум
+# один раз на пользователя благодаря dedup через broadcast_log.
+FEEDBACK_CAMPAIGN_ENABLED = True
+FEEDBACK_CAMPAIGN_KEY = "feedback_features_2026_09"
+FEEDBACK_CAMPAIGN_TEXT = (
+    "❤️ Дорогие мамы!\n\n"
+    "Мне очень приятно видеть, что вас становится всё больше и что «Мамин Помощник» "
+    "действительно используется каждый день.\n\n"
+    "Я продолжаю развивать приложение и хочу делать его не просто больше, а действительно "
+    "полезнее именно для вас.\n\n"
+    "Поэтому хочу спросить:\n\n"
+    "Какой функции вам сейчас не хватает? Что вы хотели бы видеть в приложении дальше?\n\n"
+    "Это может быть что угодно — новый трекер, полезный раздел, напоминания, новая возможность "
+    "для ребёнка или для мамы.\n\n"
+    "Я читаю ваши предложения и буду учитывать их при следующих обновлениях ❤️\n\n"
+    "Нажмите кнопку ниже и напишите свою идею."
+)
+FEEDBACK_CAMPAIGN_BUTTONS = [
+    [{"type": "callback", "text": "💬 Предложить функцию", "payload": "fb2026:suggest"}],
+    [{"type": "callback", "text": "❤️ Всё нравится", "payload": "fb2026:like"}],
+]
+
+
+async def maybe_deliver_pending_feedback_campaign(user_id, chat_id):
+    """Доставляет одноразовую кампанию обратной связи, как только у пользователя
+    появился валидный chat_id. Не более одного раза на пользователя (dedup в broadcast_log)."""
+    if not FEEDBACK_CAMPAIGN_ENABLED or not user_id or not chat_id or chat_id == CHANNEL_ID or user_id == OWNER_ID:
+        return
+    try:
+        if not _claim_existing_max_broadcast(user_id, FEEDBACK_CAMPAIGN_KEY):
+            return
+        result, error_code = await _send_max_once(chat_id, FEEDBACK_CAMPAIGN_TEXT, FEEDBACK_CAMPAIGN_BUTTONS)
+        if result == "rate_limited" or (result == "temp_error" and error_code != "exception"):
+            await asyncio.sleep(3)
+            result, error_code = await _send_max_once(chat_id, FEEDBACK_CAMPAIGN_TEXT, FEEDBACK_CAMPAIGN_BUTTONS)
+        _mark_max_broadcast(user_id, result, error_code, FEEDBACK_CAMPAIGN_KEY)
+    except Exception:
+        logging.error("maybe_deliver_pending_feedback_campaign: непредвиденная ошибка")
+        try:
+            _mark_max_broadcast(user_id, "temp_error", "exception", FEEDBACK_CAMPAIGN_KEY)
+        except Exception:
+            pass
+
+
+async def send_feedback_campaign_max():
+    """Ручная одноразовая рассылка обратной связи. Не запускается из scheduler/main —
+    вызывается один раз внешним job-скриптом. Активно отправляет только пользователям
+    с уже известным chat_id; остальным сообщение будет доставлено при следующем
+    обращении через maybe_deliver_pending_feedback_campaign (тот же принцип, что и
+    для исторической рассылки MAX_PENDING_BROADCAST)."""
+    with db_connect() as conn:
+        total_rows = conn.execute("SELECT user_id FROM users WHERE user_id IS NOT NULL AND user_id > 0").fetchall()
+        known_rows = conn.execute(
+            "SELECT u.user_id, m.chat_id FROM users u JOIN max_user_chats m ON m.user_id = u.user_id "
+            "WHERE u.user_id IS NOT NULL AND u.user_id > 0"
+        ).fetchall()
+    audience = [r[0] for r in total_rows if r[0] != OWNER_ID]
+    _ensure_feedback_campaign_snapshot_max(audience)
+    reachable = [(uid, cid) for uid, cid in known_rows if uid != OWNER_ID and cid != CHANNEL_ID]
+    sent, failed = 0, 0
+    for user_id, chat_id in reachable:
+        if not _claim_existing_max_broadcast(user_id, FEEDBACK_CAMPAIGN_KEY):
+            status = _feedback_broadcast_status_max(user_id, FEEDBACK_CAMPAIGN_KEY)
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            continue
+        result, error_code = await _send_max_once(chat_id, FEEDBACK_CAMPAIGN_TEXT, FEEDBACK_CAMPAIGN_BUTTONS)
+        if result == "rate_limited" or (result == "temp_error" and error_code != "exception"):
+            await asyncio.sleep(3)
+            result, error_code = await _send_max_once(chat_id, FEEDBACK_CAMPAIGN_TEXT, FEEDBACK_CAMPAIGN_BUTTONS)
+        _mark_max_broadcast(user_id, result, error_code, FEEDBACK_CAMPAIGN_KEY)
+        if result == "sent":
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.3)
+    queued_opportunistic = max(0, len(audience) - len(reachable))
+    return {
+        "audience": len(audience),
+        "reachable_now": len(reachable),
+        "sent": sent,
+        "failed": failed,
+        "queued_opportunistic": queued_opportunistic,
+    }
+
+
+# ─── ОДНОРАЗОВАЯ РАССЫЛКА «ПРИКОРМ 6+» (campaign: complementary_foods_2026_09) ──
+# Тот же проверенный паттерн, что и FEEDBACK_CAMPAIGN выше: пользователям с уже
+# известным chat_id отправляем сразу, остальным — при следующем обращении
+# (maybe_deliver_pending_cf_campaign). Не периодическая рассылка, dedup через broadcast_log.
+CF_CAMPAIGN_ENABLED = True
+CF_CAMPAIGN_KEY = "complementary_foods_2026_09"
+CF_CAMPAIGN_TEXT = (
+    "🥣 Новая функция — «Прикорм 6+» ❤️\n\n"
+    "Дорогие мамы, в «Мамин Помощник» появился новый раздел для начала прикорма.\n\n"
+    "Теперь можно:\n"
+    "• посмотреть, что можно давать ребёнку по возрасту;\n"
+    "• отмечать уже попробованные продукты;\n"
+    "• сохранять, что понравилось или не понравилось;\n"
+    "• отмечать возможную реакцию;\n"
+    "• смотреть рекомендации по введению продуктов и важные правила безопасности.\n\n"
+    "Раздел находится:\nПитание → Прикорм 6+\n\n"
+    "Буду очень рада вашей обратной связи ❤️\n"
+    "Попробуйте новую функцию и напишите, насколько она вам полезна и чего в ней ещё не хватает."
+)
+CF_CAMPAIGN_BUTTONS = [
+    [{"type": "link", "text": "🥣 Открыть «Прикорм 6+»", "url": MINIAPP_URL + "?screen=complementary-feeding"}],
+    [{"type": "callback", "text": "💬 Оставить мнение", "payload": "cf2026:feedback"}],
+]
+
+
+def _ensure_cf_campaign_snapshot_max(audience):
+    """Creates the campaign audience snapshot only on the first manual run."""
+    now = datetime.now().isoformat()
+    with db_connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM broadcast_log WHERE broadcast_key=? AND platform='max' LIMIT 1",
+            (CF_CAMPAIGN_KEY,),
+        ).fetchone()
+        if exists:
+            return
+        conn.executemany(
+            "INSERT OR IGNORE INTO broadcast_log(broadcast_key, platform, user_id, status, error_code, ts) "
+            "VALUES (?, 'max', ?, 'pending', '', ?)",
+            [(CF_CAMPAIGN_KEY, user_id, now) for user_id in audience],
+        )
+
+
+async def maybe_deliver_pending_cf_campaign(user_id, chat_id):
+    """Доставляет одноразовую кампанию «Прикорм 6+», как только у пользователя
+    появился валидный chat_id. Не более одного раза на пользователя (dedup в broadcast_log)."""
+    if not CF_CAMPAIGN_ENABLED or not user_id or not chat_id or chat_id == CHANNEL_ID or user_id == OWNER_ID:
+        return
+    try:
+        if not _claim_existing_max_broadcast(user_id, CF_CAMPAIGN_KEY):
+            return
+        result, error_code = await _send_max_once(chat_id, CF_CAMPAIGN_TEXT, CF_CAMPAIGN_BUTTONS)
+        if result == "rate_limited" or (result == "temp_error" and error_code != "exception"):
+            await asyncio.sleep(3)
+            result, error_code = await _send_max_once(chat_id, CF_CAMPAIGN_TEXT, CF_CAMPAIGN_BUTTONS)
+        _mark_max_broadcast(user_id, result, error_code, CF_CAMPAIGN_KEY)
+    except Exception:
+        logging.error("maybe_deliver_pending_cf_campaign: непредвиденная ошибка")
+        try:
+            _mark_max_broadcast(user_id, "temp_error", "exception", CF_CAMPAIGN_KEY)
+        except Exception:
+            pass
+
+
+async def send_cf_campaign_max():
+    """Ручная одноразовая рассылка «Прикорм 6+». Не запускается из scheduler/main —
+    вызывается один раз внешним job-скриптом. Активно отправляет только пользователям
+    с уже известным chat_id; остальным сообщение будет доставлено при следующем
+    обращении через maybe_deliver_pending_cf_campaign."""
+    with db_connect() as conn:
+        total_rows = conn.execute("SELECT user_id FROM users WHERE user_id IS NOT NULL AND user_id > 0").fetchall()
+        known_rows = conn.execute(
+            "SELECT u.user_id, m.chat_id FROM users u JOIN max_user_chats m ON m.user_id = u.user_id "
+            "WHERE u.user_id IS NOT NULL AND u.user_id > 0"
+        ).fetchall()
+    audience = [r[0] for r in total_rows if r[0] != OWNER_ID]
+    _ensure_cf_campaign_snapshot_max(audience)
+    reachable = [(uid, cid) for uid, cid in known_rows if uid != OWNER_ID and cid != CHANNEL_ID]
+    sent, failed = 0, 0
+    for user_id, chat_id in reachable:
+        if not _claim_existing_max_broadcast(user_id, CF_CAMPAIGN_KEY):
+            status = _feedback_broadcast_status_max(user_id, CF_CAMPAIGN_KEY)
+            if status == "sent":
+                sent += 1
+            else:
+                failed += 1
+            continue
+        result, error_code = await _send_max_once(chat_id, CF_CAMPAIGN_TEXT, CF_CAMPAIGN_BUTTONS)
+        if result == "rate_limited" or (result == "temp_error" and error_code != "exception"):
+            await asyncio.sleep(3)
+            result, error_code = await _send_max_once(chat_id, CF_CAMPAIGN_TEXT, CF_CAMPAIGN_BUTTONS)
+        _mark_max_broadcast(user_id, result, error_code, CF_CAMPAIGN_KEY)
+        if result == "sent":
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.3)
+    queued_opportunistic = max(0, len(audience) - len(reachable))
+    return {
+        "audience": len(audience),
+        "reachable_now": len(reachable),
+        "sent": sent,
+        "failed": failed,
+        "queued_opportunistic": queued_opportunistic,
+    }
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
@@ -3957,14 +5366,23 @@ async def webhook(request: Request):
         if update_type == "bot_started":
             user = data.get("user", {})
             start_payload = data.get("payload") or ""
-            chat_id = data.get("chat_id") or user.get("user_id")
+            real_chat_id = data.get("chat_id")
+            chat_id = real_chat_id or user.get("user_id")
             user_id = user.get("user_id") or chat_id
             if not user_id:
                 return JSONResponse({"ok": True})
+            # real_chat_id — фактическое поле апдейта; chat_id выше может быть подменён
+            # на user_id как fallback для немедленного ответа, такое значение сохранять нельзя.
+            if real_chat_id and real_chat_id != CHANNEL_ID:
+                save_max_chat_id(user_id, real_chat_id, "bot_started")
+                _run_webhook_task(maybe_deliver_pending_max_broadcast(user_id, real_chat_id), f"pending_broadcast:{user_id}")
+                _run_webhook_task(maybe_deliver_pending_feedback_campaign(user_id, real_chat_id), f"pending_feedback_campaign:{user_id}")
+                _run_webhook_task(maybe_deliver_pending_cf_campaign(user_id, real_chat_id), f"pending_cf_campaign:{user_id}")
             # Если запуск пришёл из канала, отвечаем только пользователю в личный чат.
             response_chat_id = user_id if chat_id == CHANNEL_ID else chat_id
             first_name = user.get("name", "мама")
             username = user.get("username", "")
+            log_analytics_event("user_start", user_id, start_payload)
             with db_connect() as conn:
                 was_known = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone() is not None
             get_user(user_id, username, first_name)
@@ -3982,39 +5400,34 @@ async def webhook(request: Request):
                 if save_channel_poll_vote(user_id, start_payload):
                     await send_message(response_chat_id, "Спасибо за ответ 🤍 Ваш голос учтён.")
                 return JSONResponse({"ok": True})
+            if start_payload.startswith("channel_"):
+                log_analytics_event("ad_payload_opened", user_id, start_payload)
             existing_user = get_user(user_id, username, first_name)
             existing_birth_date = existing_user.get("birth_date", "")
             is_pregnant_profile = existing_birth_date.startswith("pdr:")
-            channel_payloads = {
-                "channel": ("🤍 Ты пришла из канала «Я МАМА». ", None),
-                "channel_today": ("❓ Получить персональный ответ", "ask"),
-                "channel_sleep": ("🌙 Разобрать сон ребёнка", "funnel_sleep"),
-                "channel_feeding": ("🥣 Разобрать питание ребёнка", "funnel_feeding"),
-                "channel_doctor": ("🩺 Подготовить вопросы врачу", "funnel_doctor"),
-                "channel_psycho": ("🤍 Разобрать мою ситуацию", "funnel_mom"),
-                "channel_pregnancy": ("🤰 Задать вопрос по беременности", "funnel_pregnancy"),
-                "channel_child": ("👶 Проверить развитие", "funnel_development"),
-                "channel_family": ("👨‍👩‍👧 Подготовить разговор", "funnel_family"),
-            }
-            channel_title, channel_callback = channel_payloads.get(start_payload, ("", None))
+            is_channel_payload = start_payload.startswith("channel_")
             intro = "🤍 Ты пришла из канала «Я МАМА». Здесь рекомендации становятся персональными.\n\n" if start_payload.startswith("channel") else ""
             if existing_birth_date.startswith("pdr:"):
                 weeks = calc_pregnancy_weeks(existing_birth_date[4:])
-                await send_message(response_chat_id, intro + f"🤰 Ты на {weeks} неделе беременности. Чем могу помочь?", pregnant_menu_buttons())
-                if channel_callback:
-                    await send_message(response_chat_id, channel_title, [[{"type": "callback", "text": channel_title, "payload": channel_callback}]])
+                if is_channel_payload:
+                    landing_text, landing_buttons = channel_landing_max(start_payload)
+                    await send_message(response_chat_id, landing_text, landing_buttons)
+                else:
+                    await send_message(response_chat_id, intro + f"🤰 Ты на {weeks} неделе беременности. Чем могу помочь?", pregnant_menu_buttons(user_id))
             elif existing_birth_date:
                 months = calc_child_age(existing_birth_date)
-                await send_message(response_chat_id, intro + f"👶 Малышу {age_label(months)}. Чем могу помочь?", main_menu_buttons())
-                if channel_callback:
-                    await send_message(response_chat_id, channel_title, [[{"type": "callback", "text": channel_title, "payload": channel_callback}]])
+                if is_channel_payload:
+                    landing_text, landing_buttons = channel_landing_max(start_payload)
+                    await send_message(response_chat_id, landing_text, landing_buttons)
+                else:
+                    await send_message(response_chat_id, intro + f"👶 Малышу {age_label(months)}. Чем могу помочь?", main_menu_buttons(user_id))
             else:
                 if start_payload.startswith("channel_"):
                     with db_connect() as conn:
                         conn.execute("UPDATE users SET pending_start=? WHERE user_id=?", (start_payload, user_id))
                 await send_message(response_chat_id, intro + WELCOME_TEXT.format(name=first_name),
                     [[{"type": "callback", "text": "🤰 Я беременна", "payload": "set_pregnant"},
-                      {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]])
+                      {"type": "callback", "text": "👩 Я уже мама", "payload": "set_mama"}]] + ([[{"type": "callback", "text": "👑 Кабинет владельца", "payload": "owner_cab:home"}]] if user_id == OWNER_ID else []))
 
         elif update_type == "message_created":
             sender = message.get("sender", {})
@@ -4029,6 +5442,12 @@ async def webhook(request: Request):
             # Игнорируем сообщения в канале
             if not user_id or chat_id == CHANNEL_ID:
                 return JSONResponse({"ok": True})
+
+            if chat_id:
+                save_max_chat_id(user_id, chat_id, "message_created")
+                _run_webhook_task(maybe_deliver_pending_max_broadcast(user_id, chat_id), f"pending_broadcast:{user_id}")
+                _run_webhook_task(maybe_deliver_pending_feedback_campaign(user_id, chat_id), f"pending_feedback_campaign:{user_id}")
+                _run_webhook_task(maybe_deliver_pending_cf_campaign(user_id, chat_id), f"pending_cf_campaign:{user_id}")
 
             if attachments:
                 for att in attachments:
@@ -4049,6 +5468,13 @@ async def webhook(request: Request):
                     elif att.get("type") in ("audio", "voice"):
                         audio_url = att.get("payload", {}).get("url")
                         if audio_url:
+                            owner_step = get_user(user_id).get("step", "") if (OWNER_ID and user_id == OWNER_ID) else ""
+                            if owner_step.startswith("pr_voice_"):
+                                _run_webhook_task(
+                                    pr_receive_voice_max(chat_id, user_id, owner_step, audio_url),
+                                    f"pr_voice:{user_id}",
+                                )
+                                return JSONResponse({"ok": True})
                             _run_webhook_task(
                                 process_voice(chat_id, user_id, audio_url, first_name),
                                 f"voice:{user_id}",
@@ -4066,16 +5492,24 @@ async def webhook(request: Request):
         elif update_type == "message_callback":
             user = callback.get("user", {})
             recipient = message.get("recipient", {})
-            chat_id = (
+            raw_chat_id = (
                 recipient.get("chat_id") or
                 callback.get("chat_id") or
                 message.get("sender", {}).get("chat_id")
             )
+            chat_id = raw_chat_id
             user_id = user.get("user_id") or message.get("sender", {}).get("user_id")
             first_name = user.get("name") or message.get("sender", {}).get("name", "мама")
             payload_cb = callback.get("payload", "")
             if chat_id == CHANNEL_ID and user_id:
                 chat_id = user_id
+            # raw_chat_id — значение до подмены на user_id для канальных callback'ов,
+            # сохранять на будущее можно только его.
+            if user_id and raw_chat_id and raw_chat_id != CHANNEL_ID:
+                save_max_chat_id(user_id, raw_chat_id, "message_callback")
+                _run_webhook_task(maybe_deliver_pending_max_broadcast(user_id, raw_chat_id), f"pending_broadcast:{user_id}")
+                _run_webhook_task(maybe_deliver_pending_feedback_campaign(user_id, raw_chat_id), f"pending_feedback_campaign:{user_id}")
+                _run_webhook_task(maybe_deliver_pending_cf_campaign(user_id, raw_chat_id), f"pending_cf_campaign:{user_id}")
             logging.info(f"CALLBACK: chat_id={chat_id} user_id={user_id} payload={payload_cb}")
             if chat_id and user_id and payload_cb:
                 _run_webhook_task(
@@ -4159,6 +5593,3356 @@ async def payment_success():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ========== MINI APP API (Home v1, Telegram + MAX auth) ==========
+# Один и тот же production Mini App обслуживает и Telegram, и MAX через единый platform-aware
+# контракт: initData проверяется HMAC-SHA256 (см. _miniapp_verify_init_data для Telegram и
+# _miniapp_verify_max_init_data для MAX — тот же алгоритм, свой секрет на платформу), затем
+# запрос маршрутизируется в свою БД (_miniapp_db): telegram -> mama.db, max -> mama_max.db.
+# Namespace-ы user_id платформ НЕ смешиваются — это разные БД, разные таблицы users.
+MINIAPP_TG_BOT_TOKEN = _ENV.get("BOT_TOKEN", "").strip()
+MINIAPP_INIT_DATA_MAX_AGE = 86400  # сутки, рекомендация Telegram/MAX для initData
+MINIAPP_HISTORY_LIMIT = 20
+# Обратная связь Mini App (support_menu/support_write/review_write/suggestion_write из mama_bot.py):
+# TG_OWNER_ID — тот же владелец, которому mama_bot.py пересылает обращения через aiogram Bot;
+# здесь используется HTTP Bot API напрямую, т.к. mama_max_bot.py — отдельный процесс без
+# доступа к тому объекту Bot. SUPPORT_USERNAME — тот же резервный контакт, что в mama_bot.py.
+MINIAPP_TG_OWNER_ID = int(_ENV.get("TG_OWNER_ID", "0") or 0)
+MINIAPP_TG_SUPPORT_USERNAME = "@demo23rus"
+# Тот же Google Sheet (SPREADSHEET_ID_MAMA == SPREADSHEET_ID из mama_bot.py), тот же лист и
+# заголовки, что TG_USER_SHEET/TG_USER_HEADERS в mama_bot.py — не отдельная таблица.
+MINIAPP_TG_USER_SHEET = "МамаБот Telegram"
+MINIAPP_TG_USER_HEADERS = [
+    "Последнее посещение", "user_id", "Имя", "Username",
+    "AI-запросы", "Тариф", "Дата окончания", "Отзыв"
+]
+_miniapp_max_schema_ready = False
+
+
+def _miniapp_db(user=None):
+    platform = user.get("platform", "telegram") if isinstance(user, dict) else (user or "telegram")
+    if platform == "max":
+        conn = sqlite3.connect(DB, timeout=5)
+        conn.row_factory = sqlite3.Row
+        global _miniapp_max_schema_ready
+        if not _miniapp_max_schema_ready:
+            # Чат-бот MAX хранит сон/кормления в diary с префиксами (СОН:/КОРМ:); Mini App
+            # использует те же нативные таблицы, что и Telegram-бот в mama.db — добавляем их
+            # аддитивно (CREATE TABLE IF NOT EXISTS), не трогая существующие данные чат-бота.
+            conn.execute("""CREATE TABLE IF NOT EXISTS sleep_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                created_at TEXT
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sleep_log_user_date ON sleep_log(user_id, created_at)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS feeding (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                side TEXT,
+                duration INTEGER,
+                created_at TEXT
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_feeding_user_date ON feeding(user_id, created_at)")
+            conn.commit()
+            _miniapp_max_schema_ready = True
+        return conn
+    conn = sqlite3.connect(TG_DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _miniapp_verify_init_data(init_data):
+    """Проверяет Telegram WebApp initData по документированной схеме HMAC-SHA256."""
+    if not init_data or not MINIAPP_TG_BOT_TOKEN:
+        return None
+    try:
+        pairs = parse_qsl(init_data, strict_parsing=True)
+    except ValueError:
+        return None
+    data = dict(pairs)
+    received_hash = data.pop("hash", None)
+    if not received_hash:
+        return None
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(b"WebAppData", MINIAPP_TG_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if auth_date <= 0 or (datetime.now().timestamp() - auth_date) > MINIAPP_INIT_DATA_MAX_AGE:
+        return None
+    try:
+        user = json.loads(data.get("user", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not user.get("id"):
+        return None
+    return user
+
+
+def _miniapp_verify_max_init_data(init_data):
+    """Проверяет MAX WebAppData: тот же HMAC-SHA256 алгоритм, что и Telegram, свой secret_key
+    из MAX_TOKEN. hash должен встречаться ровно один раз в launch params."""
+    if not init_data or not MAX_TOKEN:
+        return None
+    try:
+        pairs = parse_qsl(init_data, strict_parsing=True)
+    except ValueError:
+        return None
+    if sum(1 for k, _ in pairs if k == "hash") != 1:
+        return None
+    data = dict(pairs)
+    received_hash = data.pop("hash", None)
+    if not received_hash:
+        return None
+    launch_params = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(b"WebAppData", MAX_TOKEN.encode(), hashlib.sha256).digest()
+    expected_hash = hmac.new(secret_key, launch_params.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_hash, received_hash):
+        return None
+    try:
+        auth_date = int(data.get("auth_date", "0"))
+    except ValueError:
+        return None
+    if auth_date <= 0 or (datetime.now().timestamp() - auth_date) > MINIAPP_INIT_DATA_MAX_AGE:
+        return None
+    try:
+        user = json.loads(data.get("user", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not user.get("id"):
+        return None
+    return user
+
+
+def _miniapp_resolve_user(request: Request, body_init_data=None):
+    """Единая точка входа platform-aware авторизации. Platform-заголовок клиента — это только
+    подсказка, какой секрет и какую init-data проверять; доверие полностью определяется
+    результатом HMAC-проверки, а не тем, что заявил клиент."""
+    platform = (request.headers.get("X-Miniapp-Platform") or "telegram").strip().lower()
+    if platform not in ("telegram", "max"):
+        platform = "telegram"
+    if platform == "max":
+        init_data = request.headers.get("X-Init-Data") or body_init_data or ""
+        user = _miniapp_verify_max_init_data(init_data)
+    else:
+        init_data = (
+            request.headers.get("X-Init-Data")
+            or request.headers.get("X-Telegram-Init-Data")
+            or body_init_data
+            or ""
+        )
+        user = _miniapp_verify_init_data(init_data)
+    if not user:
+        return None
+    user = dict(user)
+    user["platform"] = platform
+    return user
+
+
+def _miniapp_require_user(request: Request):
+    user = _miniapp_resolve_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return user
+
+
+def _miniapp_profile_row(conn, platform, user_id):
+    """Единый вид профиля (mode/date_value/name/created_at) поверх разных схем users:
+    mama.db (Telegram) хранит mode+date_value напрямую; mama_max.db (MAX) хранит birth_date,
+    где 'pdr:ДД.ММ.ГГГГ' значит беременность. Не путать с чат-ботом MAX — читаем ту же таблицу
+    users, что и mama_max_bot.py, но ничего в ней не меняем."""
+    if platform == "max":
+        row = conn.execute(
+            "SELECT user_id, first_name, birth_date, registered_at FROM users WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None
+        birth_date = row["birth_date"] or ""
+        if birth_date.startswith("pdr:"):
+            mode, date_value = "pregnant", birth_date[4:]
+        elif birth_date:
+            mode, date_value = "mama", birth_date
+        else:
+            mode, date_value = "", ""
+        return {
+            "user_id": row["user_id"],
+            "mode": mode,
+            "date_value": date_value,
+            "name": row["first_name"] or "",
+            "created_at": row["registered_at"] or "",
+        }
+    row = conn.execute(
+        "SELECT user_id, mode, date_value, name, created_at FROM users WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "user_id": row["user_id"],
+        "mode": row["mode"] or "",
+        "date_value": row["date_value"] or "",
+        "name": row["name"] or "",
+        "created_at": row["created_at"] or "",
+    }
+
+
+def _miniapp_pregnancy_weeks(pdr_str):
+    try:
+        pdr = datetime.strptime(pdr_str, "%d.%m.%Y").date()
+        conception = pdr - timedelta(days=280)
+        days = (datetime.now().date() - conception).days
+        return days // 7
+    except Exception:
+        return None
+
+
+def _miniapp_child_months(birth_str):
+    try:
+        birth = datetime.strptime(birth_str, "%d.%m.%Y").date()
+        today = datetime.now().date()
+        return (today.year - birth.year) * 12 + (today.month - birth.month)
+    except Exception:
+        return None
+
+
+@app.get("/api/miniapp/health")
+async def miniapp_health():
+    return {"status": "ok"}
+
+
+@app.post("/api/miniapp/auth")
+async def miniapp_auth(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user = _miniapp_resolve_user(request, (body or {}).get("initData"))
+    if not user:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return {
+        "ok": True,
+        "user_id": user.get("id"),
+        "first_name": user.get("first_name", ""),
+        "platform": user.get("platform", "telegram"),
+    }
+
+
+@app.get("/api/miniapp/home")
+async def miniapp_home(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    name = ""
+    registered = False
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            if row:
+                registered = True
+                name = row["name"] or ""
+    except Exception:
+        logging.exception("miniapp_home db error")
+    return {
+        "ok": True,
+        "registered": registered,
+        "name": name or user.get("first_name", ""),
+        "status_message": "Все функции бесплатно",
+    }
+
+
+@app.get("/api/miniapp/profile")
+async def miniapp_profile(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    row = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+    except Exception:
+        logging.exception("miniapp_profile db error")
+    if not row:
+        return {"ok": True, "registered": False, "user_id": user_id, "first_name": user.get("first_name", "")}
+    mode = row["mode"] or ""
+    date_value = row["date_value"] or ""
+    weeks = _miniapp_pregnancy_weeks(date_value) if mode == "pregnant" else None
+    months = _miniapp_child_months(date_value) if mode and mode != "pregnant" else None
+    return {
+        "ok": True,
+        "registered": True,
+        "user_id": row["user_id"],
+        "name": row["name"] or user.get("first_name", ""),
+        "mode": mode,
+        "date_value": date_value,
+        "pregnancy_weeks": weeks,
+        "child_months": months,
+        "created_at": row["created_at"] or "",
+    }
+
+
+# ========== MINI APP: СЕГОДНЯ ==========
+# Персональная сводка для широкой плашки на Home и отдельного экрана "Сегодня". Использует
+# только уже существующие таблицы/хелперы (_miniapp_profile_row, _miniapp_pregnancy_weeks_days,
+# _miniapp_child_months, age_label, sleep_log/feeding/symptoms/diary/growth/vaccinations) и уже
+# существующий OpenAI client через _miniapp_ask_gpt — новых таблиц нет, AI вызывается только по
+# отдельному эндпоинту /today/advice (по кнопке), не при каждом открытии Home/Сегодня.
+MINIAPP_TODAY_WINDOW_HOURS = 24
+
+
+def _miniapp_today_snapshot(conn, platform, user_id):
+    """Единый срез "Сегодня" по режиму профиля. None, если профиль/режим ещё не заполнен."""
+    row = _miniapp_profile_row(conn, platform, user_id)
+    if not row or not row["mode"]:
+        return None
+    mode = row["mode"]
+    date_value = row["date_value"] or ""
+    snapshot = {"mode": mode, "date_value": date_value}
+
+    if mode == "pregnant":
+        weeks, days = _miniapp_pregnancy_weeks_days(date_value)
+        trimester = None
+        if weeks is not None:
+            trimester = (
+                "1-й триместр — закладка всех органов" if weeks <= 13
+                else "2-й триместр — активный рост" if weeks <= 26
+                else "3-й триместр — подготовка к рождению"
+            )
+        snapshot["pregnancy_weeks"] = weeks
+        snapshot["pregnancy_days"] = days
+        snapshot["trimester"] = trimester
+        return snapshot
+
+    months = _miniapp_child_months(date_value)
+    snapshot["child_months"] = months
+    snapshot["child_age_label"] = age_label(months)
+
+    since = (datetime.now() - timedelta(hours=MINIAPP_TODAY_WINDOW_HOURS)).isoformat()
+    snapshot["sleep_count_24h"] = int(conn.execute(
+        "SELECT COUNT(*) FROM sleep_log WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    snapshot["feeding_count_24h"] = int(conn.execute(
+        "SELECT COUNT(*) FROM feeding WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    snapshot["symptoms_count_24h"] = int(conn.execute(
+        "SELECT COUNT(*) FROM symptoms WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+
+    growth_row = conn.execute(
+        "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if growth_row:
+        snapshot["last_growth"] = {
+            "height": growth_row["height"],
+            "weight": growth_row["weight"],
+            "created_at": growth_row["created_at"] or "",
+        }
+
+    diary_row = conn.execute(
+        "SELECT entry, created_at FROM diary WHERE user_id=? AND entry NOT LIKE 'КОРМ:%' "
+        "AND entry NOT LIKE 'СОН:%' AND entry NOT LIKE 'СИМПТОМ:%' ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if diary_row:
+        snapshot["last_diary"] = {"entry": diary_row["entry"] or "", "created_at": diary_row["created_at"] or ""}
+
+    nearest_vaccine = None
+    nearest_date = None
+    today_date = datetime.now().date()
+    for vrow in conn.execute(
+        "SELECT vaccine, scheduled_date FROM vaccinations WHERE user_id=? AND done=0", (user_id,)
+    ):
+        try:
+            vdate = datetime.strptime(vrow["scheduled_date"] or "", "%d.%m.%Y").date()
+        except Exception:
+            continue
+        if vdate < today_date:
+            continue
+        if nearest_date is None or vdate < nearest_date:
+            nearest_date = vdate
+            nearest_vaccine = {"vaccine": vrow["vaccine"] or "", "scheduled_date": vrow["scheduled_date"] or ""}
+    snapshot["nearest_vaccine"] = nearest_vaccine
+
+    if months is not None and months >= 6:
+        try:
+            _miniapp_cf_ensure_schema(conn, platform)
+            cf_rows = list(conn.execute(
+                "SELECT food_key, status, updated_at FROM complementary_food_log "
+                "WHERE platform=? AND user_id=? AND status!='not_tried' ORDER BY updated_at DESC",
+                (platform, user_id),
+            ))
+            if cf_rows:
+                last_food = MINIAPP_CF_FOOD_BY_KEY.get(cf_rows[0]["food_key"])
+                snapshot["complementary_food"] = {
+                    "tried_count": len(cf_rows),
+                    "liked_count": sum(1 for r in cf_rows if r["status"] == "liked"),
+                    "last_food": last_food["title"] if last_food else cf_rows[0]["food_key"],
+                    "last_food_status": cf_rows[0]["status"],
+                }
+        except Exception:
+            logging.exception("miniapp_today_snapshot complementary_food error")
+    return snapshot
+
+
+@app.get("/api/miniapp/today")
+async def miniapp_today(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        with _miniapp_db(user) as conn:
+            snapshot = _miniapp_today_snapshot(conn, user.get("platform", "telegram"), user_id)
+    except Exception:
+        logging.exception("miniapp_today db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if snapshot is None:
+        return {"ok": True, "registered": False}
+    snapshot["ok"] = True
+    snapshot["registered"] = True
+    snapshot["date"] = datetime.now().strftime("%d.%m.%Y")
+    return snapshot
+
+
+@app.get("/api/miniapp/today/advice")
+async def miniapp_today_advice(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        with _miniapp_db(user) as conn:
+            snapshot = _miniapp_today_snapshot(conn, user.get("platform", "telegram"), user_id)
+    except Exception:
+        logging.exception("miniapp_today_advice db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if snapshot is None:
+        raise HTTPException(status_code=400, detail="profile_required")
+
+    if snapshot["mode"] == "pregnant":
+        weeks = snapshot.get("pregnancy_weeks")
+        days = snapshot.get("pregnancy_days")
+        context_lines = [
+            f"Срок беременности: {weeks} недель и {days} дней."
+            if weeks is not None else "Срок беременности неизвестен."
+        ]
+        system_prompt = EXPERT_PREG
+    else:
+        context_lines = [f"Возраст ребёнка: {snapshot.get('child_age_label')}."]
+        context_lines.append(
+            f"За последние 24 часа: сон — {snapshot.get('sleep_count_24h', 0)} записей, "
+            f"кормление — {snapshot.get('feeding_count_24h', 0)} записей, "
+            f"самочувствие — {snapshot.get('symptoms_count_24h', 0)} записей."
+        )
+        last_growth = snapshot.get("last_growth")
+        if last_growth:
+            context_lines.append(f"Последний рост/вес: {last_growth.get('height')} см, {last_growth.get('weight')} кг.")
+        last_diary = snapshot.get("last_diary")
+        if last_diary:
+            context_lines.append(f"Последняя запись дневника: {last_diary.get('entry')}")
+        system_prompt = EXPERT_BASE
+
+    nearest_vaccine = snapshot.get("nearest_vaccine")
+    if nearest_vaccine:
+        context_lines.append(f"Ближайшая прививка: {nearest_vaccine.get('vaccine')} — {nearest_vaccine.get('scheduled_date')}.")
+
+    context_str = "\n".join(context_lines)
+    log_analytics_event_tg(user_id, "request_started", "today_advice", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        system_prompt,
+        f"Вот реальные данные пользователя на сегодня:\n{context_str}\n\n"
+        f"Дай короткий персональный совет на сегодня — 3-5 по-настоящему полезных пунктов, "
+        f"основанных только на этих данных. Не придумывай событий и цифр, которых нет выше. "
+        f"Не ставь диагнозов. Если в данных есть тревожные признаки — прямо скажи об этом и "
+        f"порекомендуй обратиться к врачу."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "today_advice", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "today_advice", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+@app.get("/api/miniapp/referral")
+async def miniapp_referral(request: Request):
+    # Перенос invite_friend из mama_bot.py (Telegram callback) и process_callback (MAX payload
+    # "invite_friend") в Mini App — та же таблица referrals/referral_bonus_questions на платформу
+    # (mama.db для Telegram, mama_max.db для MAX, через уже platform-routed _miniapp_db(user)),
+    # без новой системы начисления. Проект сейчас бесплатный, поэтому мы не придумываем новую
+    # награду: bonus_questions_granted/available отражают реально работающую механику
+    # increment_request_count (бонусный вопрос сверх лимита тарифа), как есть.
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    link = referral_link_tg(user_id) if platform == "telegram" else referral_link_max(user_id)
+    share_url = None
+    if platform == "telegram":
+        # Тот же share intent, что и кнопка "📤 Поделиться" в mama_bot.py invite_friend (call.data
+        # "invite_friend"): t.me/share/url — открывается через Platform.openLink на клиенте.
+        share_text = "Я пользуюсь «Маминым Помощником» — здесь можно получить поддержку по беременности, ребёнку, сну, питанию и развитию 🤍"
+        share_url = "https://t.me/share/url?url=" + quote(link, safe="") + "&text=" + quote(share_text, safe="")
+    invited_count = 0
+    bonus_questions_granted = 0
+    bonus_questions_available = 0
+    try:
+        with _miniapp_db(user) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(start_reward_granted),0) FROM referrals WHERE referrer_user_id=?",
+                (user_id,),
+            ).fetchone()
+            invited_count = int(row[0] or 0)
+            bonus_questions_granted = int(row[1] or 0)
+            bonus_row = conn.execute(
+                "SELECT bonus_questions FROM referral_bonus_questions WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            bonus_questions_available = int(bonus_row[0] or 0) if bonus_row else 0
+    except Exception:
+        logging.exception("miniapp_referral db error")
+    return {
+        "ok": True,
+        "platform": platform,
+        "link": link,
+        "share_url": share_url,
+        "invited_count": invited_count,
+        "bonus_questions_granted": bonus_questions_granted,
+        "bonus_questions_available": bonus_questions_available,
+        "note": "Все функции «Маминого помощника» и так доступны бесплатно — приглашение просто помогает больше мам узнать о проекте.",
+    }
+
+
+@app.get("/api/miniapp/history/recent")
+async def miniapp_history_recent(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            for r in conn.execute(
+                "SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_HISTORY_LIMIT),
+            ):
+                items.append({"type": "symptoms", "label": "Самочувствие", "detail": r["symptom"] or "", "created_at": r["created_at"] or ""})
+            for r in conn.execute(
+                "SELECT action, created_at FROM sleep_log WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_HISTORY_LIMIT),
+            ):
+                items.append({"type": "sleep", "label": "Сон", "detail": r["action"] or "", "created_at": r["created_at"] or ""})
+            for r in conn.execute(
+                "SELECT side, duration, created_at FROM feeding WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_HISTORY_LIMIT),
+            ):
+                detail = (r["side"] or "").strip()
+                if r["duration"]:
+                    detail = f"{detail} · {r['duration']} мин".strip(" ·")
+                items.append({"type": "feeding", "label": "Питание", "detail": detail, "created_at": r["created_at"] or ""})
+            for r in conn.execute(
+                "SELECT entry, created_at FROM diary WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_HISTORY_LIMIT),
+            ):
+                items.append({"type": "diary", "label": "Дневник", "detail": r["entry"] or "", "created_at": r["created_at"] or ""})
+            for r in conn.execute(
+                "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_HISTORY_LIMIT),
+            ):
+                detail = f"{r['height']} см, {r['weight']} кг" if r["height"] is not None and r["weight"] is not None else ""
+                items.append({"type": "growth", "label": "Рост и вес", "detail": detail, "created_at": r["created_at"] or ""})
+            for r in conn.execute(
+                "SELECT vaccine, scheduled_date, done, created_at FROM vaccinations WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_HISTORY_LIMIT),
+            ):
+                status = "✅ сделано" if r["done"] else "⏳ запланировано"
+                detail = f"{r['vaccine'] or ''} · {status} {r['scheduled_date'] or ''}".strip()
+                items.append({"type": "vaccines", "label": "Прививки", "detail": detail, "created_at": r["created_at"] or ""})
+    except Exception:
+        logging.exception("miniapp_history_recent db error")
+    items.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"ok": True, "items": items[:MINIAPP_HISTORY_LIMIT]}
+
+
+# ========== MINI APP: ОБРАТНАЯ СВЯЗЬ ==========
+# Перенос support_menu/support_write/review_write/suggestion_write из mama_bot.py (Telegram) и
+# их аналогов в process_message/process_callback из этого файла (MAX) — тот же канал доставки
+# на платформу, без нового независимого хранилища:
+#   MAX:      support -> send_message(OWNER_ID,...) + save_review(...) + sheets_upsert_max_user(...)
+#             review -> save_review(...) + sheets_log_review(...), suggestion -> sheets_log_review(...)
+#             с префиксом "ПРЕДЛОЖЕНИЕ:" — как в process_message.
+#   Telegram: support -> Telegram Bot API sendMessage владельцу (TG_OWNER_ID) — тот же получатель,
+#             что и mama_bot.py, но через HTTP, т.к. mama_max_bot.py не держит aiogram Bot;
+#             review/suggestion -> тот же Google Sheet/лист/заголовки, что sheets_upsert_user
+#             в mama_bot.py (MINIAPP_TG_USER_SHEET/MINIAPP_TG_USER_HEADERS == TG_USER_SHEET/
+#             TG_USER_HEADERS, тот же SPREADSHEET_ID_MAMA == SPREADSHEET_ID).
+# user_id всегда берётся из проверенного initData (_miniapp_require_user), не с клиента.
+# Текст обращения нигде не пишется в analytics_events — только event_name/source.
+MINIAPP_FEEDBACK_MAX_LEN = 3000
+
+
+async def _miniapp_feedback_read_text(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text_required")
+    if len(text) > MINIAPP_FEEDBACK_MAX_LEN:
+        raise HTTPException(status_code=400, detail="text_too_long")
+    return text
+
+
+async def _miniapp_tg_owner_send(text):
+    """Отправляет сообщение владельцу Telegram через HTTP Bot API — тот же TG_OWNER_ID и тот же
+    BOT_TOKEN, что использует mama_bot.py (aiogram bot.send_message), но напрямую по HTTP,
+    так как aiogram Bot этого бота живёт в процессе mambot.service, а не здесь."""
+    if not MINIAPP_TG_BOT_TOKEN or not MINIAPP_TG_OWNER_ID:
+        logging.warning("miniapp feedback: BOT_TOKEN/TG_OWNER_ID не заданы, обращение владельцу Telegram не отправлено")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{MINIAPP_TG_BOT_TOKEN}/sendMessage",
+                json={"chat_id": MINIAPP_TG_OWNER_ID, "text": text[:3900]},
+            )
+            if not r.is_success:
+                logging.error("miniapp feedback tg owner send: status=%s body=%s", r.status_code, r.text[:300])
+    except Exception:
+        logging.exception("miniapp feedback tg owner send error")
+
+
+def _miniapp_sheets_tg_feedback(user_id, username, first_name, review=None):
+    """Пишет в тот же лист 'МамаБот Telegram' той же таблицы SPREADSHEET_ID_MAMA, что и
+    sheets_upsert_user в mama_bot.py — не отдельный механизм хранения отзывов/обращений."""
+    try:
+        book = _max_sheets_book()
+        ws = _max_worksheet(book, MINIAPP_TG_USER_SHEET, MINIAPP_TG_USER_HEADERS)
+        uid = str(user_id)
+        ids = ws.col_values(2)
+        row_num = next((i + 1 for i, value in enumerate(ids) if value == uid), None)
+        values = [
+            datetime.now().strftime("%d.%m.%Y %H:%M"), uid,
+            first_name or "", username or "",
+            "", "", "",
+            review if review is not None else "",
+        ]
+        if row_num:
+            old = ws.row_values(row_num)
+            while len(old) < len(MINIAPP_TG_USER_HEADERS):
+                old.append("")
+            if not first_name:
+                values[2] = old[2]
+            if not username:
+                values[3] = old[3]
+            values[4], values[5], values[6] = old[4], old[5], old[6]
+            if review is None:
+                values[7] = old[7]
+            ws.update(f"A{row_num}:H{row_num}", [values])
+        else:
+            ws.append_row(values)
+    except Exception as e:
+        logging.error(f"Miniapp TG sheets feedback error: {e}")
+
+
+@app.post("/api/miniapp/feedback/support")
+async def miniapp_feedback_support(request: Request):
+    user = _miniapp_require_user(request)
+    text = await _miniapp_feedback_read_text(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    first_name = user.get("first_name", "") or ""
+    username = user.get("username", "") or ""
+    try:
+        if platform == "max":
+            plan, sub_end = get_subscription(user_id)
+            plan_name = PLAN_CATALOG.get(plan, {}).get("name", "Бесплатный") if plan else "Бесплатный"
+            end_text = sub_end.strftime("%d.%m.%Y") if sub_end else "—"
+            owner_text = (
+                f"🆘 Поддержка Мамин Помощник MAX (Mini App)\n\nПлатформа: MAX\n"
+                f"Пользователь: {first_name or 'без имени'}\nID: {user_id}\nUsername: {username or 'нет'}\n"
+                f"Тариф: {plan_name}\nОкончание: {end_text}\n\nСообщение:\n{text}"
+            )
+            try:
+                await send_message(OWNER_ID, owner_text)
+            except Exception:
+                logging.exception("miniapp feedback support MAX owner send error")
+            save_review(user_id, username, first_name, f"ПОДДЕРЖКА: {text}")
+            asyncio.create_task(asyncio.to_thread(
+                sheets_upsert_max_user, user_id, first_name, username, "", None, "Обращение в поддержку"
+            ))
+        else:
+            owner_text = (
+                f"🆘 Поддержка Мамин Помощник Telegram (Mini App)\n\nПлатформа: Telegram\n"
+                f"Имя: {first_name or 'без имени'}\nUsername: @{username or 'нет'}\nID: {user_id}\n\nСообщение:\n{text}"
+            )
+            await _miniapp_tg_owner_send(owner_text)
+            asyncio.create_task(asyncio.to_thread(_miniapp_sheets_tg_feedback, user_id, username, first_name, None))
+    except Exception:
+        logging.exception("miniapp_feedback_support error")
+    log_analytics_event_tg(user_id, "feedback_submitted", "support", "miniapp", platform)
+    return {"ok": True, "message": f"Сообщение отправлено! Мы ответим в ближайшее время.\n\nРезервный контакт: {MINIAPP_TG_SUPPORT_USERNAME}"}
+
+
+@app.post("/api/miniapp/feedback/review")
+async def miniapp_feedback_review(request: Request):
+    user = _miniapp_require_user(request)
+    text = await _miniapp_feedback_read_text(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    first_name = user.get("first_name", "") or ""
+    username = user.get("username", "") or ""
+    try:
+        if platform == "max":
+            save_review(user_id, username, first_name, text)
+            asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, first_name, username, text))
+        else:
+            asyncio.create_task(asyncio.to_thread(_miniapp_sheets_tg_feedback, user_id, username, first_name, text))
+    except Exception:
+        logging.exception("miniapp_feedback_review error")
+    log_analytics_event_tg(user_id, "feedback_submitted", "review", "miniapp", platform)
+    return {"ok": True, "message": "Спасибо за отзыв! Это очень важно для нас 💕"}
+
+
+@app.post("/api/miniapp/feedback/suggestion")
+async def miniapp_feedback_suggestion(request: Request):
+    user = _miniapp_require_user(request)
+    text = await _miniapp_feedback_read_text(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    first_name = user.get("first_name", "") or ""
+    username = user.get("username", "") or ""
+    try:
+        if platform == "max":
+            suggestion_text = f"ПРЕДЛОЖЕНИЕ: {text}"
+            asyncio.create_task(asyncio.to_thread(sheets_log_review, user_id, first_name, username, suggestion_text))
+        else:
+            asyncio.create_task(asyncio.to_thread(_miniapp_sheets_tg_feedback, user_id, username, first_name, text))
+    except Exception:
+        logging.exception("miniapp_feedback_suggestion error")
+    log_analytics_event_tg(user_id, "feedback_submitted", "suggestion", "miniapp", platform)
+    return {"ok": True, "message": "Спасибо за идею! Мы обязательно рассмотрим её 🤍"}
+
+
+# ========== MINI APP: БЕРЕМЕННОСТЬ ==========
+# Тот же системный prompt (EXPERT_PREG) и те же user prompts, тот же OpenAI client (gpt-4o,
+# max_tokens=2000 через _miniapp_ask_gpt), что и в preg_week/preg_baby/preg_checklist/preg_shop
+# из mama_bot.py (Telegram) — тексты и расчёт срока (280 дней от ПДР) скопированы дословно.
+# Доступно только профилю mode="pregnant" (см. _miniapp_require_pregnant_profile); для остальных
+# профилей — 400 pregnancy_profile_required, не 500. user_id с клиента не доверяется.
+EXPERT_PREG = (
+    "Ты эксперт в акушерстве, перинатальной психологии и фетальной медицине. "
+    "Опирайся на рекомендации ВОЗ, протоколы ACOG (Американский колледж акушеров и гинекологов), "
+    "исследования в области эмбриологии и нейронауки развития плода. "
+    "Отвечай тепло, поддерживающе, без страшилок — но точно и научно. "
+    "При любых тревожных симптомах направляй к врачу."
+)
+
+
+def _miniapp_pregnancy_weeks_days(pdr_str):
+    """Тот же расчёт, что и calc_pregnancy_weeks() в mama_bot.py (280 дней от ПДР до "зачатия"),
+    но с остатком дней — нужен для текста, идентичного Telegram-сценарию preg_week."""
+    try:
+        pdr = datetime.strptime(pdr_str, "%d.%m.%Y").date()
+        conception = pdr - timedelta(days=280)
+        days = (datetime.now().date() - conception).days
+        return days // 7, days % 7
+    except Exception:
+        return None, None
+
+
+def _miniapp_require_pregnant_profile(user):
+    """Отдаёт date_value беременной или бросает 400 pregnancy_profile_required — раздел
+    доступен только профилю mode='pregnant', без 500 для остальных профилей."""
+    user_id = user.get("id")
+    row = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+    except Exception:
+        logging.exception("miniapp_pregnancy: profile lookup error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if not row or row["mode"] != "pregnant":
+        raise HTTPException(status_code=400, detail="pregnancy_profile_required")
+    return row["date_value"] or ""
+
+
+@app.get("/api/miniapp/pregnancy/week")
+async def miniapp_pregnancy_week(request: Request):
+    user = _miniapp_require_user(request)
+    date_value = _miniapp_require_pregnant_profile(user)
+    weeks, days = _miniapp_pregnancy_weeks_days(date_value)
+    if weeks is None:
+        raise HTTPException(status_code=400, detail="invalid_date_value")
+    trimester = (
+        "1-й триместр — закладка всех органов" if weeks <= 13
+        else "2-й триместр — активный рост" if weeks <= 26
+        else "3-й триместр — подготовка к рождению"
+    )
+    text = f"Твой срок\n\n🤰 {weeks} недель и {days} дней\n\nЭто {trimester}"
+    return {"ok": True, "weeks": weeks, "days": days, "trimester": trimester, "text": text}
+
+
+@app.get("/api/miniapp/pregnancy/baby")
+async def miniapp_pregnancy_baby(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    date_value = _miniapp_require_pregnant_profile(user)
+    weeks, _days = _miniapp_pregnancy_weeks_days(date_value)
+    log_analytics_event_tg(user_id, "request_started", "pregnancy_baby", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_PREG,
+        f"Дай подробное научное описание развития плода на {weeks} неделе беременности. "
+        f"1) Размер и вес плода — конкретные цифры по нормам УЗИ; "
+        f"2) Какие органы и системы формируются/развиваются прямо сейчас; "
+        f"3) Сенсорное развитие — что малыш уже слышит, чувствует, воспринимает; "
+        f"4) Нейрогенез — как развивается мозг на этой неделе; "
+        f"5) Движения плода — что норма для этого срока; "
+        f"6) Что мама может сделать для оптимального развития малыша прямо сейчас. "
+        f"Пиши увлекательно и с любовью — мама должна почувствовать связь с малышом."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "pregnancy_baby", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "pregnancy_baby", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "weeks": weeks, "answer": answer}
+
+
+@app.get("/api/miniapp/pregnancy/checklist")
+async def miniapp_pregnancy_checklist(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    date_value = _miniapp_require_pregnant_profile(user)
+    weeks, _days = _miniapp_pregnancy_weeks_days(date_value)
+    log_analytics_event_tg(user_id, "request_started", "pregnancy_checklist", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_PREG,
+        f"Составь исчерпывающий чек-лист для {weeks} недели беременности по протоколам ВОЗ и ACOG. "
+        f"1) Обязательные анализы и скрининги именно для этого срока — что, зачем, что показывает; "
+        f"2) Визиты к специалистам — акушер, узист, другие; "
+        f"3) Питание — что критически важно сейчас (фолиевая, железо, йод, омега-3 по нормам); "
+        f"4) Физическая активность — что разрешено и полезно на этом сроке; "
+        f"5) Что нужно сделать практически (документы, курсы, подготовка); "
+        f"6) Тревожные симптомы на этом сроке — когда срочно к врачу."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "pregnancy_checklist", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "pregnancy_checklist", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "weeks": weeks, "answer": answer}
+
+
+@app.get("/api/miniapp/pregnancy/shop")
+async def miniapp_pregnancy_shop(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    date_value = _miniapp_require_pregnant_profile(user)
+    weeks, _days = _miniapp_pregnancy_weeks_days(date_value)
+    log_analytics_event_tg(user_id, "request_started", "pregnancy_shop", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_PREG,
+        f"Составь практичный список покупок для мамы на {weeks} неделе беременности. "
+        f"Раздели на категории: "
+        f"1) Для мамы сейчас — одежда, уход, здоровье; "
+        f"2) В роддом — сумка мамы и малыша по актуальным рекомендациям; "
+        f"3) Для новорождённого — базовый список без лишнего; "
+        f"4) Для дома — что подготовить заранее; "
+        f"5) Что точно НЕ нужно покупать — развенчай популярные мифы о необходимых товарах. "
+        f"Будь практичной и честной — без рекламы ненужных вещей."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "pregnancy_shop", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "pregnancy_shop", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "weeks": weeks, "answer": answer}
+
+
+# ========== MINI APP: ВОПРОС СПЕЦИАЛИСТУ ==========
+# Тот же системный prompt, тот же OpenAI client (gpt-4o, max_tokens=2000) и те же правила
+# ответа, что и в handle_question() из mama_bot.py (Telegram). Читает mama.db только для
+# контекста (режим/возраст), текст вопроса в отдельную таблицу не сохраняется и не логируется.
+MINIAPP_ASK_QUESTION_MAX_LEN = 2000
+
+
+async def _miniapp_ask_gpt(system_prompt, user_prompt):
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=2000,
+        )
+        return clean_text(response.choices[0].message.content)
+    except Exception as exc:
+        logging.exception("Ошибка AI MiniApp ask-question")
+        await notify_owner_max(f"⚠️ Ошибка AI MiniApp ask-question\n\n{type(exc).__name__}: {exc}", key=f"ai_miniapp_{type(exc).__name__}")
+        return AI_FAILURE_MESSAGE
+
+
+@app.post("/api/miniapp/ask-question")
+async def miniapp_ask_question(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    question = str((body or {}).get("question") or "").strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question_required")
+    if len(question) > MINIAPP_ASK_QUESTION_MAX_LEN:
+        raise HTTPException(status_code=400, detail="question_too_long")
+
+    context = "Мама задаёт вопрос о ребёнке или беременности."
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+        if row:
+            mode = row["mode"] or ""
+            date_value = row["date_value"] or ""
+            if mode == "pregnant":
+                weeks = _miniapp_pregnancy_weeks(date_value)
+                if weeks is not None:
+                    context = f"Женщина на {weeks} неделе беременности задаёт вопрос."
+            elif mode:
+                months = _miniapp_child_months(date_value)
+                if months is not None:
+                    context = f"Мама, ребёнку {age_label(months)} ({months} месяцев), задаёт вопрос."
+    except Exception:
+        logging.exception("miniapp_ask_question: profile lookup error")
+
+    log_analytics_event_tg(user_id, "request_started", "personal_question", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        "Ты эксперт в педиатрии, перинатальной психологии и детском развитии. "
+        f"{context} "
+        "Опирайся на рекомендации ВОЗ, AAP, ACOG и труды ведущих специалистов. "
+        "Отвечай развёрнуто, точно и с теплом. При медицинских симптомах — направляй к педиатру.",
+        question,
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "personal_question", "miniapp", user.get("platform", "telegram"))
+        return {"ok": True, "answer": answer}
+    log_analytics_event_tg(user_id, "request_failed", "personal_question", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ЛИЧНЫЙ РАЗБОР СИТУАЦИИ ==========
+# Platform-aware, как и остальные Mini App endpoints: пишет/читает через _miniapp_db(user) —
+# Telegram -> mama.db, MAX -> mama_max.db, платформа берётся из verified initData, не с клиента.
+# Оплату Telegram-заявок подтверждает check_payments_loop в mama_bot.py (mama.db); оплату
+# MAX-заявок — check_payments_loop в этом же файле (mama_max.db), см. process_personal_review_payment_max.
+# Здесь никогда не пишем situation_text в логи/аналитику.
+PERSONAL_REVIEW_MIN_LEN = 10
+PERSONAL_REVIEW_MAX_LEN = 4000
+PERSONAL_REVIEW_STATUS_LABELS = {
+    "draft": {"title": "Заявка не завершена", "detail": "Заполните форму и оплатите разбор."},
+    "payment_pending": {"title": "Ждём подтверждение оплаты", "detail": "Обычно это занимает несколько секунд."},
+    "paid": {"title": "Заявка принята", "detail": "Личный разбор готовит автор проекта."},
+    "in_review": {"title": "Заявка принята", "detail": "Личный разбор готовит автор проекта."},
+    "answered": {"title": "Ваш разбор готов", "detail": "Голосовое сообщение отправлено вам в бот «Мамин помощник»."},
+    "cancelled": {"title": "Оплата не прошла", "detail": "Попробуйте отправить заявку ещё раз."},
+}
+
+
+def _personal_reviews_ensure_schema(conn):
+    conn.execute("""CREATE TABLE IF NOT EXISTS personal_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT NOT NULL DEFAULT 'telegram',
+        user_id INTEGER NOT NULL,
+        situation_text TEXT NOT NULL,
+        preferred_reply TEXT NOT NULL DEFAULT 'telegram',
+        email TEXT DEFAULT NULL,
+        consent_at TEXT NOT NULL,
+        payment_id TEXT DEFAULT '',
+        payment_status TEXT NOT NULL DEFAULT 'unpaid',
+        status TEXT NOT NULL DEFAULT 'draft',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        answer_file_id TEXT DEFAULT NULL,
+        answer_path TEXT DEFAULT NULL,
+        answered_at TEXT DEFAULT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_personal_reviews_user ON personal_reviews(user_id, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_personal_reviews_status ON personal_reviews(status, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_personal_reviews_payment ON personal_reviews(payment_id)")
+
+
+def _valid_email(value):
+    value = (value or "").strip()
+    if not value or " " in value or value.count("@") != 1 or len(value) > 254:
+        return False
+    local, _, domain = value.partition("@")
+    return bool(local) and "." in domain and not domain.startswith(".") and not domain.endswith(".")
+
+
+async def _create_personal_review_payment(user_id, review_id):
+    amount_str = f"{PERSONAL_REVIEW_PRICE_RUB:.2f}"
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.yookassa.ru/v3/payments",
+            json={
+                "amount": {"value": amount_str, "currency": "RUB"},
+                "confirmation": {"type": "redirect", "return_url": "https://maminpomoshnik.ru/payment/success"},
+                "capture": True,
+                "description": "Личный разбор ситуации",
+                "receipt": {"customer": {"email": "6038484@mail.ru"}, "items": [{
+                    "description": "Личный разбор ситуации", "quantity": "1.00",
+                    "amount": {"value": amount_str, "currency": "RUB"}, "vat_code": 1,
+                    "payment_subject": "service", "payment_mode": "full_payment"
+                }]},
+                "metadata": {"user_id": user_id, "product_code": PERSONAL_REVIEW_PRODUCT_CODE, "product_type": "personal_review", "review_id": review_id}
+            },
+            headers={"Idempotence-Key": str(uuid.uuid4()), "Content-Type": "application/json"},
+            auth=(YOOKASSA_SHOP_ID, YOOKASSA_SECRET),
+        )
+        if not r.is_success:
+            raise RuntimeError(f"ЮКасса: {r.status_code} {r.text[:300]}")
+        return r.json()
+
+
+def process_personal_review_payment_max(payment_id, user_id):
+    """MAX-аналог process_personal_review_payment из mama_bot.py, но пишет в mama_max.db
+    (DB) через db_connect(), которую здесь же читает check_payments_loop. Идемпотентно
+    фиксирует оплату личного разбора; не выдаёт кредиты, не активирует подписку."""
+    now_iso = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        _personal_reviews_ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM processed_payments WHERE payment_id=?", (payment_id,)).fetchone():
+            conn.rollback(); return False, None
+        review_row = conn.execute("SELECT id FROM personal_reviews WHERE payment_id=?", (payment_id,)).fetchone()
+        if not review_row:
+            conn.rollback(); return False, None
+        review_id = review_row[0]
+        conn.execute(
+            "UPDATE personal_reviews SET status='paid',payment_status='paid',updated_at=? "
+            "WHERE payment_id=? AND status IN ('draft','payment_pending')",
+            (now_iso, payment_id),
+        )
+        conn.execute("INSERT INTO processed_payments(payment_id,user_id,product_code,processed_at) VALUES (?,?,?,?)", (payment_id, user_id, PERSONAL_REVIEW_PRODUCT_CODE, now_iso))
+        conn.execute("UPDATE payments SET status='processed',raw_status='succeeded',updated_at=? WHERE payment_id=?", (now_iso, payment_id))
+        conn.execute(
+            "INSERT INTO sales_events(payment_id,created_at,platform,user_id,product_code,amount,currency,ends_at) VALUES (?,?,?,?,?,?,?,?)",
+            (payment_id, now_iso, "max", user_id, PERSONAL_REVIEW_PRODUCT_CODE, f"{PERSONAL_REVIEW_PRICE_RUB:.2f}", "RUB", ""),
+        )
+        conn.execute("DELETE FROM pending_payments WHERE payment_id=?", (payment_id,))
+        conn.commit(); return True, review_id
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def mark_personal_review_canceled_max(payment_id):
+    now_iso = datetime.now().isoformat()
+    conn = db_connect()
+    try:
+        _personal_reviews_ensure_schema(conn)
+        conn.execute(
+            "UPDATE personal_reviews SET status='cancelled',payment_status='cancelled',updated_at=? "
+            "WHERE payment_id=? AND status IN ('draft','payment_pending')",
+            (now_iso, payment_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ─── ЛИЧНЫЙ РАЗБОР СИТУАЦИИ: owner-flow (MAX) ──────────────────
+# Эквивалент pr_open/pr_take/pr_receive_voice/pr_rerecord/pr_send из mama_bot.py,
+# читает и пишет только personal_reviews в mama_max.db (см. db_connect() выше).
+# MAX API в этом проекте подтверждён только для входящих voice/audio-вложений
+# (см. process_voice) и для исходящих image/file-вложений (upload_channel_image_to_max,
+# aura_owner_book_delivery.py). Исходящий voice/audio ни в mama_max_bot.py, ни в
+# aura_max_bot.py не используется нигде — поэтому голос владельца скачивается и
+# сохраняется как локальный файл (безопасная временная ссылка в уже существующей
+# колонке answer_path), а доставляется получателю как file-вложение по проверенному
+# паттерну /uploads?type=file + retry на attachment.not.ready.
+PERSONAL_REVIEW_VOICE_DIR = "/root/mama_max_personal_review_voices"
+
+_PR_STATUS_LABELS_OWNER = {
+    "draft": "черновик", "payment_pending": "ожидает оплаты", "paid": "оплачена",
+    "in_review": "в работе", "answered": "отвечена", "cancelled": "отменена",
+}
+
+
+def _pr_status_label_max(status):
+    return _PR_STATUS_LABELS_OWNER.get(status, status)
+
+
+def get_personal_review_max(review_id):
+    with db_connect() as conn:
+        _personal_reviews_ensure_schema(conn)
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM personal_reviews WHERE id=?", (review_id,)).fetchone()
+
+
+def take_personal_review_max(review_id):
+    """paid -> in_review, идемпотентно (повторное нажатие ничего не меняет)."""
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        _personal_reviews_ensure_schema(conn)
+        cur = conn.execute(
+            "UPDATE personal_reviews SET status='in_review',updated_at=? WHERE id=? AND status='paid'",
+            (now_iso, review_id),
+        )
+        return cur.rowcount == 1
+
+
+def attach_personal_review_voice_max(review_id, voice_path):
+    """Привязывает локальный путь к голосовому владельца. answer_file_id (постоянный
+    MAX-идентификатор) не подтверждён для исходящих voice/audio, поэтому используется
+    answer_path — то же поле, что уже есть в схеме personal_reviews."""
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        _personal_reviews_ensure_schema(conn)
+        cur = conn.execute(
+            "UPDATE personal_reviews SET answer_path=?,updated_at=? WHERE id=? AND status='in_review'",
+            (voice_path, now_iso, review_id),
+        )
+        return cur.rowcount == 1
+
+
+def mark_personal_review_answered_max(review_id):
+    """in_review -> answered, идемпотентно. True только на первом успешном переходе —
+    повторный вызов после answered ничего не меняет и не должен приводить к повторной отправке."""
+    now_iso = datetime.now().isoformat()
+    with db_connect() as conn:
+        _personal_reviews_ensure_schema(conn)
+        cur = conn.execute(
+            "UPDATE personal_reviews SET status='answered',answered_at=?,updated_at=? "
+            "WHERE id=? AND status='in_review' AND answer_path IS NOT NULL",
+            (now_iso, now_iso, review_id),
+        )
+        return cur.rowcount == 1
+
+
+def _extract_max_file_token(data):
+    """Рекурсивный поиск token в ответе MAX /uploads?type=file — тот же проверенный
+    паттерн, что и в aura_owner_book_delivery.py (send_owner_pdf_via_max)."""
+    if isinstance(data, str):
+        return data if len(data) > 10 else None
+    if isinstance(data, dict):
+        if "token" in data:
+            return data["token"]
+        for v in data.values():
+            result = _extract_max_file_token(v)
+            if result:
+                return result
+    if isinstance(data, list):
+        for item in data:
+            result = _extract_max_file_token(item)
+            if result:
+                return result
+    return None
+
+
+async def send_personal_review_voice_max(chat_id, voice_path):
+    """Доставляет голосовой ответ владельца получателю через MAX Bot API как
+    file-вложение (см. пояснение в шапке секции выше). Возвращает True только
+    при подтверждённой отправке."""
+    if not voice_path or not os.path.exists(voice_path):
+        logging.error("send_personal_review_voice_max: файл не найден %s", voice_path)
+        return False
+    headers = {"Authorization": MAX_TOKEN}
+    filename = os.path.basename(voice_path)
+    content_type = "audio/mpeg" if voice_path.endswith(".mp3") else "audio/ogg"
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            init_resp = await client.post(f"{MAX_API}/uploads?type=file", headers=headers)
+            if not init_resp.is_success:
+                logging.error("MAX personal review voice upload init error %s %s", init_resp.status_code, init_resp.text[:300])
+                return False
+            upload_url = init_resp.json().get("url")
+            if not upload_url:
+                logging.error("MAX personal review voice upload init: в ответе нет url")
+                return False
+            with open(voice_path, "rb") as f:
+                upload_resp = await client.post(upload_url, files={"data": (filename, f, content_type)})
+            if not upload_resp.is_success:
+                logging.error("MAX personal review voice upload error %s %s", upload_resp.status_code, upload_resp.text[:300])
+                return False
+            try:
+                token = _extract_max_file_token(upload_resp.json())
+            except ValueError:
+                token = None
+            if not token:
+                logging.error("MAX personal review voice upload: token не найден")
+                return False
+            payload = {"text": " ", "attachments": [{"type": "file", "payload": {"token": token}}]}
+            sent = None
+            for attempt in range(5):
+                sent = await client.post(
+                    f"{MAX_API}/messages?chat_id={chat_id}", json=payload,
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                if sent.status_code < 400:
+                    return True
+                if sent.status_code == 400 and "attachment.not.ready" in (sent.text or ""):
+                    await asyncio.sleep(1.5)
+                    continue
+                break
+            logging.error("MAX personal review voice send error %s %s", sent.status_code if sent else "?", (sent.text[:300] if sent else ""))
+            return False
+    except Exception:
+        logging.exception("send_personal_review_voice_max exception")
+        return False
+
+
+async def pr_receive_voice_max(chat_id, user_id, step, audio_url):
+    """MAX-аналог pr_receive_voice из mama_bot.py: принимает голос/аудио владельца
+    для заявки, скачивает и сохраняет как безопасную временную ссылку (локальный
+    файл), затем показывает подтверждение отправки."""
+    try:
+        review_id = int(step.replace("pr_voice_", "", 1))
+    except ValueError:
+        set_step(user_id, "idle")
+        await send_message(chat_id, "Нет активной заявки для голосового ответа.")
+        return
+    row = get_personal_review_max(review_id)
+    if not row or row["status"] != "in_review":
+        set_step(user_id, "idle")
+        await send_message(chat_id, f"Заявка №{review_id} недоступна для голосового ответа.")
+        return
+    audio_bytes, audio_mime = await download_file(audio_url, max_size=25 * 1024 * 1024)
+    if not audio_bytes:
+        await send_message(chat_id, "Не удалось получить голосовое. Попробуй отправить ещё раз.")
+        return
+    try:
+        os.makedirs(PERSONAL_REVIEW_VOICE_DIR, exist_ok=True)
+        ext = "mp3" if audio_mime == "audio/mpeg" else "ogg"
+        for stale_ext in ("ogg", "mp3"):
+            if stale_ext == ext:
+                continue
+            stale_path = os.path.join(PERSONAL_REVIEW_VOICE_DIR, f"{review_id}.{stale_ext}")
+            if os.path.exists(stale_path):
+                os.remove(stale_path)
+        voice_path = os.path.join(PERSONAL_REVIEW_VOICE_DIR, f"{review_id}.{ext}")
+        with open(voice_path, "wb") as f:
+            f.write(audio_bytes)
+    except Exception:
+        logging.exception("pr_receive_voice_max: не удалось сохранить файл заявки %s", review_id)
+        await send_message(chat_id, "Не удалось сохранить голосовое. Попробуй ещё раз.")
+        return
+    ok = attach_personal_review_voice_max(review_id, voice_path)
+    set_step(user_id, "idle")
+    if not ok:
+        await send_message(chat_id, f"Не удалось привязать голосовое к заявке №{review_id} — проверь её статус через «Открыть заявку».")
+        return
+    await send_message(
+        chat_id,
+        "Отправить ответ клиенту?",
+        [
+            [{"type": "callback", "text": "✅ Отправить ответ клиенту", "payload": f"pr_send:{review_id}"}],
+            [{"type": "callback", "text": "🔁 Записать заново", "payload": f"pr_rerecord:{review_id}"}],
+        ],
+    )
+
+
+@app.post("/api/miniapp/personal-review/submit")
+async def miniapp_personal_review_submit(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    situation_text = str((body or {}).get("situation_text") or "").strip()
+    preferred_reply = str((body or {}).get("preferred_reply") or "telegram").strip().lower()
+    email = str((body or {}).get("email") or "").strip()
+    consent = bool((body or {}).get("consent"))
+    disclaimer_ack = bool((body or {}).get("disclaimer_ack"))
+
+    if len(situation_text) < PERSONAL_REVIEW_MIN_LEN:
+        raise HTTPException(status_code=400, detail="situation_text_too_short")
+    if len(situation_text) > PERSONAL_REVIEW_MAX_LEN:
+        raise HTTPException(status_code=400, detail="situation_text_too_long")
+    if preferred_reply not in ("telegram", "email"):
+        raise HTTPException(status_code=400, detail="invalid_preferred_reply")
+    if preferred_reply == "email" and not _valid_email(email):
+        raise HTTPException(status_code=400, detail="invalid_email")
+    if not consent:
+        raise HTTPException(status_code=400, detail="consent_required")
+    if not disclaimer_ack:
+        raise HTTPException(status_code=400, detail="disclaimer_required")
+
+    now = datetime.now().isoformat()
+    review_id = None
+    try:
+        with _miniapp_db(user) as conn:
+            _personal_reviews_ensure_schema(conn)
+            cur = conn.execute(
+                "INSERT INTO personal_reviews(platform,user_id,situation_text,preferred_reply,email,consent_at,payment_status,status,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (platform, user_id, situation_text, preferred_reply, email if preferred_reply == "email" else None, now, "unpaid", "draft", now, now),
+            )
+            review_id = cur.lastrowid
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_personal_review_submit: db insert error")
+        raise HTTPException(status_code=500, detail="internal_error")
+
+    try:
+        payment = await _create_personal_review_payment(user_id, review_id)
+    except Exception:
+        logging.exception("miniapp_personal_review_submit: yookassa error")
+        try:
+            with _miniapp_db(user) as conn:
+                conn.execute("DELETE FROM personal_reviews WHERE id=? AND status='draft'", (review_id,))
+                conn.commit()
+        except Exception:
+            logging.exception("miniapp_personal_review_submit: cleanup after payment error failed")
+        raise HTTPException(status_code=502, detail="payment_create_failed")
+
+    payment_id = payment.get("id")
+    confirmation = payment.get("confirmation") or {}
+    confirmation_url = confirmation.get("confirmation_url")
+    amount_str = f"{PERSONAL_REVIEW_PRICE_RUB:.2f}"
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute(
+                "UPDATE personal_reviews SET payment_id=?,status='payment_pending',payment_status='pending',updated_at=? WHERE id=?",
+                (payment_id, datetime.now().isoformat(), review_id),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_payments(payment_id,user_id,plan,created_at) VALUES (?,?,?,?)",
+                (payment_id, user_id, PERSONAL_REVIEW_PRODUCT_CODE, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO payments(payment_id,user_id,platform,product_type,product_code,amount,currency,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (payment_id, user_id, platform, "personal_review", PERSONAL_REVIEW_PRODUCT_CODE, amount_str, "RUB", "pending", now, now),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_personal_review_submit: db update error after payment create")
+        raise HTTPException(status_code=500, detail="internal_error")
+
+    log_analytics_event_tg(user_id, "personal_review_payment_created", PERSONAL_REVIEW_PRODUCT_CODE, payment_id, platform)
+    return {"ok": True, "review_id": review_id, "payment_id": payment_id, "confirmation_url": confirmation_url, "amount": PERSONAL_REVIEW_PRICE_RUB}
+
+
+@app.get("/api/miniapp/personal-review/status")
+async def miniapp_personal_review_status(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    review_id = request.query_params.get("id")
+    if not review_id or not review_id.isdigit():
+        raise HTTPException(status_code=400, detail="invalid_id")
+    row = None
+    try:
+        with _miniapp_db(user) as conn:
+            _personal_reviews_ensure_schema(conn)
+            row = conn.execute(
+                "SELECT id,user_id,status,preferred_reply,answered_at,created_at FROM personal_reviews WHERE id=?",
+                (int(review_id),),
+            ).fetchone()
+    except Exception:
+        logging.exception("miniapp_personal_review_status db error")
+        raise HTTPException(status_code=500, detail="internal_error")
+    if not row or int(row["user_id"]) != int(user_id):
+        raise HTTPException(status_code=404, detail="not_found")
+    label = PERSONAL_REVIEW_STATUS_LABELS.get(row["status"], {"title": row["status"], "detail": ""})
+    return {
+        "ok": True,
+        "review_id": row["id"],
+        "status": row["status"],
+        "title": label["title"],
+        "detail": label["detail"],
+        "answered": row["status"] == "answered",
+        "answered_at": row["answered_at"] or "",
+    }
+
+
+# ========== MINI APP: ПОДДЕРЖАТЬ ПРОЕКТ (ДОНАТ) ==========
+# Переиспользует существующий добровольный support-flow: create_support_payment() — тот же
+# вызов ЮKassa (креды/провайдер не меняются), что уже использует нативный MAX-бот
+# (donate_confirm) и mama_bot.py (Telegram). Новый webhook не создаётся. Запись уходит в
+# pending_payments/payments/support_payments БД своей платформы (_miniapp_db, telegram ->
+# mama.db, max -> mama_max.db) — подтверждение оплаты и уведомление делает уже работающий
+# check_payments_loop: свой для Telegram (mama_bot.py) и свой для MAX (в этом файле).
+# Донат не выдаёт кредиты, не активирует подписку и не меняет тариф.
+DONATE_MINIAPP_VARIANTS = {str(int(a)) for a, _ in DONATE_AMOUNTS} | {"custom"}
+
+
+@app.post("/api/miniapp/support/create")
+async def miniapp_support_create(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    variant = str((body or {}).get("variant") or "").strip()
+    if variant not in DONATE_MINIAPP_VARIANTS:
+        raise HTTPException(status_code=400, detail="invalid_variant")
+    try:
+        amount = round(float((body or {}).get("amount")), 2)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_amount")
+    if not (DONATE_MIN_AMOUNT <= amount <= DONATE_MAX_AMOUNT):
+        raise HTTPException(status_code=400, detail="invalid_amount")
+    if variant != "custom" and amount != float(variant):
+        raise HTTPException(status_code=400, detail="invalid_amount")
+
+    try:
+        payment = await create_support_payment(user_id, amount)
+    except Exception:
+        logging.exception("miniapp_support_create: yookassa error")
+        raise HTTPException(status_code=502, detail="payment_create_failed")
+
+    payment_id = payment.get("id")
+    confirmation_url = (payment.get("confirmation") or {}).get("confirmation_url")
+    if not payment_id or not confirmation_url:
+        raise HTTPException(status_code=502, detail="payment_create_failed")
+
+    amount_str = f"{amount:.2f}"
+    now = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute("INSERT OR IGNORE INTO pending_payments(payment_id,user_id,plan,created_at) VALUES (?,?,?,?)", (payment_id, user_id, "support_project", now))
+            conn.execute(
+                "INSERT OR IGNORE INTO payments(payment_id,user_id,platform,product_type,product_code,amount,currency,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (payment_id, user_id, platform, "support", "support_project", amount_str, "RUB", "pending", now, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO support_payments(payment_id,user_id,platform,amount,currency,status,variant,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (payment_id, user_id, platform, amount_str, "RUB", "pending", variant, "miniapp", now, now),
+            )
+    except Exception:
+        logging.exception("miniapp_support_create: db error")
+        raise HTTPException(status_code=500, detail="internal_error")
+
+    log_analytics_event_tg(user_id, "support_payment_created", variant, amount_str, platform)
+    return {"ok": True, "payment_id": payment_id, "confirmation_url": confirmation_url, "amount": amount}
+
+
+# ========== MINI APP: ИСТЕРИКИ И ЭМОЦИИ ==========
+# Те же системные prompts, тот же OpenAI client (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt),
+# что и в mama_tantrums() / mama_emotions() из mama_bot.py (Telegram) — тексты скопированы дословно.
+# Возраст ребёнка для "Истерики ребёнка" читается из mama.db (users.date_value), как в Telegram
+# (mama_gpt_handler требует заполненный профиль); "Эмоции мамы" от возраста не зависит, как в Telegram.
+MINIAPP_TANTRUMS_SYSTEM = (
+    "Ты эксперт в детской педиатрии, психологии развития и нейронауке. "
+    "Опирайся строго на научно доказанные данные: рекомендации ВОЗ, руководства AAP "
+    "(Американской академии педиатрии), исследования CDC, труды ведущих специалистов — "
+    "Людмилы Петрановской (теория привязанности), Харви Карпа (успокоение новорождённых), "
+    "Уильяма Серза (attachment parenting), Жана Пиаже (когнитивное развитие), "
+    "Льва Выготского (зона ближайшего развития). "
+    "Отвечай развёрнуто, структурированно, с конкретными практическими рекомендациями. "
+    "Пиши тепло и понятно для мамы — без медицинского жаргона, но с научной точностью. "
+    "При любых симптомах здоровья обязательно рекомендуй консультацию педиатра."
+)
+
+MINIAPP_EMOTIONS_SYSTEM = (
+    MINIAPP_TANTRUMS_SYSTEM + " Ты также специалист по послеродовой психологии и материнскому выгоранию. "
+    "Говори с мамой как заботливый друг-эксперт — тепло, без осуждения, с глубоким пониманием. "
+    "Мама важна не меньше ребёнка. Это научный факт."
+)
+
+MINIAPP_EMOTIONS_PROMPT = (
+    "Дай развёрнутую научную информацию об эмоциональном состоянии мамы после родов. "
+    "1) Послеродовая депрессия vs беби-блюз — в чём разница, критерии DSM-5, распространённость по данным ВОЗ; "
+    "2) Материнское выгорание — симптомы, исследования Моники Роскам; "
+    "3) Тревожность молодых мам — нейрофизиология и доказанные методы снижения; "
+    "4) Самозабота с научной точки зрения — что реально восстанавливает ресурс мамы; "
+    "5) Когда нужна профессиональная помощь — конкретные признаки. "
+    "Говори тепло, поддерживающе, без осуждения."
+)
+
+
+@app.post("/api/miniapp/tantrums")
+async def miniapp_tantrums(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    months = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+        if row and row["mode"] and row["mode"] != "pregnant":
+            months = _miniapp_child_months(row["date_value"] or "")
+    except Exception:
+        logging.exception("miniapp_tantrums: profile lookup error")
+    if months is None:
+        raise HTTPException(status_code=400, detail="profile_required")
+
+    log_analytics_event_tg(user_id, "request_started", "tantrums", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        MINIAPP_TANTRUMS_SYSTEM,
+        f"Объясни поведение ребёнка {age_label(months)} ({months} месяцев) с нейронаучной точки зрения "
+        f"на основе трудов Людмилы Петрановской, Дэниэла Сигела и Тины Пейн Брайсон. "
+        f"1) Почему ребёнок ведёт себя именно так — незрелость префронтальной коры; "
+        f"2) Теория привязанности Петрановской — как это применить прямо сейчас; "
+        f"3) Метод 'Connect and Redirect' Сигела — пошаговый алгоритм; "
+        f"4) Что делать в момент истерики — конкретные фразы и действия; "
+        f"5) Как НЕ навредить психике ребёнка — чего избегать категорически.",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "tantrums", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "tantrums", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+@app.post("/api/miniapp/emotions")
+async def miniapp_emotions(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    log_analytics_event_tg(user_id, "request_started", "emotions", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_EMOTIONS_SYSTEM, MINIAPP_EMOTIONS_PROMPT)
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "emotions", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "emotions", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: МАМИН ПСИХОЛОГ ==========
+# Тот же сценарий psycho_start/psycho_message/psycho_clear, что и в mama_bot.py (Telegram) и
+# в step=="psycho" из этого файла (MAX-бот): тот же PSYCHO_SYSTEM, тот же OpenAI client
+# (gpt-4o, max_tokens=800), та же таблица psycho_history (без новой таблицы), история читается
+# и пишется через _miniapp_db(user) — своя БД на платформу (mama.db/mama_max.db), как и во всех
+# остальных miniapp-эндпоинтах. Лимит psycho_messages (премиум/апсейл) здесь намеренно не
+# применяется — как и в остальных AI-эндпоинтах Mini App (ask-question/emotions/tantrums/
+# kindergarten), чтобы не трогать логику payments/subscriptions.
+# Точный Telegram PSYCHO_SYSTEM (mama_bot.py, PsychoStates.in_session / psycho_message) — дословно,
+# без сокращений и перефразирования, включая инструкцию по кризисным состояниям и мягкое
+# направление к специалисту. Используется ТОЛЬКО эндпоинтом Mini App /api/miniapp/psycho/message
+# (обе платформы, Telegram и MAX, проходят через этот же FastAPI-процесс). Отдельно от глобального
+# PSYCHO_SYSTEM выше (используется MAX chat-flow step=="psycho", не трогаем).
+MINIAPP_PSYCHO_SYSTEM_TG = """Ты Мамин психолог — тёплый, внимательный, профессиональный психолог специально для мам.
+
+Твои принципы:
+- Ты помнишь всё что мама рассказывала тебе раньше — используй это в ответах
+- Отвечаешь как живой человек, не как робот — с теплом, эмпатией, без шаблонов
+- Опираешься на доказательные методы: КПТ (когнитивно-поведенческая терапия), ACT (терапия принятия), нарративную терапию, теорию привязанности Петрановской
+- Никогда не осуждаешь маму — любое её чувство нормально
+- Не даёшь советов пока не поймёшь ситуацию — сначала слушаешь и задаёшь вопросы
+- Замечаешь паттерны в том что мама рассказывает и мягко указываешь на них
+- Помогаешь маме понять себя, а не просто решаешь проблему
+- При серьёзных симптомах (суицидальные мысли, тяжёлая депрессия) мягко направляешь к специалисту
+
+Ты знаешь что материнство — это огромный труд. Мама важна не меньше ребёнка."""
+
+MINIAPP_PSYCHO_MAX_LEN = 2000
+MINIAPP_PSYCHO_AI_HISTORY_LIMIT = 15  # столько сообщений уходит в контекст GPT — как в Telegram/MAX
+MINIAPP_PSYCHO_DISPLAY_LIMIT = 60  # сколько сообщений отдаём на экран истории чата
+
+
+def _miniapp_psycho_context(row):
+    if not row:
+        return ""
+    mode = row["mode"] or ""
+    date_value = row["date_value"] or ""
+    if mode == "pregnant":
+        weeks = _miniapp_pregnancy_weeks(date_value)
+        if weeks is not None:
+            return f"Это беременная женщина на {weeks} неделе."
+    elif mode:
+        months = _miniapp_child_months(date_value)
+        if months is not None:
+            return f"Это мама, ребёнку {age_label(months)} ({months} месяцев)."
+    return ""
+
+
+@app.get("/api/miniapp/psycho/history")
+async def miniapp_psycho_history(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            rows = conn.execute(
+                "SELECT role, content, created_at FROM psycho_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (user_id, MINIAPP_PSYCHO_DISPLAY_LIMIT),
+            ).fetchall()
+        items = [
+            {"role": r["role"] or "assistant", "content": r["content"] or "", "created_at": r["created_at"] or ""}
+            for r in reversed(rows)
+        ]
+    except Exception:
+        logging.exception("miniapp_psycho_history db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    return {"ok": True, "items": items}
+
+
+@app.post("/api/miniapp/psycho/message")
+async def miniapp_psycho_message(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    text = str((body or {}).get("message") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message_required")
+    if len(text) > MINIAPP_PSYCHO_MAX_LEN:
+        raise HTTPException(status_code=400, detail="message_too_long")
+
+    context = ""
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            context = _miniapp_psycho_context(row)
+            conn.execute(
+                "INSERT INTO psycho_history (user_id, role, content, created_at) VALUES (?,?,?,?)",
+                (user_id, "user", text, created_at),
+            )
+            conn.commit()
+            history_rows = conn.execute(
+                "SELECT role, content FROM psycho_history WHERE user_id=? ORDER BY id DESC LIMIT ?",
+                (user_id, MINIAPP_PSYCHO_AI_HISTORY_LIMIT),
+            ).fetchall()
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("miniapp_psycho_message db error")
+        raise HTTPException(status_code=500, detail="db_error")
+
+    history = list(reversed(history_rows))
+    messages = [{"role": "system", "content": MINIAPP_PSYCHO_SYSTEM_TG + (f" {context}" if context else "")}]
+    for r in history[:-1]:
+        messages.append({"role": r["role"], "content": r["content"]})
+    messages.append({"role": "user", "content": text})
+
+    log_analytics_event_tg(user_id, "request_started", "psycho", "miniapp", user.get("platform", "telegram"))
+    try:
+        response = await openai_client.chat.completions.create(model="gpt-4o", messages=messages, max_tokens=800)
+        answer = clean_text(response.choices[0].message.content)
+    except Exception as exc:
+        logging.exception("miniapp_psycho_message AI error")
+        await notify_owner_max(
+            f"⚠️ Ошибка AI MiniApp psycho\n\n{type(exc).__name__}: {exc}",
+            key=f"ai_miniapp_psycho_{type(exc).__name__}",
+        )
+        answer = AI_FAILURE_MESSAGE
+
+    if ai_answer_success(answer):
+        try:
+            with _miniapp_db(user) as conn:
+                conn.execute(
+                    "INSERT INTO psycho_history (user_id, role, content, created_at) VALUES (?,?,?,?)",
+                    (user_id, "assistant", answer, datetime.now().isoformat()),
+                )
+                conn.commit()
+        except Exception:
+            logging.exception("miniapp_psycho_message: save assistant error")
+        log_analytics_event_tg(user_id, "request_completed", "psycho", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "psycho", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+@app.post("/api/miniapp/psycho/clear")
+async def miniapp_psycho_clear(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute("DELETE FROM psycho_history WHERE user_id=?", (user_id,))
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_psycho_clear db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "psycho_clear", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True}
+
+
+# ========== MINI APP: УДАЛИТЬ МОИ ДАННЫЕ ==========
+# Перенос reset_me/reset_me_confirm из mama_bot.py (Telegram) в Mini App: список таблиц
+# скопирован дословно из reset_me_confirm_tg, включая допущение "таблицы может не быть на
+# этой платформе — пропускаем" (sqlite3.OperationalError), как в оригинале. Платёжный журнал
+# (payments/processed_payments/subscription_history/purchases/sales_events/support_payments)
+# в список не входит и не трогается — как и в Telegram-сценарии. user_id берётся только из
+# проверенного initData (_miniapp_require_user), с клиента не принимается.
+MINIAPP_RESET_ME_TABLES = [
+    "diary", "growth", "symptoms", "feeding", "sleep_log", "psycho_history",
+    "vaccinations", "subscriptions", "requests_count", "user_credits",
+    "marketing_offers", "pending_payments", "users"
+]
+
+
+@app.post("/api/miniapp/reset-me")
+async def miniapp_reset_me(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        raise HTTPException(status_code=400, detail="confirm_required")
+    try:
+        with _miniapp_db(user) as conn:
+            for table in MINIAPP_RESET_ME_TABLES:
+                try:
+                    conn.execute(f"DELETE FROM {table} WHERE user_id=?", (user_id,))
+                except sqlite3.OperationalError as exc:
+                    msg = str(exc).lower()
+                    if "no such table" not in msg and "no such column" not in msg:
+                        raise
+            conn.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        logging.exception("miniapp_reset_me db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    return {"ok": True, "reset": True}
+
+
+# ========== MINI APP: САДИК ==========
+# Тот же системный prompt (EXPERT_BASE) и тот же user prompt, тот же OpenAI client
+# (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt), что и в fd_sadik() из mama_bot.py
+# (Telegram) — текст скопирован дословно. fd_sadik не использует профиль/возраст
+# ребёнка, поэтому запрос к users не выполняется, как и в Telegram-сценарии.
+MINIAPP_KINDERGARTEN_SYSTEM = MINIAPP_TANTRUMS_SYSTEM
+
+MINIAPP_KINDERGARTEN_PROMPT = (
+    "Дай подробную инструкцию по записи ребёнка в детский сад в России. "
+    "1) Когда вставать в очередь — оптимальный возраст ребёнка; "
+    "2) Как встать в очередь через Госуслуги — пошагово; "
+    "3) Какие документы нужны; "
+    "4) Как работает система льготных очередей — кто имеет право; "
+    "5) Что делать если отказали или долго ждать; "
+    "6) С какого возраста берут в садик по закону. "
+    "Конкретно и пошагово."
+)
+
+
+@app.post("/api/miniapp/kindergarten")
+async def miniapp_kindergarten(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    log_analytics_event_tg(user_id, "request_started", "kindergarten", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_KINDERGARTEN_SYSTEM, MINIAPP_KINDERGARTEN_PROMPT)
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "kindergarten", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "kindergarten", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ПЕРВЫЕ ДНИ С МАЛЫШОМ ==========
+# Тот же системный prompt (EXPERT_BASE/MINIAPP_TANTRUMS_SYSTEM) и те же user prompts, тот же
+# OpenAI client (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt), что и в fd_pediatr/fd_doctors/
+# fd_svid/fd_massage/fd_swim из mama_bot.py (Telegram) — тексты скопированы дословно. Единый
+# endpoint с query-параметром topic, авторизация через _miniapp_require_user (user_id с клиента
+# не доверяется). Ни один из этих 5 Telegram-хендлеров не использует профиль/возраст ребёнка,
+# поэтому запрос к users не выполняется — как и в /api/miniapp/kindergarten. fd_sadik сюда
+# намеренно НЕ включён — это уже отдельный рабочий /api/miniapp/kindergarten, дублировать его
+# промпт здесь нельзя.
+MINIAPP_FIRSTDAYS_SYSTEM = MINIAPP_TANTRUMS_SYSTEM
+
+MINIAPP_FIRSTDAYS_PROMPTS = {
+    "pediatrician": (
+        "Расскажи подробно о первом осмотре педиатра после выписки из роддома. "
+        "1) Когда педиатр должен прийти по закону — сроки по российскому законодательству; "
+        "2) Как вызвать педиатра на дом — пошаговая инструкция (телефон, Госуслуги, сайт поликлиники); "
+        "3) Что педиатр проверяет при первом осмотре новорождённого — полный список; "
+        "4) Какие вопросы задать педиатру при первом визите; "
+        "5) Что приготовить к приходу врача. "
+        "Отвечай конкретно и практично."
+    ),
+    "doctors": (
+        "Составь подробный календарь обходов врачей для ребёнка по месяцам — от рождения до 1 года. "
+        "По каждому визиту укажи: возраст, каких врачей пройти, какие анализы сдать, "
+        "какие прививки по национальному календарю РФ. "
+        "Также укажи какие специалисты нужны в 1 год. "
+        "Сделай в виде чёткого структурированного списка по месяцам."
+    ),
+    "documents": (
+        "Дай пошаговую инструкцию по оформлению документов на новорождённого в России. "
+        "1) Свидетельство о рождении — где получить (ЗАГС/МФЦ/Госуслуги), какие документы нужны, сроки; "
+        "2) Регистрация ребёнка по месту жительства — как и где; "
+        "3) Полис ОМС на ребёнка — как оформить, сроки; "
+        "4) СНИЛС — как получить; "
+        "5) Пособия и выплаты — какие положены, куда обращаться, сроки подачи; "
+        "6) Материнский капитал — как получить. "
+        "Всё пошагово, конкретно, с указанием сроков."
+    ),
+    "massage": (
+        "Дай научно обоснованное руководство по массажу и гимнастике для младенцев. "
+        "1) С какого возраста можно начинать массаж — по рекомендациям педиатров; "
+        "2) Виды массажа для разных возрастов (0-3 мес, 3-6 мес, 6-12 мес); "
+        "3) Пошаговая техника общего укрепляющего массажа — как делать маме дома; "
+        "4) Массаж при коликах и газах — техника и движения; "
+        "5) Гимнастика по возрастам — конкретные упражнения; "
+        "6) Противопоказания к массажу; "
+        "7) Когда нужен профессиональный массажист а не домашний. "
+        "Описывай движения чётко чтобы мама могла повторить."
+    ),
+    "swimming": (
+        "Дай научно обоснованное руководство по плаванию с младенцем. "
+        "1) С какого возраста можно купать и плавать — научные данные; "
+        "2) Рефлекс плавания у новорождённых — что это и как использовать; "
+        "3) Раннее плавание — польза для физического и нервного развития по исследованиям; "
+        "4) Как организовать плавание дома в ванной — пошаговая инструкция; "
+        "5) Температура воды, продолжительность, позиции поддержки; "
+        "6) Бассейн с грудничком — с какого возраста, что выбрать; "
+        "7) Противопоказания к плаванию. "
+        "Конкретно и безопасно."
+    ),
+}
+
+
+@app.get("/api/miniapp/content/firstdays")
+async def miniapp_content_firstdays(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    topic = (request.query_params.get("topic") or "").strip().lower()
+    if topic not in MINIAPP_FIRSTDAYS_PROMPTS:
+        raise HTTPException(status_code=400, detail="invalid_topic")
+
+    log_analytics_event_tg(user_id, "request_started", "firstdays_" + topic, "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_FIRSTDAYS_SYSTEM, MINIAPP_FIRSTDAYS_PROMPTS[topic])
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "firstdays_" + topic, "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "firstdays_" + topic, "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ГРУДНОЕ ВСКАРМЛИВАНИЕ ==========
+# Тот же системный prompt (EXPERT_BASE/MINIAPP_TANTRUMS_SYSTEM) и те же user prompts, тот же
+# OpenAI client (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt), что и в bf_start/bf_pump/
+# bf_lactostaz/bf_food/bf_nofood/bf_formula из mama_bot.py (Telegram) — тексты скопированы
+# дословно. Единый endpoint с query-параметром topic, авторизация через _miniapp_require_user
+# (user_id с клиента не доверяется).
+MINIAPP_BREASTFEEDING_PROMPTS = {
+    "start": (
+        "Дай исчерпывающее руководство по налаживанию грудного вскармливания с первых дней "
+        "по рекомендациям ВОЗ и ЮНИСЕФ. "
+        "1) Первое прикладывание — когда и как, важность в первый час после родов; "
+        "2) Правильный захват груди — детальное описание, признаки правильного и неправильного захвата; "
+        "3) Позиции для кормления — колыбель, из-под руки, лёжа — как каждая выполняется; "
+        "4) Как понять что молока хватает ребёнку — конкретные признаки; "
+        "5) Частота кормлений по возрасту — по требованию vs по расписанию, позиция ВОЗ; "
+        "6) Молозиво — что это, почему оно важнее любой смеси; "
+        "7) Как приходит молоко — сроки, что нормально. "
+        "Поддерживающий и конкретный тон."
+    ),
+    "pump": (
+        "Дай научно обоснованное руководство по увеличению лактации и расцеживанию. "
+        "1) Почему молока может быть мало — физиологические причины; "
+        "2) Как стимулировать выработку молока — доказанные методы (частые прикладывания, сцеживание, контакт кожа-к-коже); "
+        "3) Техника ручного сцеживания — пошагово, движения, как правильно; "
+        "4) Молокоотсос — как выбрать, как пользоваться правильно; "
+        "5) Питание и питьевой режим мамы для лактации — что реально помогает по науке; "
+        "6) Лактогонные средства — что доказано, что миф; "
+        "7) Когда обратиться к консультанту по ГВ. "
+    ),
+    "lactostaz": (
+        "Дай исчерпывающее руководство по лактостазу и уплотнениям в груди. "
+        "1) Что такое лактостаз — причины, симптомы, как отличить от мастита; "
+        "2) Лактостаз vs мастит vs абсцесс — чёткие различия и алгоритм действий для каждого; "
+        "3) Первая помощь при лактостазе — конкретные действия в первые часы; "
+        "4) Техника массажа при уплотнениях — движения, направление, интенсивность; "
+        "5) Правильное расцеживание при лактостазе — пошагово; "
+        "6) Тепло или холод — что и когда применять по доказательной медицине; "
+        "7) Газоотводная трубка и другие народные методы — что говорит наука; "
+        "8) Красные флаги — когда срочно к врачу; "
+        "9) Профилактика лактостаза. "
+        "Это срочная тема — отвечай чётко и конкретно."
+    ),
+    "food": (
+        "Дай научно обоснованные рекомендации по питанию кормящей мамы. "
+        "1) Принципы питания при ГВ по позиции ВОЗ — что реально важно; "
+        "2) Что обязательно включить в рацион — белки, жиры, углеводы, витамины, минералы; "
+        "3) Продукты которые улучшают качество молока — с научным обоснованием; "
+        "4) Витамины для кормящей мамы — какие нужны, дозировки по нормам; "
+        "5) Водный режим — сколько пить и что; "
+        "6) Развенчание мифов о диете при ГВ — что на самом деле не нужно исключать. "
+        "Конкретно и без излишних ограничений."
+    ),
+    "nofood": (
+        "Дай научно обоснованный список того что нельзя или нужно ограничить при грудном вскармливании. "
+        "1) Алкоголь — как влияет на молоко, безопасный интервал по данным AAP; "
+        "2) Кофеин — допустимые дозы, в каких продуктах содержится; "
+        "3) Аллергены — нужно ли исключать заранее или только при реакции ребёнка; "
+        "4) Лекарства при ГВ — общий принцип, где проверять совместимость (LactMed); "
+        "5) Продукты которые влияют на вкус молока; "
+        "6) Что категорически запрещено. "
+        "Развенчай популярные мифы — многие мамы излишне ограничивают себя без причины."
+    ),
+    "formula": (
+        "Дай поддерживающее и научно обоснованное руководство по переходу на смесь. "
+        "1) Когда переход на смесь оправдан — медицинские показания; "
+        "2) Как правильно завершить ГВ — постепенно, без вреда для здоровья мамы; "
+        "3) Как выбрать смесь по возрасту — на что смотреть в составе; "
+        "4) Как правильно разводить смесь — температура, пропорции, стерильность; "
+        "5) Смешанное вскармливание — как совмещать ГВ и смесь; "
+        "6) Психологический аспект — мама не должна чувствовать вину. "
+        "Отвечай без осуждения, поддерживающе."
+    ),
+}
+
+
+@app.get("/api/miniapp/content/breastfeeding")
+async def miniapp_content_breastfeeding(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    topic = (request.query_params.get("topic") or "").strip().lower()
+    if topic not in MINIAPP_BREASTFEEDING_PROMPTS:
+        raise HTTPException(status_code=400, detail="invalid_topic")
+
+    log_analytics_event_tg(user_id, "request_started", "breastfeeding_" + topic, "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_TANTRUMS_SYSTEM, MINIAPP_BREASTFEEDING_PROMPTS[topic])
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "breastfeeding_" + topic, "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "breastfeeding_" + topic, "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ВОССТАНОВЛЕНИЕ МАМЫ ==========
+# Тот же системный prompt (EXPERT_BASE/MINIAPP_TANTRUMS_SYSTEM) и те же user prompts, тот же
+# OpenAI client (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt), что и в rec_natural/rec_caesar/
+# rec_sport/rec_intimate/rec_hair/rec_diastaz из mama_bot.py (Telegram) — тексты скопированы
+# дословно. Единый endpoint с query-параметром topic, авторизация через _miniapp_require_user
+# (user_id с клиента не доверяется).
+MINIAPP_RECOVERY_PROMPTS = {
+    "natural": (
+        "Дай подробное руководство по восстановлению после естественных родов. "
+        "1) Первые 24 часа — что нормально, что должно насторожить; "
+        "2) Послеродовые выделения (лохии) — норма по срокам и объёму, красные флаги; "
+        "3) Швы и разрывы — уход, когда заживут, когда снимают; "
+        "4) Восстановление матки — сроки, признаки нормального процесса; "
+        "5) Боль и дискомфорт — что облегчит, какие препараты безопасны при ГВ; "
+        "6) Поход в туалет после родов — как облегчить; "
+        "7) Геморрой после родов — как лечить безопасно; "
+        "8) Когда можно вставать, ходить, поднимать тяжести. "
+        "Конкретно и практично."
+    ),
+    "caesar": (
+        "Дай исчерпывающее руководство по восстановлению после кесарева сечения. "
+        "1) Первые дни в больнице — что происходит, когда встают, обезболивание; "
+        "2) Шов после КС — виды швов, уход в домашних условиях, чем обрабатывать; "
+        "3) Когда снимают швы или рассасываются сами — по видам; "
+        "4) Ограничения после КС — что нельзя и сколько времени: поднятие тяжестей, секс, спорт; "
+        "5) Боль после КС — как справляться, какие препараты при ГВ; "
+        "6) Восстановление тканей — сроки заживления по слоям; "
+        "7) Рубец — уход, когда начинать массаж рубца, силиконовые пластыри; "
+        "8) Следующая беременность после КС — через сколько можно, риски; "
+        "9) Красные флаги — симптомы при которых срочно к врачу. "
+        "Максимально конкретно — мамы после КС часто не знают что нормально."
+    ),
+    "sport": (
+        "Дай научно обоснованный план возвращения к физической активности после родов. "
+        "1) После естественных родов — когда начинать, с чего начать; "
+        "2) После КС — другие сроки и ограничения; "
+        "3) Упражнения Кегеля — почему критически важны, как делать правильно; "
+        "4) Первые упражнения в роддоме — что безопасно сразу; "
+        "5) Диастаз — как проверить самостоятельно, какие упражнения запрещены при диастазе; "
+        "6) Постепенный план: 6 недель, 3 месяца, 6 месяцев после родов; "
+        "7) Бег, силовые тренировки — когда можно. "
+        "С научным обоснованием и без вреда для здоровья."
+    ),
+    "intimate": (
+        "Дай деликатное и научно обоснованное руководство по интимной жизни после родов. "
+        "1) Когда физически можно возобновить — рекомендации ACOG после естественных родов и КС; "
+        "2) Почему может быть дискомфорт и боль — физиологические причины (сухость, швы, гормоны); "
+        "3) Как справиться с сухостью при ГВ — безопасные средства; "
+        "4) Психологический аспект — снижение либидо после родов это норма, почему; "
+        "5) Как разговаривать с партнёром об этом; "
+        "6) Контрацепция после родов — какие методы при ГВ безопасны. "
+        "Деликатно, без осуждения, с уважением к маме."
+    ),
+    "hair": (
+        "Объясни послеродовое выпадение волос научно и дай практические рекомендации. "
+        "1) Почему выпадают волосы после родов — физиология, роль эстрогена и телогеновой фазы; "
+        "2) Когда начинается и заканчивается — нормальные сроки; "
+        "3) Это норма или патология — как отличить; "
+        "4) Что реально помогает — витамины, питание, уход за волосами с доказательной базой; "
+        "5) Что не поможет — развенчание мифов о масках и народных средствах; "
+        "6) Когда обратиться к трихологу или эндокринологу. "
+        "Поддерживающий тон — многие мамы очень переживают из-за этого."
+    ),
+    "diastaz": (
+        "Дай подробное научное руководство по диастазу после родов. "
+        "1) Что такое диастаз — анатомия, почему возникает при беременности; "
+        "2) Как самостоятельно проверить есть ли диастаз — пошаговый тест; "
+        "3) Степени диастаза — лёгкий, средний, тяжёлый; "
+        "4) Упражнения которые ЗАПРЕЩЕНЫ при диастазе — скручивания, планка, пресс; "
+        "5) Упражнения которые ПОМОГАЮТ — дыхательные, гипопрессивные, Кегеля; "
+        "6) Бандаж после родов — помогает ли, как носить правильно; "
+        "7) Когда нужна операция — показания; "
+        "8) Сроки восстановления при разных степенях. "
+        "Конкретно с описанием упражнений которые мама может делать дома."
+    ),
+}
+
+
+@app.get("/api/miniapp/content/recovery")
+async def miniapp_content_recovery(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    topic = (request.query_params.get("topic") or "").strip().lower()
+    if topic not in MINIAPP_RECOVERY_PROMPTS:
+        raise HTTPException(status_code=400, detail="invalid_topic")
+
+    log_analytics_event_tg(user_id, "request_started", "recovery_" + topic, "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_TANTRUMS_SYSTEM, MINIAPP_RECOVERY_PROMPTS[topic])
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "recovery_" + topic, "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "recovery_" + topic, "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ПОСОБИЯ И ВЫПЛАТЫ ==========
+# Тот же системный prompt и те же user prompts, тот же OpenAI client (gpt-4o, max_tokens=2000
+# через _miniapp_ask_gpt), что и в benefits_gpt()/ben_birth/ben_15/ben_3/ben_matcap/ben_decree/
+# ben_multi из mama_bot.py (Telegram) — тексты скопированы дословно. Единый endpoint с
+# query-параметром topic, авторизация через _miniapp_require_user (user_id с клиента не доверяется).
+MINIAPP_BENEFITS_SYSTEM = (
+    "Ты эксперт по социальным выплатам и пособиям в России. "
+    "Давай актуальную информацию на текущую дату; если точная сумма может измениться, предупреди и предложи проверить на Госуслугах или СФР. "
+    "Указывай конкретные суммы, сроки подачи, необходимые документы и куда обращаться. "
+    "Отвечай структурированно и понятно."
+)
+
+MINIAPP_BENEFITS_PROMPTS = {
+    "birth": (
+        "Расскажи о единовременном пособии при рождении ребёнка в России на текущую дату. "
+        "Размер, кто имеет право, документы, куда подавать, сроки."
+    ),
+    "15": (
+        "Расскажи о ежемесячном пособии по уходу за ребёнком до 1.5 лет в России на текущую дату. "
+        "Размер для работающих и неработающих мам, как рассчитывается, документы, сроки."
+    ),
+    "3": (
+        "Расскажи о выплатах и пособиях на ребёнка от 1.5 до 3 лет в России на текущую дату. "
+        "Путинские выплаты, региональные пособия, условия получения."
+    ),
+    "matcap": (
+        "Расскажи о материнском капитале в России на текущую дату. "
+        "Размер на первого и второго ребёнка, на что можно потратить, как оформить через Госуслуги, "
+        "сроки получения сертификата."
+    ),
+    "decree": (
+        "Расскажи о пособии по беременности и родам (декретные) в России на текущую дату. "
+        "Как рассчитывается для работающих, ИП, безработных. "
+        "Сроки декрета, документы, куда обращаться."
+    ),
+    "multi": (
+        "Расскажи о льготах и выплатах многодетным семьям в России на текущую дату. "
+        "Федеральные и региональные льготы, налоговые вычеты, земельные участки, "
+        "транспортный налог, ЖКХ, досрочная пенсия мамы."
+    ),
+}
+
+
+@app.get("/api/miniapp/content/benefits")
+async def miniapp_content_benefits(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    topic = (request.query_params.get("topic") or "").strip().lower()
+    if topic not in MINIAPP_BENEFITS_PROMPTS:
+        raise HTTPException(status_code=400, detail="invalid_topic")
+
+    log_analytics_event_tg(user_id, "request_started", "benefits_" + topic, "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_BENEFITS_SYSTEM, MINIAPP_BENEFITS_PROMPTS[topic])
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "benefits_" + topic, "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "benefits_" + topic, "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ПОСОБИЯ — ПЕРСОНАЛЬНЫЙ РАЗБОР ==========
+# Тот же системный prompt и user prompt, что и в ben_personal_answer() из mama_bot.py
+# (Telegram) — текст скопирован дословно. Текст ситуации нигде не сохраняется (ни в БД, ни в
+# аналитике) — так же, как остальные AI-сценарии мини-приложения не пишут вопрос пользователя.
+MINIAPP_BENEFITS_PERSONAL_MAX_LEN = 2000
+
+
+@app.post("/api/miniapp/benefits/personal")
+async def miniapp_benefits_personal(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    situation = str((body or {}).get("situation") or "").strip()
+    if not situation:
+        raise HTTPException(status_code=400, detail="situation_required")
+    if len(situation) > MINIAPP_BENEFITS_PERSONAL_MAX_LEN:
+        raise HTTPException(status_code=400, detail="situation_too_long")
+
+    log_analytics_event_tg(user_id, "request_started", "benefits_personal", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        "Ты эксперт по социальным выплатам в России на текущую дату. "
+        "Давай конкретные персональные рекомендации на основе ситуации мамы.",
+        f"Мама описала свою ситуацию: {situation}\n\n"
+        f"Перечисли все федеральные и региональные пособия и выплаты на которые она имеет право. "
+        f"Для каждого: название, размер, как оформить, куда обратиться. "
+        f"Отсортируй по сумме — сначала самые крупные."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "benefits_personal", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "benefits_personal", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: РЕБЁНОК ==========
+# Единый каталог "Ребёнок" — тот же системный prompt (EXPERT_BASE, дословно продублирован как
+# MINIAPP_TANTRUMS_SYSTEM выше) и те же user prompts по возрасту ребёнка, тот же OpenAI client
+# (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt), что и в mama_dev/mama_games/mama_games_more/
+# mama_books/mama_books_more/mama_health/mama_meds/mama_teeth/mama_food/mama_recipes/
+# mama_recipes_more/mama_routine/mama_sleep/mama_family из mama_bot.py (Telegram) — тексты
+# скопированы дословно. Единый endpoint с query-параметром topic, авторизация через
+# _miniapp_require_user (user_id с клиента не доверяется), профиль ребёнка проверяется как в
+# mama_gpt_handler()/mama_games() и т.п. — при отсутствии профиля 400 profile_required, не 500.
+# "sleep" здесь — контентный AI-раздел "Сон ребёнка" (аналог Telegram mama_sleep): отдельный от
+# tracker'а /api/miniapp/sleep/log и /api/miniapp/sleep/analyze (дневник сна) — не путать и не
+# смешивать, это разные функции с разным назначением.
+MINIAPP_CHILD_PROMPTS = {
+    "development": lambda m: (
+        f"Дай подробный научно обоснованный анализ развития ребёнка в {age_label(m)} ({m} месяцев). "
+        f"Охвати все сферы по стандартам AAP и ВОЗ: "
+        f"1) Физическое развитие — моторика крупная и мелкая, нормы роста и веса; "
+        f"2) Речевое развитие — что должен говорить/понимать по нормам; "
+        f"3) Когнитивное развитие — мышление, память, причинно-следственные связи; "
+        f"4) Социально-эмоциональное развитие — привязанность, эмоции, взаимодействие; "
+        f"5) Сенсорное развитие — зрение, слух, тактильное восприятие. "
+        f"Укажи чёткие нормы и что должно насторожить маму."
+    ),
+    "games": lambda m: (
+        f"Предложи 3-4 научно обоснованные развивающие игры для ребёнка {age_label(m)} ({m} месяцев). "
+        f"Опирайся на теорию Выготского и исследования нейропластичности. "
+        f"Для каждой: название, как играть пошагово, что развивает. "
+        f"Только простые игры без дорогих игрушек."
+    ),
+    "games_more": lambda m: (
+        f"Предложи ещё 3-4 ДРУГИЕ развивающие игры для ребёнка {age_label(m)} ({m} месяцев). "
+        f"Не повторяй предыдущие игры. Другие виды активности — сенсорные, моторные, речевые или социальные. "
+        f"Для каждой: название, как играть, что развивает."
+    ),
+    "books": lambda m: (
+        f"Порекомендуй 3 книги для чтения ребёнку {age_label(m)} ({m} месяцев). "
+        f"Для каждой: название, автор, почему подходит для этого возраста. "
+        f"И 1 книгу ДЛЯ МАМЫ от ведущего специалиста по этому возрасту."
+    ),
+    "books_more": lambda m: (
+        f"Порекомендуй ещё 3 ДРУГИЕ книги для ребёнка {age_label(m)} ({m} месяцев). "
+        f"Не повторяй предыдущие. Для каждой: название, автор, почему подходит."
+    ),
+    "health": lambda m: (
+        f"Дай исчерпывающую информацию о здоровье ребёнка {age_label(m)} ({m} месяцев) "
+        f"по стандартам ВОЗ и AAP. "
+        f"1) Типичные проблемы этого возраста и доказанные методы помощи; "
+        f"2) Алгоритм действий при температуре (по протоколам AAP); "
+        f"3) Признаки ОРВИ vs бактериальной инфекции — когда антибиотики НЕ нужны; "
+        f"4) Красные флаги — симптомы при которых немедленно к врачу; "
+        f"5) Плановые осмотры и прививки по календарю ВОЗ для этого возраста."
+    ),
+    "meds": lambda m: (
+        f"Дай научно обоснованную информацию о лекарственной безопасности "
+        f"для ребёнка {age_label(m)} ({m} месяцев) по стандартам AAP. "
+        f"1) Жаропонижающие — парацетамол vs ибупрофен, при какой температуре давать по протоколу AAP; "
+        f"2) Что категорически нельзя в этом возрасте и почему; "
+        f"3) Доказательная база по популярным средствам (колики, зубы, простуда); "
+        f"4) Когда самолечение опасно. "
+        f"Конкретные дозировки — только у педиатра. Объясни маме почему это важно."
+    ),
+    "teeth": lambda m: (
+        f"Дай полную научную информацию о зубах ребёнка {age_label(m)} ({m} месяцев). "
+        f"1) Хронология прорезывания по нормам ВОЗ — что ожидать сейчас; "
+        f"2) Нейрофизиология боли при прорезывании и доказанные методы облегчения; "
+        f"3) Что НЕ работает и опасно (гели с лидокаином — позиция AAP); "
+        f"4) Уход за молочными зубами — когда начинать чистить, фторид по рекомендации AAP; "
+        f"5) Первый визит к стоматологу — когда и зачем по стандартам."
+    ),
+    "food": lambda m: (
+        f"Дай научно обоснованные рекомендации по питанию ребёнка {age_label(m)} ({m} месяцев) "
+        f"строго по протоколам ВОЗ и ESPGHAN (Европейское общество детской гастроэнтерологии). "
+        f"1) Что вводить сейчас — конкретный список продуктов с обоснованием; "
+        f"2) Что категорически нельзя и почему (физиология ЖКТ ребёнка); "
+        f"3) Размер порций по возрасту; "
+        f"4) Грудное вскармливание vs смесь — позиция ВОЗ; "
+        f"5) Аллергены — когда и как вводить по новым исследованиям (метод LEAP); "
+        f"6) Признаки пищевой аллергии и непереносимости."
+    ),
+    "recipes": lambda m: (
+        f"Дай 2 рецепта для ребёнка {age_label(m)} ({m} месяцев) по нормам ВОЗ и ESPGHAN. "
+        f"Для каждого: ингредиенты, способ приготовления, почему полезен в этом возрасте. "
+        f"Только разрешённые продукты для данного возраста."
+    ),
+    "recipes_more": lambda m: (
+        f"Дай ещё 2 ДРУГИХ рецепта для ребёнка {age_label(m)} ({m} месяцев). "
+        f"Не повторяй предыдущие. Только разрешённые продукты для этого возраста."
+    ),
+    "routine": lambda m: (
+        f"Составь научно обоснованный режим дня для ребёнка {age_label(m)} ({m} месяцев) "
+        f"на основе хронобиологии и исследований сна AAP и ВОЗ. "
+        f"1) Нормы сна для этого возраста — дневной и ночной по данным NSF; "
+        f"2) Примерное расписание по часам с объяснением физиологии; "
+        f"3) Окна бодрствования — сколько времени ребёнок может не спать без переутомления; "
+        f"4) Признаки переутомления и недосыпа; "
+        f"5) Как выстроить режим с учётом циркадных ритмов ребёнка."
+    ),
+    "sleep": lambda m: (
+        f"Дай исчерпывающий научный анализ сна ребёнка {age_label(m)} ({m} месяцев) "
+        f"на основе исследований AAP, NSF и сомнологии. "
+        f"1) Нейрофизиология сна в этом возрасте — почему ребёнок так спит; "
+        f"2) Доказанные методы улучшения сна (без метода CIO если возраст до 6 мес); "
+        f"3) Безопасная среда сна по стандартам AAP (профилактика СВДС); "
+        f"4) Ночные пробуждения — норма или нет для этого возраста; "
+        f"5) Методы засыпания с доказательной базой — что реально работает."
+    ),
+    "family": lambda m: (
+        f"Дай научно обоснованные рекомендации по семейным отношениям "
+        f"когда ребёнку {age_label(m)} ({m} месяцев). "
+        f"Опирайся на исследования Джона Готтмана (стабильность пар), "
+        f"Петрановской (роль отца в привязанности) и психологию семейных систем. "
+        f"1) Роль отца в развитии ребёнка этого возраста — что говорит наука; "
+        f"2) Как сохранить партнёрские отношения с доказательными стратегиями Готтмана; "
+        f"3) Ревность старших детей — нейрофизиология и как помочь; "
+        f"4) Бабушки и дедушки — границы и сотрудничество без конфликтов."
+    ),
+}
+
+
+@app.get("/api/miniapp/content/child")
+async def miniapp_content_child(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    topic = (request.query_params.get("topic") or "").strip().lower()
+    if topic not in MINIAPP_CHILD_PROMPTS:
+        raise HTTPException(status_code=400, detail="invalid_topic")
+
+    months = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+        if row and row["mode"] and row["mode"] != "pregnant":
+            months = _miniapp_child_months(row["date_value"] or "")
+    except Exception:
+        logging.exception("miniapp_content_child: profile lookup error")
+    if months is None:
+        raise HTTPException(status_code=400, detail="profile_required")
+
+    log_analytics_event_tg(user_id, "request_started", "child_" + topic, "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(MINIAPP_TANTRUMS_SYSTEM, MINIAPP_CHILD_PROMPTS[topic](months))
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "child_" + topic, "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "child_" + topic, "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: СОН ==========
+# Пишет/читает ту же таблицу sleep_log в mama.db, что и tracker_sleep/sleep_start/sleep_end
+# из mama_bot.py (Telegram) — те же значения action ("уснул"/"проснулся"). sleep/analyze
+# использует тот же EXPERT_BASE и тот же user prompt, что и sleep_analyze() из mama_bot.py,
+# через тот же OpenAI client (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt).
+MINIAPP_SLEEP_ACTIONS = {"start": "уснул", "end": "проснулся"}
+
+
+@app.post("/api/miniapp/sleep/log")
+async def miniapp_sleep_log(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str((body or {}).get("action") or "").strip()
+    if action not in MINIAPP_SLEEP_ACTIONS:
+        raise HTTPException(status_code=400, detail="invalid_action")
+    sleep_action = MINIAPP_SLEEP_ACTIONS[action]
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute(
+                "INSERT INTO sleep_log (user_id, action, created_at) VALUES (?, ?, ?)",
+                (user_id, sleep_action, created_at),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_sleep_log db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "sleep_log", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "action": sleep_action, "created_at": created_at}
+
+
+@app.get("/api/miniapp/sleep/analyze")
+async def miniapp_sleep_analyze(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    entries = []
+    months = 0
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            if row and row["mode"] and row["mode"] != "pregnant":
+                m = _miniapp_child_months(row["date_value"] or "")
+                if m is not None:
+                    months = m
+            for r in conn.execute(
+                "SELECT action, created_at FROM sleep_log WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+                (user_id,),
+            ):
+                entries.append((r["action"], r["created_at"]))
+    except Exception:
+        logging.exception("miniapp_sleep_analyze: db error")
+
+    if len(entries) < 4:
+        raise HTTPException(status_code=400, detail="not_enough_entries")
+
+    data_str = "\n".join(
+        f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {action}"
+        for action, dt in entries
+    )
+    log_analytics_event_tg(user_id, "request_started", "sleep_analyze", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот дневник сна:\n{data_str}\n\n"
+        f"Проанализируй паттерн сна по нормам AAP и NSF для этого возраста: "
+        f"сколько часов спит суммарно, правильные ли интервалы бодрствования, "
+        f"есть ли проблемы и как их решить. Конкретные рекомендации.",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "sleep_analyze", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "sleep_analyze", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ПИТАНИЕ ==========
+# Пишет/читает ту же таблицу feeding в mama.db, что и tracker_feeding/feed_left/feed_right/
+# feed_bottle/feed_duration из mama_bot.py (Telegram) — те же значения side ("Левая грудь"/
+# "Правая грудь"/"Смесь/бутылочка"). feeding/analyze использует тот же EXPERT_BASE и тот же
+# user prompt, что и feed_stats() из mama_bot.py, через тот же OpenAI client (gpt-4o,
+# max_tokens=2000 через _miniapp_ask_gpt).
+MINIAPP_FEEDING_SIDES = {"left": "Левая грудь", "right": "Правая грудь", "bottle": "Смесь/бутылочка"}
+MINIAPP_FEEDING_MAX_DURATION = 600
+
+
+@app.post("/api/miniapp/feeding/log")
+async def miniapp_feeding_log(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    side_key = str((body or {}).get("side") or "").strip()
+    if side_key not in MINIAPP_FEEDING_SIDES:
+        raise HTTPException(status_code=400, detail="invalid_side")
+    side = MINIAPP_FEEDING_SIDES[side_key]
+    try:
+        duration = int((body or {}).get("duration"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_duration")
+    if duration <= 0 or duration > MINIAPP_FEEDING_MAX_DURATION:
+        raise HTTPException(status_code=400, detail="invalid_duration")
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute(
+                "INSERT INTO feeding (user_id, side, duration, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, side, duration, created_at),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_feeding_log db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "feeding_log", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "side": side, "duration": duration, "created_at": created_at}
+
+
+@app.get("/api/miniapp/feeding/analyze")
+async def miniapp_feeding_analyze(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    entries = []
+    months = 0
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            if row and row["mode"] and row["mode"] != "pregnant":
+                m = _miniapp_child_months(row["date_value"] or "")
+                if m is not None:
+                    months = m
+            for r in conn.execute(
+                "SELECT side, duration, created_at FROM feeding WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+                (user_id,),
+            ):
+                entries.append((r["side"], r["duration"], r["created_at"]))
+    except Exception:
+        logging.exception("miniapp_feeding_analyze: db error")
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="not_enough_entries")
+
+    data_str = "\n".join(
+        f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {side}, {dur} мин"
+        for side, dur, dt in entries
+    )
+    log_analytics_event_tg(user_id, "request_started", "feeding_analyze", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот журнал кормлений:\n{data_str}\n\n"
+        f"Проанализируй: достаточно ли кормлений по нормам ВОЗ для этого возраста, "
+        f"правильные ли интервалы, достаточная ли продолжительность. "
+        f"Дай практические рекомендации.",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "feeding_analyze", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "feeding_analyze", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ПРИКОРМ 6+ ==========
+# Справочный навигатор по прикорму (WHO complementary feeding 6-23 months). Каталог продуктов и
+# категорий статический (ниже) — в БД пишутся только личные отметки мамы, в отдельной новой
+# таблице complementary_food_log (аддитивно, тем же platform-routed _miniapp_db(user), что и
+# остальной Mini App). Никаких AI-вызовов и индивидуальных лечебных назначений — только
+# справочная информация и safety-тексты.
+MINIAPP_CF_AGE_TIERS = ["6-7", "8-9", "10-12", "12+"]
+
+MINIAPP_CF_CATEGORIES = [
+    {"key": "vegetables", "title": "Овощи", "example": "брокколи + картофель + рыба"},
+    {"key": "fruits", "title": "Фрукты и ягоды", "example": "овсяная каша + груша"},
+    {"key": "grains", "title": "Каши и крупы", "example": "гречка + индейка + кабачок"},
+    {"key": "protein_iron", "title": "Источники железа и белка", "example": "чечевица + овощи"},
+    {"key": "dairy", "title": "Кисломолочные продукты", "example": "натуральный йогурт + мягкий фрукт"},
+    {"key": "fats", "title": "Полезные жиры", "example": "авокадо + овощное пюре"},
+]
+
+MINIAPP_CF_FOODS = [
+    {"key": "kabachok", "title": "Кабачок", "category": "vegetables", "min_tier": "6-7"},
+    {"key": "brokkoli", "title": "Брокколи", "category": "vegetables", "min_tier": "6-7"},
+    {"key": "cvetnaya_kapusta", "title": "Цветная капуста", "category": "vegetables", "min_tier": "6-7"},
+    {"key": "morkov", "title": "Морковь", "category": "vegetables", "min_tier": "6-7"},
+    {"key": "tykva", "title": "Тыква", "category": "vegetables", "min_tier": "6-7"},
+    {"key": "kartofel", "title": "Картофель", "category": "vegetables", "min_tier": "6-7"},
+    {"key": "goroshek", "title": "Зелёный горошек", "category": "vegetables", "min_tier": "8-9"},
+    {"key": "yabloko", "title": "Яблоко", "category": "fruits", "min_tier": "6-7"},
+    {"key": "grusha", "title": "Груша", "category": "fruits", "min_tier": "6-7"},
+    {"key": "banan", "title": "Банан", "category": "fruits", "min_tier": "6-7"},
+    {"key": "persik", "title": "Персик", "category": "fruits", "min_tier": "6-7"},
+    {"key": "sliva", "title": "Слива", "category": "fruits", "min_tier": "6-7"},
+    {"key": "yagody", "title": "Ягоды (безопасно размятые, по возрасту)", "category": "fruits", "min_tier": "8-9"},
+    {"key": "grechka", "title": "Гречневая каша", "category": "grains", "min_tier": "6-7"},
+    {"key": "ovsyanka", "title": "Овсяная каша", "category": "grains", "min_tier": "6-7"},
+    {"key": "kukuruznaya", "title": "Кукурузная каша", "category": "grains", "min_tier": "6-7"},
+    {"key": "pshenka", "title": "Пшённая каша", "category": "grains", "min_tier": "8-9"},
+    {"key": "obogaschennaya_kasha", "title": "Другая обогащённая цельнозерновая каша (например, пшеничная)", "category": "grains", "min_tier": "10-12", "allergen": "wheat"},
+    {"key": "govyadina", "title": "Говядина", "category": "protein_iron", "min_tier": "6-7"},
+    {"key": "indeyka", "title": "Индейка", "category": "protein_iron", "min_tier": "6-7"},
+    {"key": "kuritsa", "title": "Курица", "category": "protein_iron", "min_tier": "6-7"},
+    {"key": "ryba", "title": "Рыба (нежирная)", "category": "protein_iron", "min_tier": "8-9", "allergen": "fish"},
+    {"key": "yaytso", "title": "Яйцо", "category": "protein_iron", "min_tier": "6-7", "allergen": "egg"},
+    {"key": "chechevitsa", "title": "Чечевица", "category": "protein_iron", "min_tier": "8-9"},
+    {"key": "fasol", "title": "Фасоль/бобовые (мягкая консистенция)", "category": "protein_iron", "min_tier": "8-9"},
+    {"key": "yogurt", "title": "Натуральный йогурт без добавленного сахара", "category": "dairy", "min_tier": "8-9", "allergen": "dairy"},
+    {"key": "syr", "title": "Мягкий творог/сыр в безопасной форме", "category": "dairy", "min_tier": "8-9", "allergen": "dairy"},
+    {"key": "maslo", "title": "Растительное масло (немного, в блюда)", "category": "fats", "min_tier": "6-7"},
+    {"key": "avokado", "title": "Авокадо", "category": "fats", "min_tier": "6-7"},
+    {"key": "orehovaya_pasta", "title": "Ореховая паста (тонким слоем, не цельные орехи)", "category": "fats", "min_tier": "8-9", "allergen": "nuts"},
+]
+MINIAPP_CF_FOOD_BY_KEY = {f["key"]: f for f in MINIAPP_CF_FOODS}
+
+MINIAPP_CF_ALLERGEN_NOTE = (
+    "Потенциально аллергенные продукты вводят в рацион наряду с другими продуктами, учитывая "
+    "готовность ребёнка и индивидуальные особенности. Если у ребёнка тяжёлая экзема, уже "
+    "известная пищевая аллергия или была выраженная реакция на еду — обсудите введение этого "
+    "продукта с педиатром или аллергологом."
+)
+
+MINIAPP_CF_REACTION_SAFETY_NOTE = (
+    "При выраженной или быстро нарастающей реакции, затруднении дыхания, отёке или ухудшении "
+    "состояния малыша — это повод для срочной медицинской помощи, а не для ожидания."
+)
+
+MINIAPP_CF_DISCLAIMER = "Информация носит справочный характер и не заменяет рекомендации педиатра."
+
+MINIAPP_CF_STATUSES = {"not_tried", "tried", "liked", "disliked", "reaction"}
+MINIAPP_CF_REACTION_TEXT_MAX_LEN = 300
+
+_miniapp_cf_schema_ready_tg = False
+_miniapp_cf_schema_ready_max = False
+
+
+def _miniapp_cf_ensure_schema(conn, platform):
+    """Создаёт complementary_food_log аддитивно (CREATE TABLE IF NOT EXISTS), не трогая ничего
+    остального в mama.db/mama_max.db. Флаг на процесс — чтобы не выполнять DDL на каждый запрос."""
+    global _miniapp_cf_schema_ready_tg, _miniapp_cf_schema_ready_max
+    if platform == "max":
+        if _miniapp_cf_schema_ready_max:
+            return
+    else:
+        if _miniapp_cf_schema_ready_tg:
+            return
+    conn.execute("""CREATE TABLE IF NOT EXISTS complementary_food_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        platform TEXT,
+        user_id INTEGER,
+        food_key TEXT,
+        status TEXT,
+        first_tried_at TEXT,
+        reaction_text TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(platform, user_id, food_key)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cf_log_user ON complementary_food_log(platform, user_id)")
+    conn.commit()
+    if platform == "max":
+        _miniapp_cf_schema_ready_max = True
+    else:
+        _miniapp_cf_schema_ready_tg = True
+
+
+def _miniapp_cf_age_tier(months):
+    """Возраст — только подсказка для вкладки по умолчанию; пользователь может открыть любую."""
+    if months is None:
+        return "6-7"
+    if months < 8:
+        return "6-7"
+    if months < 10:
+        return "8-9"
+    if months <= 12:
+        return "10-12"
+    return "12+"
+
+
+def _miniapp_cf_catalog_payload(default_tier):
+    categories = []
+    for cat in MINIAPP_CF_CATEGORIES:
+        foods = [
+            {"key": f["key"], "title": f["title"], "min_tier": f["min_tier"], "allergen": f.get("allergen")}
+            for f in MINIAPP_CF_FOODS
+            if f["category"] == cat["key"]
+        ]
+        categories.append({"key": cat["key"], "title": cat["title"], "example": cat["example"], "foods": foods})
+    return {
+        "ok": True,
+        "age_tiers": MINIAPP_CF_AGE_TIERS,
+        "default_age_tier": default_tier,
+        "categories": categories,
+        "allergen_note": MINIAPP_CF_ALLERGEN_NOTE,
+        "disclaimer": MINIAPP_CF_DISCLAIMER,
+        "total_foods": len(MINIAPP_CF_FOODS),
+    }
+
+
+@app.get("/api/miniapp/complementary-foods")
+async def miniapp_complementary_foods(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    default_tier = "6-7"
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, platform, user_id)
+            if row and row["mode"] and row["mode"] != "pregnant":
+                months = _miniapp_child_months(row["date_value"] or "")
+                default_tier = _miniapp_cf_age_tier(months)
+    except Exception:
+        logging.exception("miniapp_complementary_foods db error")
+    return _miniapp_cf_catalog_payload(default_tier)
+
+
+@app.get("/api/miniapp/complementary-foods/my")
+async def miniapp_complementary_foods_my(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            _miniapp_cf_ensure_schema(conn, platform)
+            for r in conn.execute(
+                "SELECT food_key, status, first_tried_at, reaction_text, updated_at FROM complementary_food_log "
+                "WHERE platform=? AND user_id=? ORDER BY updated_at DESC",
+                (platform, user_id),
+            ):
+                food = MINIAPP_CF_FOOD_BY_KEY.get(r["food_key"])
+                if not food:
+                    continue
+                items.append({
+                    "food_key": r["food_key"],
+                    "title": food["title"],
+                    "category": food["category"],
+                    "status": r["status"] or "not_tried",
+                    "first_tried_at": r["first_tried_at"] or "",
+                    "reaction_text": r["reaction_text"] or "",
+                    "updated_at": r["updated_at"] or "",
+                })
+    except Exception:
+        logging.exception("miniapp_complementary_foods_my db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    tried_count = sum(1 for it in items if it["status"] != "not_tried")
+    liked_count = sum(1 for it in items if it["status"] == "liked")
+    return {
+        "ok": True,
+        "items": items,
+        "tried_count": tried_count,
+        "liked_count": liked_count,
+        "total_foods": len(MINIAPP_CF_FOODS),
+    }
+
+
+@app.post("/api/miniapp/complementary-foods/mark")
+async def miniapp_complementary_foods_mark(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    platform = user.get("platform", "telegram")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    food_key = str((body or {}).get("food_key") or "").strip()
+    status = str((body or {}).get("status") or "").strip()
+    if food_key not in MINIAPP_CF_FOOD_BY_KEY:
+        raise HTTPException(status_code=400, detail="invalid_food_key")
+    if status not in MINIAPP_CF_STATUSES:
+        raise HTTPException(status_code=400, detail="invalid_status")
+    reaction_text = str((body or {}).get("reaction_text") or "").strip()[:MINIAPP_CF_REACTION_TEXT_MAX_LEN]
+    if status != "reaction":
+        reaction_text = ""
+    now = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            _miniapp_cf_ensure_schema(conn, platform)
+            existing = conn.execute(
+                "SELECT first_tried_at FROM complementary_food_log WHERE platform=? AND user_id=? AND food_key=?",
+                (platform, user_id, food_key),
+            ).fetchone()
+            first_tried_at = (existing["first_tried_at"] if existing else None) or ""
+            if status != "not_tried" and not first_tried_at:
+                first_tried_at = now
+            conn.execute(
+                "INSERT INTO complementary_food_log "
+                "(platform, user_id, food_key, status, first_tried_at, reaction_text, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(platform, user_id, food_key) DO UPDATE SET "
+                "status=excluded.status, first_tried_at=excluded.first_tried_at, "
+                "reaction_text=excluded.reaction_text, updated_at=excluded.updated_at",
+                (platform, user_id, food_key, status, first_tried_at or None, reaction_text or None, now, now),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_complementary_foods_mark db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "complementary_mark", "miniapp", platform)
+    resp = {
+        "ok": True,
+        "food_key": food_key,
+        "status": status,
+        "first_tried_at": first_tried_at,
+        "reaction_text": reaction_text,
+        "updated_at": now,
+    }
+    if status == "reaction":
+        resp["safety_note"] = MINIAPP_CF_REACTION_SAFETY_NOTE
+    return resp
+
+
+# ========== MINI APP: САМОЧУВСТВИЕ ==========
+# Пишет/читает ту же таблицу symptoms в mama.db, что и tracker_symptoms/symptom_add/
+# save_symptom_entry из mama_bot.py (Telegram) — та же структура записи (user_id, symptom,
+# created_at). symptoms/analyze использует тот же EXPERT_BASE и тот же user prompt, что и
+# symptom_analyze() из mama_bot.py, через тот же OpenAI client (gpt-4o, max_tokens=2000
+# через _miniapp_ask_gpt).
+MINIAPP_SYMPTOM_MAX_LEN = 500
+
+
+@app.post("/api/miniapp/symptoms/log")
+async def miniapp_symptoms_log(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symptom = str((body or {}).get("symptom") or "").strip()
+    if not symptom:
+        raise HTTPException(status_code=400, detail="symptom_required")
+    if len(symptom) > MINIAPP_SYMPTOM_MAX_LEN:
+        raise HTTPException(status_code=400, detail="symptom_too_long")
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute(
+                "INSERT INTO symptoms (user_id, symptom, created_at) VALUES (?, ?, ?)",
+                (user_id, symptom, created_at),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_symptoms_log db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "symptoms_log", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "symptom": symptom, "created_at": created_at}
+
+
+@app.get("/api/miniapp/symptoms/analyze")
+async def miniapp_symptoms_analyze(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    entries = []
+    months = 0
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            if row and row["mode"] and row["mode"] != "pregnant":
+                m = _miniapp_child_months(row["date_value"] or "")
+                if m is not None:
+                    months = m
+            for r in conn.execute(
+                "SELECT symptom, created_at FROM symptoms WHERE user_id=? ORDER BY created_at DESC LIMIT 30",
+                (user_id,),
+            ):
+                entries.append((r["symptom"], r["created_at"]))
+    except Exception:
+        logging.exception("miniapp_symptoms_analyze: db error")
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="not_enough_entries")
+
+    data_str = "\n".join(
+        f"{datetime.fromisoformat(dt).strftime('%d.%m %H:%M')}: {s}"
+        for s, dt in entries
+    )
+    log_analytics_event_tg(user_id, "request_started", "symptoms_analyze", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот симптомы за последние дни:\n{data_str}\n\n"
+        f"Проанализируй картину: что это может быть, какова динамика — лучше или хуже, "
+        f"стоит ли идти к врачу прямо сейчас или можно наблюдать дома. "
+        f"Красные флаги — если есть тревожные симптомы скажи прямо.",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "symptoms_analyze", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "symptoms_analyze", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ДНЕВНИК МАЛЫША ==========
+# Пишет/читает ту же таблицу diary в mama.db, что и mama_diary/diary_add/save_diary_entry
+# из mama_bot.py (Telegram) — та же структура записи (user_id, entry, created_at).
+MINIAPP_DIARY_MAX_LEN = 2000
+MINIAPP_DIARY_LIST_LIMIT = 20
+
+
+@app.get("/api/miniapp/diary/list")
+async def miniapp_diary_list(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            for r in conn.execute(
+                "SELECT entry, created_at FROM diary WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+                (user_id, MINIAPP_DIARY_LIST_LIMIT),
+            ):
+                items.append({"text": r["entry"] or "", "created_at": r["created_at"] or ""})
+    except Exception:
+        logging.exception("miniapp_diary_list db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    return {"ok": True, "items": items}
+
+
+@app.post("/api/miniapp/diary/add")
+async def miniapp_diary_add(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text_required")
+    if len(text) > MINIAPP_DIARY_MAX_LEN:
+        raise HTTPException(status_code=400, detail="text_too_long")
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute(
+                "INSERT INTO diary (user_id, entry, created_at) VALUES (?, ?, ?)",
+                (user_id, text, created_at),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_diary_add db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "diary_add", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "text": text, "created_at": created_at}
+
+
+# ========== MINI APP: РОСТ И ВЕС ==========
+# Пишет/читает ту же таблицу growth в mama.db, что и tracker_growth/growth_add/growth_height/
+# growth_weight из mama_bot.py (Telegram) — та же структура записи (user_id, height, weight,
+# created_at). growth/analyze использует тот же EXPERT_BASE и тот же user prompt, что и
+# growth_analyze() из mama_bot.py, через тот же OpenAI client (gpt-4o, max_tokens=2000 через
+# _miniapp_ask_gpt).
+MINIAPP_GROWTH_MIN_HEIGHT = 30.0
+MINIAPP_GROWTH_MAX_HEIGHT = 200.0
+MINIAPP_GROWTH_MIN_WEIGHT = 0.5
+MINIAPP_GROWTH_MAX_WEIGHT = 100.0
+
+
+@app.post("/api/miniapp/growth/log")
+async def miniapp_growth_log(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        height = float((body or {}).get("height"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_height")
+    if not (MINIAPP_GROWTH_MIN_HEIGHT <= height <= MINIAPP_GROWTH_MAX_HEIGHT):
+        raise HTTPException(status_code=400, detail="invalid_height")
+    try:
+        weight = float((body or {}).get("weight"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_weight")
+    if not (MINIAPP_GROWTH_MIN_WEIGHT <= weight <= MINIAPP_GROWTH_MAX_WEIGHT):
+        raise HTTPException(status_code=400, detail="invalid_weight")
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute(
+                "INSERT INTO growth (user_id, height, weight, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, height, weight, created_at),
+            )
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_growth_log db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "growth_log", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "height": height, "weight": weight, "created_at": created_at}
+
+
+@app.get("/api/miniapp/growth/list")
+async def miniapp_growth_list(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            for r in conn.execute(
+                "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
+                (user_id,),
+            ):
+                items.append({"height": r["height"], "weight": r["weight"], "created_at": r["created_at"]})
+    except Exception:
+        logging.exception("miniapp_growth_list db error")
+    return {"ok": True, "items": items}
+
+
+@app.get("/api/miniapp/growth/analyze")
+async def miniapp_growth_analyze(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    entries = []
+    months = 0
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            if row and row["mode"] and row["mode"] != "pregnant":
+                m = _miniapp_child_months(row["date_value"] or "")
+                if m is not None:
+                    months = m
+            for r in conn.execute(
+                "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 10",
+                (user_id,),
+            ):
+                entries.append((r["height"], r["weight"], r["created_at"]))
+    except Exception:
+        logging.exception("miniapp_growth_analyze: db error")
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="not_enough_entries")
+
+    data_str = "\n".join(
+        f"{datetime.fromisoformat(dt).strftime('%d.%m.%Y')}: рост {h} см, вес {w} кг"
+        for h, w, dt in entries
+    )
+    log_analytics_event_tg(user_id, "request_started", "growth_analyze", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_BASE,
+        f"Ребёнку {age_label(months)} ({months} месяцев). Вот динамика роста и веса:\n{data_str}\n\n"
+        f"Проанализируй динамику по нормам ВОЗ — прибавки в норме или нет, тренд хороший или нет, "
+        f"на что обратить внимание педиатру.",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "growth_analyze", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "growth_analyze", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ПРИВИВОЧНЫЙ КАЛЕНДАРЬ ==========
+# Тот же стандартный календарь РФ (список и месяцы) и та же логика, что в
+# tracker_vaccines/vaccines_create/vaccines_done/vac_done_{id}/vaccines_info из mama_bot.py
+# (Telegram) — тексты и prompt скопированы дословно. Читает/пишет исключительно mama.db,
+# существующую таблицу vaccinations, без миграций. Планировщик напоминаний (check_vaccine_reminders)
+# не затрагивается.
+MINIAPP_VACCINE_SCHEDULE = [
+    (0, "БЦЖ (туберкулёз)"),
+    (0, "Гепатит B — 1-я доза"),
+    (1, "Гепатит B — 2-я доза"),
+    (2, "АКДС — 1-я доза"),
+    (2, "Полиомиелит — 1-я доза"),
+    (2, "Пневмококк — 1-я доза"),
+    (3, "АКДС — 2-я доза"),
+    (3, "Полиомиелит — 2-я доза"),
+    (4, "АКДС — 3-я доза"),
+    (4, "Полиомиелит — 3-я доза"),
+    (4, "Пневмококк — 2-я доза"),
+    (6, "Гепатит B — 3-я доза"),
+    (12, "Корь, краснуха, паротит (КПК)"),
+    (12, "Ветряная оспа"),
+    (15, "Пневмококк — ревакцинация"),
+    (18, "АКДС — ревакцинация"),
+    (18, "Полиомиелит — ревакцинация"),
+]
+MINIAPP_VACCINE_NAME_MAX_LEN = 200
+
+
+def _miniapp_add_months(dt, count):
+    month = dt.month - 1 + count
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+@app.get("/api/miniapp/vaccines/list")
+async def miniapp_vaccines_list(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            for r in conn.execute(
+                "SELECT id, vaccine, scheduled_date, done FROM vaccinations WHERE user_id=? ORDER BY scheduled_date",
+                (user_id,),
+            ):
+                items.append({
+                    "id": r["id"],
+                    "vaccine": r["vaccine"] or "",
+                    "scheduled_date": r["scheduled_date"] or "",
+                    "done": bool(r["done"]),
+                    "status": "done" if r["done"] else "planned",
+                })
+    except Exception:
+        logging.exception("miniapp_vaccines_list db error")
+    return {"ok": True, "items": items}
+
+
+@app.post("/api/miniapp/vaccines/create-schedule")
+async def miniapp_vaccines_create_schedule(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    row = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+    except Exception:
+        logging.exception("miniapp_vaccines_create_schedule: profile lookup error")
+    if not row or row["mode"] != "mama" or not (row["date_value"] or "").strip():
+        raise HTTPException(status_code=400, detail="profile_required")
+    try:
+        birth = datetime.strptime(row["date_value"], "%d.%m.%Y")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="profile_required")
+
+    added = 0
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute("DELETE FROM vaccinations WHERE user_id=?", (user_id,))
+            created_at = datetime.now().isoformat()
+            for month_age, vaccine in MINIAPP_VACCINE_SCHEDULE:
+                vac_date = _miniapp_add_months(birth, month_age).strftime("%d.%m.%Y")
+                conn.execute(
+                    "INSERT INTO vaccinations (user_id, vaccine, scheduled_date, created_at) VALUES (?, ?, ?, ?)",
+                    (user_id, vaccine, vac_date, created_at),
+                )
+                added += 1
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_vaccines_create_schedule db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "vaccines_create_schedule", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "added": added}
+
+
+@app.post("/api/miniapp/vaccines/{vac_id}/done")
+async def miniapp_vaccines_done(vac_id: int, request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    row = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = conn.execute("SELECT id, user_id FROM vaccinations WHERE id=?", (vac_id,)).fetchone()
+    except Exception:
+        logging.exception("miniapp_vaccines_done: lookup error")
+        raise HTTPException(status_code=500, detail="internal_error")
+    if not row or int(row["user_id"]) != int(user_id):
+        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        with _miniapp_db(user) as conn:
+            conn.execute("UPDATE vaccinations SET done=1 WHERE id=? AND user_id=?", (vac_id, user_id))
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_vaccines_done: update error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "vaccines_done", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "id": vac_id, "done": True}
+
+
+@app.get("/api/miniapp/vaccines/info")
+async def miniapp_vaccines_info(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    vaccine_name = (request.query_params.get("name") or "").strip()
+    if not vaccine_name:
+        raise HTTPException(status_code=400, detail="name_required")
+    if len(vaccine_name) > MINIAPP_VACCINE_NAME_MAX_LEN:
+        raise HTTPException(status_code=400, detail="name_too_long")
+
+    log_analytics_event_tg(user_id, "request_started", "vaccines_info", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        EXPERT_BASE,
+        f"Дай подробное научное объяснение прививки {vaccine_name} для родителей. "
+        f"1) От чего защищает и насколько опасна болезнь без прививки; "
+        f"2) Как работает вакцина — механизм иммунитета; "
+        f"3) Когда делают и сколько доз нужно; "
+        f"4) Как подготовить ребёнка — за день до и в день прививки; "
+        f"5) Нормальные реакции — что ожидать в первые дни; "
+        f"6) Красные флаги — когда срочно к врачу; "
+        f"7) Развенчай главные мифы о этой прививке с научными аргументами."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "vaccines_info", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "vaccines_info", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: ЭКСТРЕННАЯ ПОМОЩЬ ==========
+# Перенос существующего Telegram-сценария emergency/EMERGENCY_GUIDES/em_other/
+# emergency_other_answer из mama_bot.py 1:1: те же темы и тот же текст статичных guides
+# (без AI, отдаются напрямую), тот же system/user prompt и тот же OpenAI client
+# (gpt-4o, max_tokens=2000 через _miniapp_ask_gpt) для "Другой ситуации". situation
+# не сохраняется и не логируется — та же приватность, что и в /ask-question.
+MINIAPP_EMERGENCY_SITUATION_MAX_LEN = 2000
+
+MINIAPP_EMERGENCY_INTRO = (
+    "Выбери главное проявление. Раздел помогает оценить срочность, но не заменяет врача. "
+    "Если ребёнок не дышит, синеет, не реагирует или у него судороги — звони 112 сразу."
+)
+
+MINIAPP_EMERGENCY_GUIDES = {
+    "em_fever": ("🌡 Температура", "Звони 112 при судорогах, нарушении дыхания, синюшности, потере сознания или не бледнеющей сыпи. Для ребёнка младше 3 месяцев температура 38°C и выше требует срочной медицинской оценки. Не укутывай и не растирай спиртом или уксусом. Предлагай питьё или грудь чаще. Лекарство давай только подходящее по возрасту и весу по рекомендации врача."),
+    "em_breath": ("😮‍💨 Проблемы с дыханием", "Звони 112 немедленно, если синеют губы, есть паузы дыхания, выраженное втяжение межрёберий, спутанность или потеря сознания. Держи ребёнка вертикально, освободи тесную одежду, не давай еду и не пытайся осматривать горло предметами."),
+    "em_vomit": ("🤮 Рвота или понос", "Звони 112 при крови, зелёной рвоте, судорогах, резкой боли или нарушении сознания. Срочно к врачу при отсутствии мочи, сухих губах, отсутствии слёз и запавших глазах. Отпаивай часто маленькими порциями; не давай противорвотные и противодиарейные средства без врача."),
+    "em_lethargic": ("😴 Сильная вялость", "Если ребёнка трудно разбудить, он не удерживает взгляд, необычно обмяк или вялость сопровождается нарушением дыхания — звони 112. Проверь дыхание, цвет кожи и температуру. Не заставляй есть и не оставляй одного."),
+    "em_rash": ("🔴 Внезапная сыпь", "Надави прозрачным стаканом на сыпь. Если пятна не бледнеют, особенно вместе с температурой или вялостью, — звони 112. Также срочно вызывай помощь при отёке губ или языка, осиплости и затруднении дыхания."),
+    "em_crying": ("😭 Безутешный плач", "Звони 112 при нарушении дыхания, посинении, судорогах, травме, резкой вялости или необычном пронзительном крике с рвотой. Проверь температуру, подгузник, голод, одежду и пальцы на пережимающий волос. Никогда не встряхивай ребёнка."),
+}
+
+MINIAPP_EMERGENCY_GUIDE_FOOTER = "Если сомневаешься — лучше позвонить 112 или в неотложную помощь."
+
+MINIAPP_EMERGENCY_OTHER_SYSTEM = (
+    "Ты медицинский навигатор. Сначала укажи, есть ли повод звонить 112. "
+    "Затем безопасные действия до врача и уточняющие вопросы. "
+    "Не ставь диагноз, не назначай препараты и дозировки."
+)
+
+
+@app.get("/api/miniapp/emergency/guides")
+async def miniapp_emergency_guides(request: Request):
+    _miniapp_require_user(request)
+    return {
+        "ok": True,
+        "intro": MINIAPP_EMERGENCY_INTRO,
+        "footer": MINIAPP_EMERGENCY_GUIDE_FOOTER,
+        "guides": [
+            {"key": key, "title": title, "text": text}
+            for key, (title, text) in MINIAPP_EMERGENCY_GUIDES.items()
+        ],
+    }
+
+
+@app.post("/api/miniapp/emergency/ask")
+async def miniapp_emergency_ask(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    situation = str((body or {}).get("situation") or "").strip()
+    if not situation:
+        raise HTTPException(status_code=400, detail="situation_required")
+    if len(situation) > MINIAPP_EMERGENCY_SITUATION_MAX_LEN:
+        raise HTTPException(status_code=400, detail="situation_too_long")
+
+    months = None
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+        if row:
+            mode = row["mode"] or ""
+            if mode and mode != "pregnant":
+                months = _miniapp_child_months(row["date_value"] or "")
+    except Exception:
+        logging.exception("miniapp_emergency_ask: profile lookup error")
+
+    log_analytics_event_tg(user_id, "request_started", "emergency_other", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        MINIAPP_EMERGENCY_OTHER_SYSTEM,
+        f"Ребёнку {age_label(months) if months is not None else 'неизвестного возраста'}. Ситуация: {situation}",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "emergency_other", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "emergency_other", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+def log_analytics_event_tg(user_id, event_name, source="", details="", platform="telegram"):
+    """Аналитика заявок из Mini App — пишет в свою БД на платформу (mama.db/mama_max.db),
+    не логирует situation_text."""
+    try:
+        with _miniapp_db(platform) as conn:
+            conn.execute(
+                "INSERT INTO analytics_events(created_at,platform,user_id,event_name,source,details) VALUES (?,?,?,?,?,?)",
+                (datetime.now().isoformat(), platform, int(user_id or 0), event_name, source or "", str(details or "")[:1000]),
+            )
+            conn.commit()
+    except Exception:
+        logging.error("log_analytics_event_tg error")
+
+
+# ========== MINI APP: ФОТОАНАЛИЗ ==========
+# Перенос существующего Telegram-сценария photo_menu/photo_analysis/photo_uzi/photo_med_preg/
+# photo_skin/photo_stool/photo_food/photo_package/handle_photo из mama_bot.py 1:1: та же
+# двухступенчатая проверка (сначала filter_prompt — соответствует ли фото выбранному типу, затем
+# analysis_prompt — экспертный разбор), те же формулировки wrong_msg и тот же OpenAI client
+# (gpt-4o, max_tokens=10 для фильтра и 1000 для анализа, как в handle_photo). Загруженное фото
+# никогда не пишется на диск и не логируется (в т.ч. в analytics details) — только временный
+# bytes-объект в памяти запроса, который освобождается сразу после ответа.
+MINIAPP_PHOTO_MAX_BYTES = 8 * 1024 * 1024  # 8 МБ — с запасом покрывает обычное фото с телефона
+
+MINIAPP_PHOTO_TYPES = {
+    "analysis": {
+        "filter_prompt": "На этом изображении медицинский документ, бланк анализов или результаты лабораторного исследования? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты опытный акушер-гинеколог и лабораторный диагност. Расшифруй результаты анализов для беременной женщины: "
+            "1) Какие показатели в норме; "
+            "2) Какие отклонения от нормы для беременных; "
+            "3) На что обратить внимание; "
+            "4) С какими результатами нужно срочно к врачу. "
+            "Напомни что интерпретацию результатов должен делать врач."
+        ),
+        "wrong_msg": "📸 Я жду фото результатов анализов 🤍",
+    },
+    "uzi": {
+        "filter_prompt": "На этом изображении медицинский документ или заключение УЗИ? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты опытный акушер-гинеколог. Объясни заключение УЗИ беременной понятным языком: "
+            "1) Что означают основные показатели (размеры плода, ИАЖ, плацента, кровоток); "
+            "2) Что в норме для данного срока; "
+            "3) Если есть отклонения — что они означают простыми словами; "
+            "4) Нужно ли беспокоиться и когда срочно к врачу. "
+            "Используй простые слова, избегай медицинского жаргона."
+        ),
+        "wrong_msg": "📸 Я жду фото заключения УЗИ 🤍",
+    },
+    "med_preg": {
+        "filter_prompt": "На этом изображении упаковка лекарства или медицинского препарата? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты акушер-гинеколог и клинический фармаколог. Оцени лекарство для беременной: "
+            "1) Что это за препарат и для чего; "
+            "2) Можно ли при беременности — по категориям FDA/ACOG; "
+            "3) В каком триместре разрешён/запрещён; "
+            "4) Возможные риски для плода; "
+            "5) Обязательно: решение о приёме принимает только врач. "
+            "Будь конкретной и честной."
+        ),
+        "wrong_msg": "📸 Я жду фото упаковки лекарства 🤍",
+    },
+    "skin": {
+        "filter_prompt": "Посмотри на это изображение. На нём кожа человека или ребёнка с возможными высыпаниями, покраснениями или другими кожными проявлениями? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты опытный педиатр. Опиши что видишь на коже ребёнка: "
+            "1) Характер высыпаний — цвет, форма, размер, локализация; "
+            "2) На какие известные состояния это визуально похоже — потница, атопический дерматит, аллергия, инфекция и т.д.; "
+            "3) Что можно сделать дома прямо сейчас; "
+            "4) Красные флаги — когда срочно к врачу. "
+            "В конце обязательно напомни что это описание а не диагноз."
+        ),
+        "wrong_msg": "📸 Я жду фото кожи или сыпи малыша 🤍 Отправь фотографию кожного покрова ребёнка.",
+    },
+    "stool": {
+        "filter_prompt": "На этом изображении подгузник или стул ребёнка? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты педиатр. Оцени стул ребёнка по фото: "
+            "1) Цвет — что он означает для здоровья малыша; "
+            "2) Консистенция — норма или нет; "
+            "3) Что это может говорить о пищеварении; "
+            "4) Когда нужен врач. "
+            "Напомни что точный диагноз ставит только педиатр."
+        ),
+        "wrong_msg": "📸 Я жду фото стула малыша 🤍 Отправь соответствующее фото.",
+    },
+    "food": {
+        "filter_prompt": "На этом изображении еда или блюдо? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты диетолог-педиатр.{age_context} "
+            "Посмотри на это блюдо или продукт и скажи: "
+            "1) Что это за еда; "
+            "2) Подходит ли это ребёнку по возрасту — да/нет и почему; "
+            "3) Что в составе может быть проблематично; "
+            "4) Как правильно приготовить если нужна адаптация под возраст."
+        ),
+        "wrong_msg": "📸 Я жду фото еды или блюда 🤍 Отправь фотографию продукта или блюда.",
+    },
+    "package": {
+        "filter_prompt": "На этом изображении упаковка товара, лекарства или смеси? Ответь только: ДА или НЕТ.",
+        "analysis_prompt": (
+            "Ты педиатр-фармаколог. Изучи упаковку и скажи: "
+            "1) Что это за продукт; "
+            "2) Основные компоненты состава — что важно; "
+            "3) Для какого возраста подходит; "
+            "4) На что обратить особое внимание маме; "
+            "5) Есть ли спорные ингредиенты."
+        ),
+        "wrong_msg": "📸 Я жду фото упаковки смеси или лекарства 🤍 Отправь фотографию упаковки.",
+    },
+}
+
+MINIAPP_PHOTO_GENERIC_ERROR = "Не удалось проанализировать фото. Попробуй ещё раз."
+
+
+def _miniapp_photo_age_context(user):
+    """Тот же возрастной контекст для type=food, что в photo_food_photo/handle_photo из
+    mama_bot.py: добавляется только для профиля 'mama', для беременных и пустого профиля — пусто."""
+    try:
+        with _miniapp_db(user) as conn:
+            row = _miniapp_profile_row(conn, user.get("platform", "telegram"), user.get("id"))
+        if row and (row["mode"] or "") not in ("", "pregnant"):
+            months = _miniapp_child_months(row["date_value"] or "")
+            if months is not None:
+                return f" Малышу {age_label(months)} ({months} месяцев)."
+    except Exception:
+        logging.exception("miniapp_photo_analyze: profile lookup error")
+    return ""
+
+
+@app.post("/api/miniapp/photo/analyze")
+async def miniapp_photo_analyze(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_form")
+
+    photo_type = str(form.get("type") or "").strip()
+    spec = MINIAPP_PHOTO_TYPES.get(photo_type)
+    if not spec:
+        raise HTTPException(status_code=400, detail="invalid_type")
+
+    image = form.get("image")
+    if not isinstance(image, UploadFile):
+        raise HTTPException(status_code=400, detail="image_required")
+
+    content_type = (image.content_type or "").lower()
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="invalid_mime")
+
+    raw = await image.read()
+    await image.close()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty_file")
+    if len(raw) > MINIAPP_PHOTO_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="file_too_large")
+
+    try:
+        probe = Image.open(io.BytesIO(raw))
+        probe.verify()
+        picture = Image.open(io.BytesIO(raw))
+        picture = ImageOps.exif_transpose(picture)
+        if picture.mode != "RGB":
+            picture = picture.convert("RGB")
+        jpeg_buf = io.BytesIO()
+        picture.save(jpeg_buf, format="JPEG", quality=88)
+        photo_bytes = jpeg_buf.getvalue()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_image")
+    finally:
+        raw = None
+
+    photo_b64 = base64.b64encode(photo_bytes).decode()
+    photo_bytes = None
+
+    analysis_prompt = spec["analysis_prompt"]
+    if photo_type == "food":
+        analysis_prompt = analysis_prompt.format(age_context=_miniapp_photo_age_context(user))
+
+    log_analytics_event_tg(user_id, "request_started", f"photo_{photo_type}", "miniapp", user.get("platform", "telegram"))
+
+    try:
+        filter_response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                    {"type": "text", "text": spec["filter_prompt"]},
+                ],
+            }],
+            max_tokens=10,
+        )
+        filter_answer = (filter_response.choices[0].message.content or "").strip().upper()
+
+        if "НЕТ" in filter_answer or "NO" in filter_answer:
+            log_analytics_event_tg(user_id, "request_completed", f"photo_{photo_type}", "miniapp_no_match", user.get("platform", "telegram"))
+            return {"ok": True, "match": False, "message": spec["wrong_msg"]}
+
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{photo_b64}"}},
+                    {"type": "text", "text": analysis_prompt},
+                ],
+            }],
+            max_tokens=1000,
+        )
+        answer = clean_text(response.choices[0].message.content)
+    except Exception as exc:
+        logging.error(f"miniapp_photo_analyze: ошибка анализа фото (type={photo_type})")
+        await notify_owner_max(f"⚠️ Ошибка AI MiniApp photo/analyze\n\n{type(exc).__name__}: {exc}", key=f"ai_miniapp_photo_{type(exc).__name__}")
+        log_analytics_event_tg(user_id, "request_failed", f"photo_{photo_type}", "miniapp_ai_error", user.get("platform", "telegram"))
+        return {"ok": False, "match": True, "message": MINIAPP_PHOTO_GENERIC_ERROR}
+    finally:
+        photo_b64 = None
+
+    log_analytics_event_tg(user_id, "request_completed", f"photo_{photo_type}", "miniapp", user.get("platform", "telegram"))
+    return {"ok": True, "match": True, "answer": answer}
 
 
 async def main():

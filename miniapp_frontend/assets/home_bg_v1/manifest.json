@@ -1,0 +1,12 @@
+{
+  "name": "MAMA_MINIAPP_HOME_BG_V1",
+  "version": "1.0.0",
+  "asset": "home-bg-premium-v1.webp",
+  "size_px": [
+    1080,
+    2160
+  ],
+  "bytes": 11282,
+  "usage": "Home Mini App background; CSS background-size: cover; add subtle overlay if needed",
+  "notes": "Atmospheric blurred nursery background, no readable embedded text, designed behind standalone 3D shortcuts."
+}

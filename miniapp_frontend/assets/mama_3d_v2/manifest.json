@@ -1,0 +1,94 @@
+{
+  "name": "MAMA_MINIAPP_3D_V2",
+  "version": "2.0.0",
+  "assets": [
+    {
+      "file": "icons/icon-sleep-3d.webp",
+      "bytes": 37366,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-feeding-3d.webp",
+      "bytes": 42082,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-tantrum-3d.webp",
+      "bytes": 50462,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-symptoms-3d.webp",
+      "bytes": 31180,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-kindergarten-3d.webp",
+      "bytes": 40700,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-school-3d.webp",
+      "bytes": 47730,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-mom-support-3d.webp",
+      "bytes": 53766,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-ai-question-3d.webp",
+      "bytes": 39332,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-history-3d.webp",
+      "bytes": 42862,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "icons/icon-donate-heart-3d.webp",
+      "bytes": 31420,
+      "size_px": [
+        512,
+        512
+      ]
+    },
+    {
+      "file": "hero/hero-welcome-3d.webp",
+      "bytes": 84804,
+      "size_px": [
+        900,
+        675
+      ]
+    }
+  ]
+}
