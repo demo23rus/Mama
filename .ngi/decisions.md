@@ -43,5 +43,10 @@ Infrastructure Router/preflight JOB не меняет product behavior, payments
 - Telegram и MAX используют раздельные DB namespaces (/root/mama.db и /root/mama_max.db); схемы не объединяются.
 - GitHub demo23rus/Mama, branch main — единственный source of truth; production copies не переопределяют main.
 - Core product experience (трекеры, дневник, ассистент и т.д.) бесплатный; добровольная поддержка и платный personal-review — отдельные необязательные flows, не блокирующие основной продукт.
-- Hardcoded secrets/credentials в коде запрещены; все токены и ключи должны быть env-based. Текущие MAX_TOKEN/YooKassa литералы в tracked source — признанный P0 security blocker до отдельного owner-approved security JOB (ротация + перевод на env).
+- Hardcoded secrets/credentials в коде запрещены; все токены и ключи должны быть env-based. Текущие MAX_TOKEN/YooKassa литералы в tracked source — признанный security risk, статус см. D009 (ACCEPTED/DEFERRED by owner).
 - Routine production edits (/root/mama_bot.py, /root/mama_max_bot.py, /var/www/mama-miniapp) запрещены; изменения только через controlled JOB flow и ops/deploy_mama.sh.
+
+## D009 — Credential rotation / env migration: ACCEPTED/DEFERRED by owner
+Дата: 2026-10-01
+
+Owner explicitly decided НЕ ротировать MAX_TOKEN/YooKassa credentials и НЕ деплоить уже подготовленный env-based code patch в рамках текущего цикла. Это осознанно принятый (accepted) security risk, а не активный product-блокер: он больше не входит в BLOCKED-P0/NEXT как требующий немедленного действия пункт. Риск остаётся документированным в docs/SECURITY.md и docs/PROJECT_STATUS.md как ACCEPTED/DEFERRED до отдельного будущего owner-approved security JOB. Production/code behavior, env, deploy, restart, repo visibility, Router, DB и frontend этим решением не меняются. Future workers не должны переисследовать это решение; смена статуса требует нового явного owner-решения.

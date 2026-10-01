@@ -55,7 +55,7 @@ Preserved exactly for this migration:
 - Repository visibility is public (demo23rus/Mama).
 - Tracked source currently contains hard-coded credential literals for MAX_TOKEN and YooKassa credentials — values are never printed or copied anywhere, including here.
 - OPENAI and Telegram BOT token paths are already env-based.
-- P0 BLOCKER: project security posture is NOT fully clean until credentials are rotated and the affected code paths are moved to env-based configuration, via a separate owner-approved security JOB.
+- ACCEPTED/DEFERRED RISK: owner explicitly decided to defer credential rotation and not deploy the pending env-based code patch (see .ngi/decisions.md D009). This is a consciously accepted risk, not an active product blocker; security posture is documented as NOT fully clean until a future owner-approved security JOB rotates credentials and moves the affected code paths to env-based configuration.
 - Details: docs/SECURITY.md.
 
 ## OPERATIONS
@@ -63,11 +63,10 @@ Preserved exactly for this migration:
 - Protected areas: scheduler, watchdog, fail-safe, payments/YooKassa, subscriptions, channel/autoposting — require separate explicit owner approval, not covered by general docs-only approvals.
 
 ## CURRENT BLOCKERS
-- P0 (security): public repo + hard-coded MAX_TOKEN/YooKassa credentials — remediation requires a dedicated owner-approved security JOB (rotation + env-based config). See ROADMAP.md BLOCKED-P0 and docs/SECURITY.md.
+- None active. Public repo + hard-coded MAX_TOKEN/YooKassa credentials remain a documented ACCEPTED/DEFERRED security risk (owner decision, see .ngi/decisions.md D009), not an active blocker. See ROADMAP.md DEFERRED and docs/SECURITY.md.
 
 ## NEXT
-- Owner decision + dedicated JOB for credential rotation and env-based config migration.
-- After remediation, a follow-up JOB updates docs/SECURITY.md and this status to confirm a fully clean security posture.
+- No active NEXT item for security: credential rotation and env-based config migration are deferred by owner decision until a future, separately owner-approved security JOB is initiated.
 
 ## CHANGED INFRASTRUCTURE
 - .ngi/project.yaml, rules.md, decisions.md, workers.yaml
@@ -83,4 +82,4 @@ Payments/YooKassa, subscriptions, scheduler/watchdog/fail-safe, channel/autopost
 GitHub main source of truth: PASS. Existing Router reused: PASS. Narrow technical preflight: PASS. Current worker chain preserved: PASS. Focused Router tests: PASS. Real isolated-worktree proof: PASS. Fast-forward promotion: PASS. Source parity/health/public smoke: PASS. Owner result: PASS.
 
 ## DOCUMENTATION CONSOLIDATION (this JOB)
-README.md, docs/ARCHITECTURE.md, docs/PRODUCT_MAP.md, docs/DATA_MODEL.md and docs/SECURITY.md were added; ROADMAP.md restructured into ACTIVE/NEXT/DONE-CLOSED/BLOCKED-P0/DEFERRED/PROCESS; this file extended with PRODUCT STATE/PLATFORM/DATA/SECURITY/OPERATIONS/CURRENT BLOCKERS/NEXT. No product code, Router, deploy script, services, DB or production files were changed.
+README.md, docs/ARCHITECTURE.md, docs/PRODUCT_MAP.md, docs/DATA_MODEL.md and docs/SECURITY.md were added; ROADMAP.md restructured into ACTIVE/NEXT/DONE-CLOSED/DEFERRED/PROCESS; this file extended with PRODUCT STATE/PLATFORM/DATA/SECURITY/OPERATIONS/CURRENT BLOCKERS/NEXT. No product code, Router, deploy script, services, DB or production files were changed.

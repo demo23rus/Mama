@@ -11,11 +11,8 @@
 
 ## NEXT
 
-- Security remediation JOB (см. BLOCKED-P0): ротация credentials, перевод
-  MAX_TOKEN и YooKassa на env-based конфигурацию.
-- После закрытия security-блокера — обновление docs/SECURITY.md и
-  docs/PROJECT_STATUS.md отдельным JOB, подтверждающим чистый security
-  posture.
+- Нет активных NEXT-пунктов по security: ротация credentials и перевод на
+  env-based конфигурацию отложены owner decision (см. DEFERRED).
 
 ## DONE-CLOSED
 
@@ -29,19 +26,19 @@
   поддержка — текущий принятый функциональный baseline.
 - Экономичный Router context с coordinator narrow technical preflight.
 
-## BLOCKED-P0
-
-- Публичный репозиторий содержит захардкоженные credential-литералы
-  (MAX_TOKEN, YooKassa) в tracked source. Требуется owner-approved
-  security JOB: ротация credentials + перевод на env-based конфигурацию,
-  до этого security posture не считается полностью чистым. Подробности:
-  [docs/SECURITY.md](docs/SECURITY.md).
-
 ## DEFERRED
 
 - Расширение автоматической worker chain (например, включение Kimi Code)
   — отложено до отдельного owner-approved решения об изменении chain (см.
   [.ngi/decisions.md](.ngi/decisions.md) D003).
+- Security risk — ACCEPTED/DEFERRED by owner: публичный репозиторий
+  содержит захардкоженные credential-литералы (MAX_TOKEN, YooKassa) в
+  tracked source. Owner явно решил отложить ротацию credentials и не
+  деплоить уже подготовленный env-based code patch (см.
+  [.ngi/decisions.md](.ngi/decisions.md) D009). Это не активный блокер;
+  security posture остаётся задокументирован как ACCEPTED/DEFERRED до
+  отдельного будущего owner-approved security JOB. Подробности:
+  [docs/SECURITY.md](docs/SECURITY.md).
 
 ## PROCESS
 

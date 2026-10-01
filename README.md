@@ -10,10 +10,11 @@ NGI Autonomous Development Standard v1 migration: **PASS**. GitHub main
 (`demo23rus/Mama`, branch `main`) — единственный source of truth. Подробный
 статус: [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
-**Известный P0-блокер:** в текущем tracked-источнике есть захардкоженные
-credential-литералы (MAX_TOKEN, YooKassa) в публичном репозитории. Значения
-нигде не публикуются; ротация и перевод на env-переменные — отдельный
-owner-approved security JOB. Подробности: [docs/SECURITY.md](docs/SECURITY.md).
+**Известный security risk (ACCEPTED/DEFERRED):** в текущем tracked-источнике
+есть захардкоженные credential-литералы (MAX_TOKEN, YooKassa) в публичном
+репозитории. Значения нигде не публикуются; owner явно решил отложить
+ротацию и перевод на env-переменные (см. [.ngi/decisions.md](.ngi/decisions.md)
+D009) — это не активный блокер. Подробности: [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Структура репозитория
 
@@ -26,7 +27,7 @@ owner-approved security JOB. Подробности: [docs/SECURITY.md](docs/SEC
 - `.ngi/` — NGI v1 правила, решения, профиль проекта, worker chain.
 - `docs/` — текущая документация (архитектура, продуктовая карта, модель
   данных, безопасность, статус).
-- `ROADMAP.md` — текущий roadmap (ACTIVE/NEXT/DONE/BLOCKED/DEFERRED/PROCESS).
+- `ROADMAP.md` — текущий roadmap (ACTIVE/NEXT/DONE/DEFERRED/PROCESS).
 
 ## Документация
 
