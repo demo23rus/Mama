@@ -1,0 +1,40 @@
+schema_version: 2
+project: Mama
+project_id: mama
+mode: economical
+router:
+  adapter: existing_bot_flow
+  cli_entrypoint: /usr/local/bin/bot-flow
+  project_profile: /root/bot_flow_profiles/mama.profile
+policy:
+  context_mode: coordinator_narrow_preflight
+  broad_repository_scan_by_default: false
+  full_roadmap_read_by_default: false
+  full_test_suite_by_default: false
+  auto_purchase_tokens_or_credits: false
+  current_chain:
+    implementation: claude_code
+    reviewer_repair: codex
+  preserve_existing_chain: true
+workers:
+  claude_code:
+    enabled: true
+    automatic: true
+    role: implementation
+    narrow_preflight_required: true
+  codex:
+    enabled: true
+    automatic: true
+    role: reviewer_repair
+    narrow_preflight_required_for_repairs: true
+  kimi_code:
+    installed_on_server: true
+    enabled: false
+    automatic: false
+    role: future_optional_coding_worker
+    narrow_preflight_required: true
+    note: "Do not add to automatic chain without a separate owner-approved worker-chain change."
+cost_policy:
+  auto_purchase: forbidden
+  prefer_focused_tests: true
+  no_second_implementation_after_success: true

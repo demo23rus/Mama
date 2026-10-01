@@ -1,0 +1,54 @@
+schema_version: 1
+project: Mama
+project_id: mama
+roadmap: ROADMAP.md
+current_state: docs/PROJECT_STATUS.md
+rules: .ngi/rules.md
+decisions: .ngi/decisions.md
+workers: .ngi/workers.yaml
+source_of_truth:
+  code: github_main
+  repository: demo23rus/Mama
+  default_branch: main
+  job_base_ref: origin/main
+  cutover_status: pending_verification
+router:
+  adapter: existing_bot_flow
+  cli_entrypoint: /usr/local/bin/bot-flow
+  project_profile: /root/bot_flow_profiles/mama.profile
+  context_mode: coordinator_narrow_preflight
+  broad_repository_scan_by_default: false
+production:
+  server: ams-1-vm-g5dq
+  frontend_webroot: /var/www/mama-miniapp
+  direct_production_editing: forbidden
+  backend_files:
+    - /root/mama_bot.py
+    - /root/mama_max_bot.py
+  services:
+    - mambot.service
+    - mama-max.service
+  protected_services:
+    - mama-watchdog.service
+    - mama-watchdog.timer
+  health_checks:
+    - http://127.0.0.1:8082/health
+    - http://127.0.0.1:8082/api/miniapp/health
+    - https://maminpomoshnik.ru/app/
+verification:
+  shared_router_preflight_test: /root/bot_flow_tests/test_preflight_narrow.sh
+  focused_tests_only: true
+  full_test_suite_by_default: false
+deploy:
+  script: ops/deploy_mama.sh
+  merge: fast_forward_only
+  health_required: true
+security:
+  never_commit:
+    - secrets
+    - tokens
+    - passwords
+    - .env
+    - databases
+    - private_user_data
+    - backup_archives
