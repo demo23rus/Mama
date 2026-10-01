@@ -29,3 +29,8 @@
 Дата: 2026-10-01
 
 Infrastructure Router/preflight JOB не меняет product behavior, payments/subscriptions, personal-review logic, scheduler/watchdog/channel flows, DB schemas или production data. Direct routine production editing запрещено.
+
+## D007 — Mama NGI v1 migration complete
+Дата: 2026-10-01
+
+Полный NGI v1 cutover завершён: demo23rus/Mama main — source of truth; accepted production backend + Mini App source reconciled; existing /usr/local/bin/bot-flow reused as Router adapter; Mama defaults to coordinator_narrow_preflight; current Claude Code → Codex chain preserved; shared focused preflight tests PASS; real isolated-worktree JOB_20261001_142538 passed Claude implementation + Codex REVIEW_PASS with --preflight-file and branch packaging; promotion is fast-forward only; controlled source-parity/deploy/health smoke passed without product behavior changes.

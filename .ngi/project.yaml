@@ -11,7 +11,7 @@ source_of_truth:
   repository: demo23rus/Mama
   default_branch: main
   job_base_ref: origin/main
-  cutover_status: pending_verification
+  cutover_status: complete
 router:
   adapter: existing_bot_flow
   cli_entrypoint: /usr/local/bin/bot-flow
