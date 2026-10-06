@@ -18,3 +18,12 @@ output/
 *_backup*
 *.tar.gz
 *.zip
+
+# Agent-local state: ignore everything except committed Spec Kit skill definitions.
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/speckit-*/
+.agents/skills/speckit-*/*
+!.agents/skills/speckit-*/SKILL.md
+.codex/

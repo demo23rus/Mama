@@ -10,6 +10,8 @@ NGI Autonomous Development Standard v1 migration: **PASS**. GitHub main
 (`demo23rus/Mama`, branch `main`) — единственный source of truth. Подробный
 статус: [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
+**Spec Kit pilot:** для больших функций, сложных багов и оценки спорных идей установлен GitHub Spec Kit; мелкие задачи по-прежнему идут обычным JOB. Владелец пишет обычным языком, режим выбирается автоматически. Runtime/production установкой не менялись. См. [docs/SPECKIT_PROJECT_USAGE_2026-10-06.md](docs/SPECKIT_PROJECT_USAGE_2026-10-06.md).
+
 **Известный security risk (ACCEPTED/DEFERRED):** в текущем tracked-источнике
 есть захардкоженные credential-литералы (MAX_TOKEN, YooKassa) в публичном
 репозитории. Значения нигде не публикуются; owner явно решил отложить
@@ -36,6 +38,7 @@ D009) — это не активный блокер. Подробности: [do
 - [docs/DATA_MODEL.md](docs/DATA_MODEL.md) — базы данных и таблицы.
 - [docs/SECURITY.md](docs/SECURITY.md) — security posture и блокеры.
 - [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md) — текущий статус проекта.
+- [docs/SPECKIT_PROJECT_USAGE_2026-10-06.md](docs/SPECKIT_PROJECT_USAGE_2026-10-06.md) — pilot-процесс Spec Kit и automatic routing.
 - [ROADMAP.md](ROADMAP.md) — roadmap.
 - [.ngi/decisions.md](.ngi/decisions.md) — зафиксированные решения, которые
   future workers не должны переисследовать.
