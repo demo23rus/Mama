@@ -25,6 +25,7 @@
   трекеры, ассистент, дневник, персональный разбор и добровольная
   поддержка — текущий принятый функциональный baseline.
 - Экономичный Router context с coordinator narrow technical preflight.
+- Spec Kit pilot process установлен в control repo: Feature / Bug / Assessment workflows, automatic mode routing; runtime/production не менялись.
 
 ## DEFERRED
 
@@ -42,7 +43,15 @@
 
 ## PROCESS
 
-Каждый новый implementation JOB: coordinator preflight → Worker Router →
+Авто-выбор режима по запросу владельца:
+- маленькая и понятная правка → обычный JOB;
+- большая функция/архитектурное изменение → SpecKit Feature;
+- сложный баг с неизвестной причиной → SpecKit Bug;
+- спорная идея «делать или нет» → SpecKit Assessment.
+
+Spec Kit — pilot planning/decision layer; он не заменяет Router и не применяется к мелким задачам. Подробно: `docs/SPECKIT_PROJECT_USAGE_2026-10-06.md`.
+
+Каждый implementation JOB после планирования: coordinator preflight → Worker Router →
 focused tests → independent review → fast-forward promotion → controlled
 deploy/health → PASS/BLOCKED.
 

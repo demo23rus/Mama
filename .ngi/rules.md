@@ -40,3 +40,12 @@ Coding-worker начинает только с files/symbols/contracts из pref
 
 ## 10. Verification
 Только focused tests, exact diff, changed-scope check, nearest regression. Финальный owner result — PASS/BLOCKED.
+
+## 11. Spec Kit pilot / automatic mode routing
+Spec Kit — дополнительный pilot layer для больших задач, сложных багов и assessment, а не замена Router. Владелец не обязан указывать команды:
+- узкая понятная правка → обычный JOB;
+- большая функция/межмодульное изменение → SpecKit Feature;
+- сложный баг с неизвестной причиной → SpecKit Bug;
+- идея, где сначала нужно решить «делать / отложить / убить» → SpecKit Assessment.
+
+Для мелких задач Spec Kit не использовать. Spec Kit artifacts должны сужать scope последующей реализации до конкретных contracts/files/tests. Production policy и protected areas остаются без изменений.

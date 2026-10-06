@@ -21,6 +21,14 @@ GitHub main is reconciled to the accepted production backend + Mini App source. 
 - Shared focused Router tests: PREFLIGHT_FOCUSED_TESTS=PASS.
 - Real proof JOB_20261001_142538: docs-only, --preflight-file, Claude IMPLEMENTATION_COMPLETE, Codex REVIEW_PASS, worker commit 7e31131.
 
+## SPEC KIT PILOT — PASS
+- Spec Kit установлен в control repo `demo23rus/Mama`; `.specify/` и Codex skills в `.agents/skills/speckit-*`.
+- Codex integration installed/default; extensions `bug` и `assess` enabled.
+- Automatic routing: маленькая ясная правка → обычный JOB; большая функция → SpecKit Feature; сложный неизвестный баг → SpecKit Bug; спорная идея → SpecKit Assessment.
+- Spec Kit не заменяет существующий NGI Router/preflight/worker chain и не используется для мелких задач.
+- Установка docs/process-only: runtime, production, services, DB и deploy state не изменялись.
+- Usage: `docs/SPECKIT_PROJECT_USAGE_2026-10-06.md`; constitution: `.specify/memory/constitution.md`.
+
 ## WORKER CHAIN
 Preserved exactly for this migration:
 1. Claude Code — implementation.
