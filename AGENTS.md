@@ -36,3 +36,7 @@ Spec Kit установлен как planning/decision layer, не как вто
 Feature: specify → plan → tasks → implement → converge. Bug: assess → fix → test. Assessment: intake → research → define → shape → decide.
 
 Spec Kit не отменяет one JOB = one change, narrow preflight, protected areas и controlled deploy. Для мелких задач Spec Kit не использовать. Подробно: `docs/SPECKIT_PROJECT_USAGE_2026-10-06.md` и `.specify/memory/constitution.md`.
+
+
+## Owner GPU routing decision — 2026-10-11
+Default coding execution: Hermes / ngi-gpu / qwen3.8-27b in an isolated worktree from origin/main. Complex work may use python3 /root/ngi-ai-studio-controller/gpu_worker.py --worktree <registered worktree under /root/ngi_worker_worktrees/> --prompt-file <narrow task>. No automatic Codex/Claude/Kimi calls or cloud-only legacy BotFlow. Independent coordinator review and focused tests remain required. Existing product protections, Git and controlled deploy contracts remain. This owner-authorized migration supersedes earlier execution-chain and BotFlow-default requirements only. Previous configs are retained in .ngi/*.before-gpu.yaml and Git history for rollback.

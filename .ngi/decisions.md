@@ -50,3 +50,7 @@ Infrastructure Router/preflight JOB не меняет product behavior, payments
 Дата: 2026-10-01
 
 Owner explicitly decided НЕ ротировать MAX_TOKEN/YooKassa credentials и НЕ деплоить уже подготовленный env-based code patch в рамках текущего цикла. Это осознанно принятый (accepted) security risk, а не активный product-блокер: он больше не входит в BLOCKED-P0/NEXT как требующий немедленного действия пункт. Риск остаётся документированным в docs/SECURITY.md и docs/PROJECT_STATUS.md как ACCEPTED/DEFERRED до отдельного будущего owner-approved security JOB. Production/code behavior, env, deploy, restart, repo visibility, Router, DB и frontend этим решением не меняются. Future workers не должны переисследовать это решение; смена статуса требует нового явного owner-решения.
+
+
+## Owner GPU routing decision — 2026-10-11
+Default coding execution: Hermes / ngi-gpu / qwen3.8-27b in an isolated worktree from origin/main. Complex work may use python3 /root/ngi-ai-studio-controller/gpu_worker.py --worktree <registered worktree under /root/ngi_worker_worktrees/> --prompt-file <narrow task>. No automatic Codex/Claude/Kimi calls or cloud-only legacy BotFlow. Independent coordinator review and focused tests remain required. Existing product protections, Git and controlled deploy contracts remain. This owner-authorized migration supersedes earlier execution-chain and BotFlow-default requirements only. Previous configs are retained in .ngi/*.before-gpu.yaml and Git history for rollback.

@@ -13,28 +13,26 @@ source_of_truth:
   job_base_ref: origin/main
   cutover_status: complete
 router:
-  adapter: existing_bot_flow
-  cli_entrypoint: /usr/local/bin/bot-flow
-  project_profile: /root/bot_flow_profiles/mama.profile
+  adapter: hermes_coordinator_direct
+  legacy_botflow: manual_only
   context_mode: coordinator_narrow_preflight
-  broad_repository_scan_by_default: false
 production:
   server: ams-1-vm-g5dq
   frontend_webroot: /var/www/mama-miniapp
   direct_production_editing: forbidden
   backend_files:
-    - /root/mama_bot.py
-    - /root/mama_max_bot.py
+  - /root/mama_bot.py
+  - /root/mama_max_bot.py
   services:
-    - mambot.service
-    - mama-max.service
+  - mambot.service
+  - mama-max.service
   protected_services:
-    - mama-watchdog.service
-    - mama-watchdog.timer
+  - mama-watchdog.service
+  - mama-watchdog.timer
   health_checks:
-    - http://127.0.0.1:8082/health
-    - http://127.0.0.1:8082/api/miniapp/health
-    - https://maminpomoshnik.ru/app/
+  - http://127.0.0.1:8082/health
+  - http://127.0.0.1:8082/api/miniapp/health
+  - https://maminpomoshnik.ru/app/
 verification:
   shared_router_preflight_test: /root/bot_flow_tests/test_preflight_narrow.sh
   focused_tests_only: true
@@ -45,10 +43,10 @@ deploy:
   health_required: true
 security:
   never_commit:
-    - secrets
-    - tokens
-    - passwords
-    - .env
-    - databases
-    - private_user_data
-    - backup_archives
+  - secrets
+  - tokens
+  - passwords
+  - .env
+  - databases
+  - private_user_data
+  - backup_archives
