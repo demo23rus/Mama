@@ -16,12 +16,12 @@ policy:
   preserve_existing_chain: false
 workers:
   claude_code:
-    enabled: true
+    enabled: false
     automatic: false
     role: implementation
     narrow_preflight_required: true
   codex:
-    enabled: true
+    enabled: false
     automatic: false
     role: reviewer_repair
     narrow_preflight_required_for_repairs: true
@@ -34,8 +34,8 @@ workers:
     note: Do not add to automatic chain without a separate owner-approved worker-chain
       change.
   gpu_local:
-    enabled: true
-    automatic: true
+    enabled: false
+    automatic: false
     invocation: coordinator_direct
     model: qwen3.8-27b
 cost_policy:
