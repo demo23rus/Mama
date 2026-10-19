@@ -1,6 +1,17 @@
-name: Mama — Mini App Playwright diary
+name: Mama — Mini App Playwright
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/mama-playwright.yml'
+      - 'miniapp_frontend/index.html'
+      - 'miniapp_frontend/assets/app.js'
+      - 'miniapp_frontend/assets/app.css'
+      - 'miniapp_frontend/e2e/**'
+      - 'miniapp_frontend/playwright.config.cjs'
+      - 'miniapp_frontend/package.json'
+      - 'miniapp_frontend/package-lock.json'
   pull_request:
     paths:
       - '.github/workflows/mama-playwright.yml'
@@ -11,6 +22,8 @@ on:
       - 'miniapp_frontend/playwright.config.cjs'
       - 'miniapp_frontend/package.json'
       - 'miniapp_frontend/package-lock.json'
+  schedule:
+    - cron: '17 3 * * *'  # 06:17 MSK; approximate on GitHub runners
   workflow_dispatch:
 
 permissions:
@@ -22,7 +35,7 @@ concurrency:
 
 jobs:
   diary-e2e:
-    name: Synthetic diary / mobile Chromium
+    name: Synthetic Mini App / mobile Chromium + WebKit
     runs-on: ubuntu-latest
     timeout-minutes: 12
     defaults:
@@ -42,10 +55,10 @@ jobs:
       - name: Install test dependencies
         run: npm ci --no-audit --no-fund
 
-      - name: Install headless Chromium
-        run: npx playwright install --with-deps --only-shell chromium
+      - name: Install headless Chromium and WebKit
+        run: npx playwright install --with-deps --only-shell chromium webkit
 
-      - name: Test diary browser journey
+      - name: Test isolated Mini App scenarios
         run: npm run test:e2e
 
       - name: Attach failed-test screenshots and trace
