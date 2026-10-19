@@ -19,12 +19,15 @@ module.exports = defineConfig({
   },
   projects: [
     { name: 'mobile-chromium', use: { ...devices['Pixel 7'], browserName: 'chromium' } },
+    { name: 'mobile-webkit', use: { ...devices['iPhone 13'], browserName: 'webkit' } },
   ],
   webServer: {
     command: 'python3 -m http.server 4173 --bind 127.0.0.1 --directory .',
     cwd: __dirname,
     url: 'http://127.0.0.1:4173/index.html',
     reuseExistingServer: false,
+    stderr: 'ignore',
+    stdout: 'ignore',
     timeout: 30_000,
   },
 })
