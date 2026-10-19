@@ -1,0 +1,58 @@
+name: Mama — Mini App Playwright diary
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/mama-playwright.yml'
+      - 'miniapp_frontend/index.html'
+      - 'miniapp_frontend/assets/app.js'
+      - 'miniapp_frontend/assets/app.css'
+      - 'miniapp_frontend/e2e/**'
+      - 'miniapp_frontend/playwright.config.cjs'
+      - 'miniapp_frontend/package.json'
+      - 'miniapp_frontend/package-lock.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mama-playwright-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diary-e2e:
+    name: Synthetic diary / mobile Chromium
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    defaults:
+      run:
+        working-directory: miniapp_frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: miniapp_frontend/package-lock.json
+
+      - name: Install test dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Install headless Chromium
+        run: npx playwright install --with-deps --only-shell chromium
+
+      - name: Test diary browser journey
+        run: npm run test:e2e
+
+      - name: Attach failed-test screenshots and trace
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mama-playwright-failure
+          path: miniapp_frontend/test-results/
+          if-no-files-found: ignore
+          retention-days: 3
