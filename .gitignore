@@ -27,3 +27,7 @@ output/
 .agents/skills/speckit-*/*
 !.agents/skills/speckit-*/SKILL.md
 .codex/
+
+# Playwright-generated runtime artifacts
+test-results/
+playwright-report/
