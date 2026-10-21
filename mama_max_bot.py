@@ -5649,6 +5649,14 @@ def _miniapp_db(user=None):
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feeding_user_date ON feeding(user_id, created_at)")
             ensure_column(conn, "users", "timezone", "TEXT DEFAULT ''")
+            conn.execute("""CREATE TABLE IF NOT EXISTS notification_settings (
+                user_id INTEGER PRIMARY KEY,
+                vaccine_3d INTEGER NOT NULL DEFAULT 0,
+                vaccine_today INTEGER NOT NULL DEFAULT 0,
+                growth_monthly INTEGER NOT NULL DEFAULT 0,
+                weekly_summary INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT ''
+            )""")
             conn.commit()
             _miniapp_max_schema_ready = True
         return conn
@@ -5657,6 +5665,14 @@ def _miniapp_db(user=None):
     global _miniapp_tg_schema_ready
     if not _miniapp_tg_schema_ready:
         ensure_column(conn, "users", "timezone", "TEXT DEFAULT ''")
+        conn.execute("""CREATE TABLE IF NOT EXISTS notification_settings (
+            user_id INTEGER PRIMARY KEY,
+            vaccine_3d INTEGER NOT NULL DEFAULT 0,
+            vaccine_today INTEGER NOT NULL DEFAULT 0,
+            growth_monthly INTEGER NOT NULL DEFAULT 0,
+            weekly_summary INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT ''
+        )""")
         conn.commit()
         _miniapp_tg_schema_ready = True
     return conn
@@ -5920,6 +5936,90 @@ async def miniapp_profile_timezone(request: Request):
         conn.execute("UPDATE users SET timezone=? WHERE user_id=?", (timezone_name, user_id))
         conn.commit()
     return {"ok": True, "timezone": timezone_name}
+
+
+def _miniapp_notification_defaults(platform):
+    # Telegram already had a 3-days-before vaccine reminder before this settings screen.
+    # Preserve that behavior until the user explicitly saves preferences; MAX gets no
+    # unsolicited new reminder by default.
+    return {
+        "vaccine_3d": platform == "telegram",
+        "vaccine_today": False,
+        "growth_monthly": False,
+        "weekly_summary": False,
+    }
+
+
+@app.get("/api/miniapp/notifications")
+async def miniapp_notifications_get(request: Request):
+    user = _miniapp_require_user(request)
+    platform = user.get("platform", "telegram")
+    user_id = user.get("id")
+    with _miniapp_db(user) as conn:
+        profile = _miniapp_profile_row(conn, platform, user_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="profile_required")
+        row = conn.execute(
+            "SELECT vaccine_3d, vaccine_today, growth_monthly, weekly_summary "
+            "FROM notification_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    settings = _miniapp_notification_defaults(platform)
+    if row:
+        settings = {
+            "vaccine_3d": bool(row["vaccine_3d"]),
+            "vaccine_today": bool(row["vaccine_today"]),
+            "growth_monthly": bool(row["growth_monthly"]),
+            "weekly_summary": bool(row["weekly_summary"]),
+        }
+    return {
+        "ok": True,
+        "settings": settings,
+        "timezone": profile.get("timezone", "") or "Europe/Moscow",
+        "timezone_configured": bool(profile.get("timezone", "")),
+    }
+
+
+@app.post("/api/miniapp/notifications")
+async def miniapp_notifications_save(request: Request):
+    user = _miniapp_require_user(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    keys = ("vaccine_3d", "vaccine_today", "growth_monthly", "weekly_summary")
+    settings = {}
+    for key in keys:
+        value = (body or {}).get(key)
+        if type(value) is not bool:
+            raise HTTPException(status_code=400, detail="invalid_notification_settings")
+        settings[key] = value
+    user_id = user.get("id")
+    with _miniapp_db(user) as conn:
+        exists = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="profile_required")
+        conn.execute(
+            """INSERT INTO notification_settings
+               (user_id, vaccine_3d, vaccine_today, growth_monthly, weekly_summary, updated_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 vaccine_3d=excluded.vaccine_3d,
+                 vaccine_today=excluded.vaccine_today,
+                 growth_monthly=excluded.growth_monthly,
+                 weekly_summary=excluded.weekly_summary,
+                 updated_at=excluded.updated_at""",
+            (
+                user_id,
+                int(settings["vaccine_3d"]),
+                int(settings["vaccine_today"]),
+                int(settings["growth_monthly"]),
+                int(settings["weekly_summary"]),
+                datetime.now().isoformat(),
+            ),
+        )
+        conn.commit()
+    return {"ok": True, "settings": settings}
 
 
 # ========== MINI APP: СЕГОДНЯ ==========
