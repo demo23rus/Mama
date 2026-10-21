@@ -100,7 +100,7 @@ test('Сегодня: «Моя неделя» показывает сводку 
   await expect(page.locator('#weekBody')).toContainText('АКДС')
 
   await page.locator('#weekAdviceBtn').click()
-  await expect(page.locator('#weekAdviceBody')).toContainText('PLAYWRIGHT TEST: ориентиры на неделю')
+  await expect(page.locator('#weekAdviceBody')).toContainText('PLAYWRIGHT TEST: недельный вывод')
   expect(api.state.unexpected).toEqual([])
 })
 

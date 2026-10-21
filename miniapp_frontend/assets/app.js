@@ -237,7 +237,7 @@
     stubKey: null,
     momPendingKey: null,
     today: { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } },
-    week: { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } },
+    weekFrom: "home",
     week: { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } },
     momEmotions: { loading: false, error: "", answer: "" },
     psychoChat: {
@@ -641,6 +641,7 @@
     var weekEntryEl = document.getElementById("weekEntry");
     if (weekEntryEl) {
       weekEntryEl.addEventListener("click", function () {
+        state.weekFrom = "home";
         state.week = { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } };
         navigate("week");
       });
@@ -845,6 +846,7 @@
     if (todayCfBtn) todayCfBtn.addEventListener("click", function () { openComplementaryFeeding(); });
     var todayWeekBtn = body.querySelector("#todayWeekBtn");
     if (todayWeekBtn) todayWeekBtn.addEventListener("click", function () {
+      state.weekFrom = "today";
       state.week = { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } };
       navigate("week");
     });
@@ -900,15 +902,16 @@
 
 
   function renderWeek(root) {
+    var w = state.week;
     root.innerHTML =
       '<div class="screen">' +
-      backButtonHtml("today") +
+      backButtonHtml(state.weekFrom || "home") +
       '<div class="today-scene" id="weekScreen">' +
       '<p class="section-heading" style="margin:0 0 2px;text-align:center">Моя неделя</p>' +
       '<div id="weekBody"></div>' +
       "</div></div>";
     bindBack(root);
-    if (state.week.loading) loadWeek(root);
+    if (w.loading) loadWeek(root);
     renderWeekBody(root, root.querySelector("#weekBody"));
   }
 
@@ -923,7 +926,7 @@
     }).catch(function (err) {
       if (state.screen !== "week") return;
       state.week.loading = false;
-      state.week.error = err && err.code === 401
+      state.week.error = (err && err.code === 401)
         ? "Открой мини-приложение из бота «Мамин помощник»."
         : "Не получилось загрузить неделю. Попробуйте ещё раз.";
       renderWeek(root);
@@ -938,23 +941,35 @@
       return;
     }
     if (w.error) {
-      body.innerHTML = '<div class="pr-error">' + esc(w.error) + '</div><button class="btn-primary" id="weekRetry" type="button">Попробовать ещё раз</button>';
+      body.innerHTML =
+        '<div class="pr-error">' + esc(w.error) + '</div>' +
+        '<button class="btn-primary" id="weekRetry" type="button">Попробовать ещё раз</button>';
       body.querySelector("#weekRetry").addEventListener("click", function () {
-        state.week.loading = true; state.week.error = ""; renderWeekBody(root, body); loadWeek(root);
+        state.week.loading = true;
+        state.week.error = "";
+        renderWeekBody(root, body);
+        loadWeek(root);
       });
       return;
     }
     if (w.notApplicable) {
-      body.innerHTML = '<div class="state-message"><p class="state-message__title">Сначала заполните профиль</p></div>';
+      body.innerHTML = '<div class="state-message"><p class="state-message__title">Сначала заполните профиль</p><p>После этого здесь появится персональная сводка за неделю.</p></div>';
       return;
     }
+
     var d = w.data || {};
     var html = '<p class="ai-q-hint" style="margin:0">' + esc((d.period_start || "") + " — " + (d.period_end || "")) + '</p>';
     if (d.mode === "pregnant") {
-      html += '<div class="today-note"><b>' + esc((d.pregnancy_weeks != null ? d.pregnancy_weeks + " нед. " + (d.pregnancy_days || 0) + " дн." : "Беременность")) + '</b><br>Недельная сводка учитывает текущий срок.</div>';
-    } else {
-      html += '<div class="today-note"><b>' + esc(d.child_age_label || "") + '</b></div>';
       html +=
+        '<div class="today-note"><b>' +
+        esc(d.pregnancy_weeks != null ? d.pregnancy_weeks + " нед. " + (d.pregnancy_days || 0) + " дн." : "Беременность") +
+        '</b><br>Недельная сводка учитывает текущий срок.</div>' +
+        '<div class="week-stat-grid">' +
+        '<div class="today-stat"><span class="today-stat__value">' + (d.symptoms_count || 0) + '</span><span class="today-stat__label">Самочувствие</span></div>' +
+        '<div class="today-stat"><span class="today-stat__value">' + (d.diary_count || 0) + '</span><span class="today-stat__label">Дневник</span></div>' +
+        '</div>';
+    } else {
+      html += '<div class="today-note"><b>' + esc(d.child_age_label || "Малыш") + '</b></div>' +
         '<div class="week-stat-grid">' +
         '<div class="today-stat"><span class="today-stat__value">' + (d.activity_days || 0) + '</span><span class="today-stat__label">Активных дней</span></div>' +
         '<div class="today-stat"><span class="today-stat__value">' + (d.sleep_count || 0) + '</span><span class="today-stat__label">Сон</span></div>' +
@@ -964,7 +979,8 @@
         '<div class="today-stat"><span class="today-stat__value">' + (d.new_foods_count || 0) + '</span><span class="today-stat__label">Новых продуктов</span></div>' +
         '</div>';
       if (d.last_growth) html += '<div class="today-note">Последний рост/вес: ' + esc(d.last_growth.height) + ' см, ' + esc(d.last_growth.weight) + ' кг</div>';
-      if (d.nearest_vaccine) html += '<div class="today-note">💉 Ближайшая прививка: ' + esc(d.nearest_vaccine.vaccine) + ' — ' + esc(d.nearest_vaccine.scheduled_date) + '</div>';
+      if (d.new_foods_count && d.last_food) html += '<div class="today-note">Прикорм: ' + esc(d.new_foods_count) + ' новых · последний — ' + esc(d.last_food) + '</div>';
+      if (d.nearest_vaccine) html += '<div class="today-note">Ближайшая прививка: ' + esc(d.nearest_vaccine.vaccine) + ' — ' + esc(d.nearest_vaccine.scheduled_date) + '</div>';
       if (d.last_diary) html += '<div class="today-note">Последняя запись: ' + esc(d.last_diary.entry) + '</div>';
       if (!(d.activity_days || d.sleep_count || d.feeding_count || d.symptoms_count || d.diary_count || d.new_foods_count)) {
         html += '<div class="today-note">На этой неделе пока мало записей. Можно начать с одного удобного трекера — без обязательства заполнять всё.</div>';
@@ -997,149 +1013,23 @@
       (a.error ? '<div class="pr-error">' + esc(a.error) + '</div>' : '') +
       '<button class="btn-primary" id="weekAdviceBtn" type="button">Что важно на следующей неделе?</button>';
     body.querySelector("#weekAdviceBtn").addEventListener("click", function () {
-      a.loading = true; a.error = ""; renderWeekAdvice(body);
-      apiGet("/week/advice").then(function (data) {
-        if (state.screen !== "week") return;
-        a.loading = false; a.answer = (data && data.answer) || ""; renderWeekAdvice(body);
-      }).catch(function () {
-        if (state.screen !== "week") return;
-        a.loading = false; a.error = "Не получилось получить ориентиры. Попробуйте позже."; renderWeekAdvice(body);
-      });
-    });
-  }
-
-
-  function renderWeek(root) {
-    var w = state.week;
-    root.innerHTML =
-      '<div class="screen">' +
-      backButtonHtml("home") +
-      '<div class="today-scene" id="weekScreen">' +
-      '<p class="section-heading" style="margin:0 0 2px;text-align:center">Моя неделя</p>' +
-      '<div id="weekBody"></div>' +
-      "</div></div>";
-    bindBack(root);
-    if (w.loading) loadWeek(root);
-    renderWeekBody(root, root.querySelector("#weekBody"));
-  }
-
-  function loadWeek(root) {
-    apiGet("/week").then(function (data) {
-      if (state.screen !== "week") return;
-      state.week.loading = false;
-      state.week.error = "";
-      state.week.notApplicable = !data || data.registered === false || !data.mode;
-      state.week.data = data;
-      renderWeek(root);
-    }).catch(function (err) {
-      if (state.screen !== "week") return;
-      state.week.loading = false;
-      state.week.error = (err && err.code === 401)
-        ? "Открой мини-приложение из бота «Мамин помощник»."
-        : "Не получилось загрузить недельную сводку.";
-      renderWeek(root);
-    });
-  }
-
-  function renderWeekBody(root, body) {
-    if (!body) return;
-    var w = state.week;
-    if (w.loading) {
-      body.innerHTML = '<div class="state-message">Собираю неделю…</div>';
-      return;
-    }
-    if (w.error) {
-      body.innerHTML =
-        '<div class="pr-error">' + esc(w.error) + "</div>" +
-        '<button class="btn-primary" id="weekRetryBtn" type="button">Попробовать ещё раз</button>';
-      body.querySelector("#weekRetryBtn").addEventListener("click", function () {
-        state.week.loading = true;
-        state.week.error = "";
-        renderWeekBody(root, body);
-        loadWeek(root);
-      });
-      return;
-    }
-    if (w.notApplicable) {
-      body.innerHTML = '<div class="state-message"><p class="state-message__title">Заполни профиль</p><p>После этого здесь появится персональная сводка за неделю.</p></div>';
-      return;
-    }
-
-    var d = w.data || {};
-    var html = '<p class="ai-q-hint" style="margin:0">' + esc((d.week_start || "") + " — " + (d.week_end || "")) + "</p>";
-
-    if (d.mode === "pregnant") {
-      html += '<div class="today-note"><b>' +
-        esc((d.pregnancy_weeks != null ? d.pregnancy_weeks + " нед. " : "") + (d.pregnancy_days != null ? d.pregnancy_days + " дн." : "")) +
-        '</b><br>Беременность</div>' +
-        '<div class="week-stat-grid">' +
-        '<div class="today-stat"><span class="today-stat__value">' + (d.symptoms_count_7d || 0) + '</span><span class="today-stat__label">Самочувствие</span></div>' +
-        '<div class="today-stat"><span class="today-stat__value">' + (d.diary_count_7d || 0) + '</span><span class="today-stat__label">Дневник</span></div>' +
-        "</div>";
-    } else {
-      html += '<div class="today-note"><b>' + esc(d.child_age_label || "Малыш") + "</b></div>" +
-        '<div class="week-stat-grid">' +
-        '<div class="today-stat"><span class="today-stat__value">' + (d.sleep_count_7d || 0) + '</span><span class="today-stat__label">Сон</span></div>' +
-        '<div class="today-stat"><span class="today-stat__value">' + (d.feeding_count_7d || 0) + '</span><span class="today-stat__label">Питание</span></div>' +
-        '<div class="today-stat"><span class="today-stat__value">' + (d.symptoms_count_7d || 0) + '</span><span class="today-stat__label">Самочувствие</span></div>' +
-        '<div class="today-stat"><span class="today-stat__value">' + (d.diary_count_7d || 0) + '</span><span class="today-stat__label">Дневник</span></div>' +
-        "</div>";
-      var activity = (d.sleep_count_7d || 0) + (d.feeding_count_7d || 0) + (d.symptoms_count_7d || 0) + (d.diary_count_7d || 0);
-      if (!activity && !d.complementary_food_week) {
-        html += '<div class="today-note">За эту неделю пока мало записей. Можно пользоваться только теми трекерами, которые действительно нужны.</div>';
-      }
-      if (d.last_growth) {
-        html += '<div class="today-note">Последний рост/вес: ' + esc(d.last_growth.height) + " см, " + esc(d.last_growth.weight) + " кг</div>";
-      }
-      if (d.complementary_food_week && d.complementary_food_week.count) {
-        html += '<div class="today-note">Прикорм за неделю: ' + esc(d.complementary_food_week.count) + " продукт" + cfPluralSuffix(d.complementary_food_week.count) +
-          (d.complementary_food_week.last_food ? " · последний — " + esc(d.complementary_food_week.last_food) : "") + "</div>";
-      }
-      if (d.nearest_vaccine) {
-        html += '<div class="today-note">Ближайшая прививка: ' + esc(d.nearest_vaccine.vaccine) + " — " + esc(d.nearest_vaccine.scheduled_date) + "</div>";
-      }
-    }
-    html += '<div id="weekAdviceBody"></div>';
-    body.innerHTML = html;
-    renderWeekAdvice(body.querySelector("#weekAdviceBody"));
-  }
-
-  function renderWeekAdvice(adviceBody) {
-    if (!adviceBody) return;
-    var a = state.week.advice;
-    if (a.answer) {
-      adviceBody.innerHTML =
-        '<p class="section-heading" style="margin:10px 2px 2px">Что взять в следующую неделю</p>' +
-        '<div class="ai-q-answer">' + esc(a.answer).replace(/\\n/g, "<br>") + "</div>" +
-        '<button class="btn-primary" id="weekAdviceAgain" type="button">Обновить вывод</button>';
-      adviceBody.querySelector("#weekAdviceAgain").addEventListener("click", function () {
-        state.week.advice = { loading: false, error: "", answer: "" };
-        renderWeekAdvice(adviceBody);
-      });
-      return;
-    }
-    if (a.loading) {
-      adviceBody.innerHTML = '<button class="btn-primary" type="button" disabled>Анализирую неделю…</button>';
-      return;
-    }
-    adviceBody.innerHTML =
-      (a.error ? '<div class="pr-error">' + esc(a.error) + "</div>" : "") +
-      '<button class="btn-primary" id="weekAdviceBtn" type="button">Что изменилось за неделю?</button>';
-    adviceBody.querySelector("#weekAdviceBtn").addEventListener("click", function () {
       a.loading = true;
       a.error = "";
-      renderWeekAdvice(adviceBody);
+      renderWeekAdvice(body);
       apiGet("/week/advice").then(function (data) {
+        if (state.screen !== "week") return;
         a.loading = false;
         a.answer = (data && data.answer) || "";
-        renderWeekAdvice(adviceBody);
+        renderWeekAdvice(body);
       }).catch(function () {
+        if (state.screen !== "week") return;
         a.loading = false;
-        a.error = "Не получилось подготовить вывод. Попробуй позже.";
-        renderWeekAdvice(adviceBody);
+        a.error = "Не получилось получить ориентиры. Попробуйте позже.";
+        renderWeekAdvice(body);
       });
     });
   }
+
 
   function renderTrackerShell(root) {
     root.innerHTML =
@@ -5533,7 +5423,6 @@
     if (!root) return;
     if (state.screen === "home") renderHome(root);
     else if (state.screen === "today") renderToday(root);
-    else if (state.screen === "week") renderWeek(root);
     else if (state.screen === "week") renderWeek(root);
     else if (state.screen === "trackers") renderTrackerShell(root);
     else if (state.screen === "assistant") renderAssistantShell(root);

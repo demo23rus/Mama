@@ -1499,13 +1499,6 @@ svg.profile-action__icon {
   width: 100%;
   flex: none;
 }
-.week-stat-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-}
-
-/* ===== Моя неделя ===== */
 .week-entry {
   appearance: none;
   width: 100%;
