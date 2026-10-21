@@ -117,7 +117,7 @@ async function useLocalMiniApp(page, opts = {}) {
       state.notifications = { ...body }
       await reply({ ok: true, settings: state.notifications })
     } else if (key === 'GET /today') {
-      await reply({ registered: true, mode: 'mother', child_age_label: '9 мес.', sleep_count_24h: 0 })
+      await reply(opts.today || { registered: true, mode: 'mother', child_age_label: '9 мес.', child_months: 9, sleep_count_24h: 0 })
     } else if (key === 'GET /week') {
       await reply({
         registered: true, mode: 'mother', child_age_label: '9 мес.',

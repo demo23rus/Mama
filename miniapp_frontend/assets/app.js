@@ -630,6 +630,7 @@
       '<span><b>Моя неделя</b><small>Сводка за последние 7 дней</small></span>' +
       '<span class="week-entry__arrow">→</span>' +
       "</button>" +
+      '<button class="relevant-now" id="relevantNow" type="button" hidden></button>' +
       '<div class="shortcut-grid">' + HOME_CARDS.map(cardHtml).join("") + "</div>" +
       "</div>";
 
@@ -711,14 +712,91 @@
     return { headline: headline2, meta: meta2 };
   }
 
+  function daysUntilRuDate(value) {
+    var match = String(value || "").match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+    if (!match) return null;
+    var target = new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]));
+    var today = new Date();
+    today = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    var diff = Math.round((target.getTime() - today.getTime()) / 86400000);
+    return isFinite(diff) ? diff : null;
+  }
+
+  function relevantNowItem(data) {
+    if (!data || data.registered === false || !data.mode) return null;
+
+    if (data.mode === "pregnant") {
+      var pregnancyTitle = data.pregnancy_weeks != null
+        ? data.pregnancy_weeks + " неделя беременности"
+        : "Беременность";
+      return {
+        label: "АКТУАЛЬНО ДЛЯ ВАС",
+        title: pregnancyTitle,
+        sub: "Что происходит с малышом и что важно маме сейчас",
+        action: function () { runAction({ type: "pregnancy" }); }
+      };
+    }
+
+    if (data.nearest_vaccine && data.nearest_vaccine.scheduled_date) {
+      var days = daysUntilRuDate(data.nearest_vaccine.scheduled_date);
+      if (days != null && days >= 0 && days <= 7) {
+        var vaccineWhen = days === 0 ? "сегодня" : days === 1 ? "завтра" : "через " + days + " дн.";
+        return {
+          label: "АКТУАЛЬНО ДЛЯ ВАС",
+          title: "Прививка " + vaccineWhen,
+          sub: (data.nearest_vaccine.vaccine || "По календарю") + " · " + data.nearest_vaccine.scheduled_date,
+          action: function () { runAction({ type: "vaccines-tracker" }); }
+        };
+      }
+    }
+
+    if (data.child_months != null && data.child_months >= 6 && data.child_months <= 18) {
+      var cf = data.complementary_food || null;
+      var tried = cf && cf.tried_count ? Number(cf.tried_count) : 0;
+      if (tried < 10) {
+        return {
+          label: "АКТУАЛЬНО ДЛЯ ВАС",
+          title: tried ? "Прикорм 6+ · уже " + tried + " продукт" + cfPluralSuffix(tried) : "Прикорм 6+",
+          sub: tried ? "Продолжить знакомство с продуктами" : "Что давать, как вводить и что уже попробовали",
+          action: function () { openComplementaryFeeding(); }
+        };
+      }
+    }
+
+    return null;
+  }
+
+  function renderRelevantNow(data) {
+    var el = document.getElementById("relevantNow");
+    if (!el) return;
+    var item = relevantNowItem(data);
+    if (!item) {
+      el.hidden = true;
+      el.innerHTML = "";
+      el.onclick = null;
+      return;
+    }
+    el.innerHTML =
+      '<span class="relevant-now__copy">' +
+      '<small class="relevant-now__label">' + esc(item.label) + '</small>' +
+      '<b class="relevant-now__title">' + esc(item.title) + '</b>' +
+      '<span class="relevant-now__sub">' + esc(item.sub) + '</span>' +
+      '</span><span class="relevant-now__arrow">→</span>';
+    el.hidden = false;
+    el.onclick = item.action;
+  }
+
+
   function loadHomeTodayBanner() {
     apiGet("/today").then(function (data) {
       var banner = document.getElementById("todayBanner");
       if (!banner) return;
       if (!data || data.registered === false || !data.mode) {
         banner.style.display = "none";
+        renderRelevantNow(null);
         return;
       }
+      renderRelevantNow(data);
       var summary = todaySummaryText(data);
       var headlineEl = document.getElementById("todayBannerHeadline");
       var metaEl = document.getElementById("todayBannerMeta");
@@ -727,6 +805,7 @@
     }).catch(function () {
       var banner = document.getElementById("todayBanner");
       if (banner) banner.style.display = "none";
+      renderRelevantNow(null);
     });
   }
 
