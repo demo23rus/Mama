@@ -4977,7 +4977,7 @@ async def check_smart_notifications_max():
                     if not _notification_was_sent_max(conn, user_id, "weekly_summary", local_date, item_key):
                         result = await send_message(
                             chat_id,
-                            "📊 Ваша неделя\\n\\nЗагляните в «Историю»: там собраны записи сна, питания, самочувствия, роста, прививок и дневника.",
+                            "📊 Ваша неделя готова\\n\\nОткройте «Мамин Помощник» → «Моя неделя», чтобы посмотреть сводку за последние 7 дней.",
                         )
                         if result:
                             _notification_mark_sent_max(conn, user_id, "weekly_summary", local_date, item_key)
@@ -6352,6 +6352,388 @@ async def miniapp_today_advice(request: Request):
         log_analytics_event_tg(user_id, "request_completed", "today_advice", "miniapp", user.get("platform", "telegram"))
     else:
         log_analytics_event_tg(user_id, "request_failed", "today_advice", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
+    return {"ok": True, "answer": answer}
+
+
+
+
+# ========== MINI APP: МОЯ НЕДЕЛЯ ==========
+MINIAPP_WEEK_DAYS = 7
+
+
+def _miniapp_week_timezone(profile):
+    try:
+        return ZoneInfo((profile or {}).get("timezone") or "Europe/Moscow")
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+
+def _miniapp_week_snapshot(conn, platform, user_id):
+    profile = _miniapp_profile_row(conn, platform, user_id)
+    if not profile or not profile.get("mode"):
+        return None
+
+    tz = _miniapp_week_timezone(profile)
+    local_now = datetime.now(tz)
+    week_end = local_now.date()
+    week_start = week_end - timedelta(days=MINIAPP_WEEK_DAYS - 1)
+    since = (datetime.now() - timedelta(days=MINIAPP_WEEK_DAYS)).isoformat()
+
+    snapshot = {
+        "mode": profile.get("mode") or "",
+        "date_value": profile.get("date_value") or "",
+        "timezone": profile.get("timezone") or "Europe/Moscow",
+        "week_start": week_start.strftime("%d.%m.%Y"),
+        "week_end": week_end.strftime("%d.%m.%Y"),
+    }
+
+    if snapshot["mode"] == "pregnant":
+        weeks, days = _miniapp_pregnancy_weeks_days(snapshot["date_value"])
+        snapshot["pregnancy_weeks"] = weeks
+        snapshot["pregnancy_days"] = days
+        snapshot["symptoms_count_7d"] = int(conn.execute(
+            "SELECT COUNT(*) FROM symptoms WHERE user_id=? AND created_at>=?", (user_id, since)
+        ).fetchone()[0] or 0)
+        snapshot["diary_count_7d"] = int(conn.execute(
+            "SELECT COUNT(*) FROM diary WHERE user_id=? AND created_at>=? "
+            "AND entry NOT LIKE 'КОРМ:%' AND entry NOT LIKE 'СОН:%' AND entry NOT LIKE 'СИМПТОМ:%'",
+            (user_id, since),
+        ).fetchone()[0] or 0)
+        return snapshot
+
+    months = _miniapp_child_months(snapshot["date_value"])
+    snapshot["child_months"] = months
+    snapshot["child_age_label"] = age_label(months)
+    snapshot["sleep_count_7d"] = int(conn.execute(
+        "SELECT COUNT(*) FROM sleep_log WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    snapshot["feeding_count_7d"] = int(conn.execute(
+        "SELECT COUNT(*) FROM feeding WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    snapshot["symptoms_count_7d"] = int(conn.execute(
+        "SELECT COUNT(*) FROM symptoms WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    snapshot["diary_count_7d"] = int(conn.execute(
+        "SELECT COUNT(*) FROM diary WHERE user_id=? AND created_at>=? "
+        "AND entry NOT LIKE 'КОРМ:%' AND entry NOT LIKE 'СОН:%' AND entry NOT LIKE 'СИМПТОМ:%'",
+        (user_id, since),
+    ).fetchone()[0] or 0)
+
+    growth_row = conn.execute(
+        "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if growth_row:
+        snapshot["last_growth"] = {
+            "height": growth_row["height"],
+            "weight": growth_row["weight"],
+            "created_at": growth_row["created_at"] or "",
+        }
+
+    nearest_vaccine = None
+    nearest_date = None
+    for vrow in conn.execute(
+        "SELECT vaccine, scheduled_date FROM vaccinations WHERE user_id=? AND done=0", (user_id,)
+    ):
+        try:
+            vdate = datetime.strptime(vrow["scheduled_date"] or "", "%d.%m.%Y").date()
+        except Exception:
+            continue
+        if vdate < week_end:
+            continue
+        if nearest_date is None or vdate < nearest_date:
+            nearest_date = vdate
+            nearest_vaccine = {
+                "vaccine": vrow["vaccine"] or "",
+                "scheduled_date": vrow["scheduled_date"] or "",
+            }
+    snapshot["nearest_vaccine"] = nearest_vaccine
+
+    if months is not None and months >= 6:
+        try:
+            _miniapp_cf_ensure_schema(conn, platform)
+            cf_rows = list(conn.execute(
+                "SELECT food_key, status, updated_at FROM complementary_food_log "
+                "WHERE platform=? AND user_id=? AND status!='not_tried' AND updated_at>=? "
+                "ORDER BY updated_at DESC",
+                (platform, user_id, since),
+            ))
+            if cf_rows:
+                last_food = MINIAPP_CF_FOOD_BY_KEY.get(cf_rows[0]["food_key"])
+                snapshot["complementary_food_week"] = {
+                    "count": len(cf_rows),
+                    "last_food": last_food["title"] if last_food else cf_rows[0]["food_key"],
+                    "last_food_status": cf_rows[0]["status"],
+                }
+        except Exception:
+            logging.exception("miniapp_week_snapshot complementary_food error")
+
+    return snapshot
+
+
+@app.get("/api/miniapp/week")
+async def miniapp_week(request: Request):
+    user = _miniapp_require_user(request)
+    try:
+        with _miniapp_db(user) as conn:
+            snapshot = _miniapp_week_snapshot(
+                conn, user.get("platform", "telegram"), user.get("id")
+            )
+    except Exception:
+        logging.exception("miniapp_week db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if snapshot is None:
+        return {"ok": True, "registered": False}
+    snapshot["ok"] = True
+    snapshot["registered"] = True
+    return snapshot
+
+
+@app.get("/api/miniapp/week/advice")
+async def miniapp_week_advice(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        with _miniapp_db(user) as conn:
+            snapshot = _miniapp_week_snapshot(
+                conn, user.get("platform", "telegram"), user_id
+            )
+    except Exception:
+        logging.exception("miniapp_week_advice db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if snapshot is None:
+        raise HTTPException(status_code=400, detail="profile_required")
+
+    if snapshot["mode"] == "pregnant":
+        context_lines = [
+            f"Срок беременности: {snapshot.get('pregnancy_weeks')} нед. {snapshot.get('pregnancy_days')} дн.",
+            f"Записей самочувствия за 7 дней: {snapshot.get('symptoms_count_7d', 0)}.",
+            f"Записей дневника за 7 дней: {snapshot.get('diary_count_7d', 0)}.",
+        ]
+    else:
+        context_lines = [
+            f"Возраст ребёнка: {snapshot.get('child_age_label') or 'не указан'}.",
+            f"Записей сна за 7 дней: {snapshot.get('sleep_count_7d', 0)}.",
+            f"Кормлений за 7 дней: {snapshot.get('feeding_count_7d', 0)}.",
+            f"Записей самочувствия за 7 дней: {snapshot.get('symptoms_count_7d', 0)}.",
+            f"Записей дневника за 7 дней: {snapshot.get('diary_count_7d', 0)}.",
+        ]
+        if snapshot.get("last_growth"):
+            g = snapshot["last_growth"]
+            context_lines.append(f"Последний рост/вес: {g.get('height')} см / {g.get('weight')} кг.")
+        if snapshot.get("complementary_food_week"):
+            cf = snapshot["complementary_food_week"]
+            context_lines.append(
+                f"За неделю отмечено продуктов прикорма: {cf.get('count', 0)}; последний: {cf.get('last_food') or '—'}."
+            )
+        if snapshot.get("nearest_vaccine"):
+            v = snapshot["nearest_vaccine"]
+            context_lines.append(f"Ближайшая прививка: {v.get('vaccine')} — {v.get('scheduled_date')}.")
+
+    log_analytics_event_tg(
+        user_id, "request_started", "week_advice", "miniapp",
+        user.get("platform", "telegram")
+    )
+    answer = await _miniapp_ask_gpt(
+        EXPERT_BASE,
+        "Это недельная сводка пользователя приложения «Мамин помощник».\\n"
+        + "\\n".join(context_lines)
+        + "\\n\\nДай короткий итог на русском: 3–5 полезных пунктов на следующую неделю. "
+          "Не ставь диагнозы, не назначай лечение и не делай вывод, что отсутствие записей означает проблему. "
+          "Опирайся только на указанные данные. Если данных мало — прямо скажи об этом и предложи, что удобно отслеживать.",
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(
+            user_id, "request_completed", "week_advice", "miniapp",
+            user.get("platform", "telegram")
+        )
+    else:
+        log_analytics_event_tg(
+            user_id, "request_failed", "week_advice", "miniapp_ai_answer_invalid",
+            user.get("platform", "telegram")
+        )
+    return {"ok": True, "answer": answer}
+
+
+# ========== MINI APP: МОЯ НЕДЕЛЯ ==========
+MINIAPP_WEEK_DAYS = 7
+
+
+def _miniapp_week_snapshot(conn, platform, user_id):
+    profile = _miniapp_profile_row(conn, platform, user_id)
+    if not profile or not profile["mode"]:
+        return None
+
+    now = datetime.now()
+    since_dt = now - timedelta(days=MINIAPP_WEEK_DAYS)
+    since = since_dt.isoformat()
+    result = {
+        "mode": profile["mode"],
+        "period_start": since_dt.strftime("%d.%m.%Y"),
+        "period_end": now.strftime("%d.%m.%Y"),
+    }
+
+    if profile["mode"] == "pregnant":
+        weeks, days = _miniapp_pregnancy_weeks_days(profile["date_value"] or "")
+        result["pregnancy_weeks"] = weeks
+        result["pregnancy_days"] = days
+        return result
+
+    months = _miniapp_child_months(profile["date_value"] or "")
+    result["child_months"] = months
+    result["child_age_label"] = age_label(months)
+
+    result["sleep_count"] = int(conn.execute(
+        "SELECT COUNT(*) FROM sleep_log WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    result["feeding_count"] = int(conn.execute(
+        "SELECT COUNT(*) FROM feeding WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    result["symptoms_count"] = int(conn.execute(
+        "SELECT COUNT(*) FROM symptoms WHERE user_id=? AND created_at>=?", (user_id, since)
+    ).fetchone()[0] or 0)
+    result["diary_count"] = int(conn.execute(
+        "SELECT COUNT(*) FROM diary WHERE user_id=? AND created_at>=? "
+        "AND entry NOT LIKE 'КОРМ:%' AND entry NOT LIKE 'СОН:%' AND entry NOT LIKE 'СИМПТОМ:%'",
+        (user_id, since),
+    ).fetchone()[0] or 0)
+
+    active_days = set()
+    for table in ("sleep_log", "feeding", "symptoms", "diary", "growth"):
+        try:
+            rows = conn.execute(
+                f"SELECT created_at FROM {table} WHERE user_id=? AND created_at>=?",
+                (user_id, since),
+            ).fetchall()
+            for row in rows:
+                value = row["created_at"] if hasattr(row, "keys") else row[0]
+                if value:
+                    active_days.add(str(value)[:10])
+        except Exception:
+            logging.exception("miniapp_week activity-days table=%s", table)
+    result["activity_days"] = len(active_days)
+
+    growth = conn.execute(
+        "SELECT height, weight, created_at FROM growth WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if growth:
+        result["last_growth"] = {
+            "height": growth["height"],
+            "weight": growth["weight"],
+            "created_at": growth["created_at"] or "",
+        }
+
+    last_diary = conn.execute(
+        "SELECT entry, created_at FROM diary WHERE user_id=? "
+        "AND entry NOT LIKE 'КОРМ:%' AND entry NOT LIKE 'СОН:%' AND entry NOT LIKE 'СИМПТОМ:%' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if last_diary:
+        result["last_diary"] = {
+            "entry": last_diary["entry"] or "",
+            "created_at": last_diary["created_at"] or "",
+        }
+
+    nearest = None
+    nearest_date = None
+    for row in conn.execute(
+        "SELECT vaccine, scheduled_date FROM vaccinations WHERE user_id=? AND done=0",
+        (user_id,),
+    ):
+        planned = _notification_parse_date_max(row["scheduled_date"] or "")
+        if not planned or planned < now.date():
+            continue
+        if nearest_date is None or planned < nearest_date:
+            nearest_date = planned
+            nearest = {"vaccine": row["vaccine"] or "", "scheduled_date": row["scheduled_date"] or ""}
+    result["nearest_vaccine"] = nearest
+
+    result["new_foods_count"] = 0
+    if months is not None and months >= 6:
+        try:
+            _miniapp_cf_ensure_schema(conn, platform)
+            result["new_foods_count"] = int(conn.execute(
+                "SELECT COUNT(*) FROM complementary_food_log "
+                "WHERE platform=? AND user_id=? AND status!='not_tried' AND first_tried_at>=?",
+                (platform, user_id, since),
+            ).fetchone()[0] or 0)
+        except Exception:
+            logging.exception("miniapp_week complementary_food error")
+
+    return result
+
+
+@app.get("/api/miniapp/week")
+async def miniapp_week(request: Request):
+    user = _miniapp_require_user(request)
+    try:
+        with _miniapp_db(user) as conn:
+            snapshot = _miniapp_week_snapshot(conn, user.get("platform", "telegram"), user.get("id"))
+    except Exception:
+        logging.exception("miniapp_week db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if snapshot is None:
+        return {"ok": True, "registered": False}
+    snapshot["ok"] = True
+    snapshot["registered"] = True
+    return snapshot
+
+
+@app.get("/api/miniapp/week/advice")
+async def miniapp_week_advice(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        with _miniapp_db(user) as conn:
+            snapshot = _miniapp_week_snapshot(conn, user.get("platform", "telegram"), user_id)
+    except Exception:
+        logging.exception("miniapp_week_advice db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    if snapshot is None:
+        raise HTTPException(status_code=400, detail="profile_required")
+
+    if snapshot["mode"] == "pregnant":
+        system_prompt = EXPERT_PREG
+        context = (
+            f"Срок беременности: {snapshot.get('pregnancy_weeks')} недель "
+            f"{snapshot.get('pregnancy_days')} дней. Период сводки: "
+            f"{snapshot.get('period_start')}–{snapshot.get('period_end')}."
+        )
+    else:
+        system_prompt = EXPERT_BASE
+        lines = [
+            f"Возраст ребёнка: {snapshot.get('child_age_label')}.",
+            f"Период: {snapshot.get('period_start')}–{snapshot.get('period_end')}.",
+            f"Активных дней с записями: {snapshot.get('activity_days', 0)}.",
+            f"Сон: {snapshot.get('sleep_count', 0)} записей.",
+            f"Питание: {snapshot.get('feeding_count', 0)} записей.",
+            f"Самочувствие: {snapshot.get('symptoms_count', 0)} записей.",
+            f"Дневник: {snapshot.get('diary_count', 0)} записей.",
+            f"Новых продуктов прикорма: {snapshot.get('new_foods_count', 0)}.",
+        ]
+        if snapshot.get("last_growth"):
+            g = snapshot["last_growth"]
+            lines.append(f"Последний рост/вес: {g.get('height')} см, {g.get('weight')} кг.")
+        if snapshot.get("nearest_vaccine"):
+            v = snapshot["nearest_vaccine"]
+            lines.append(f"Ближайшая прививка: {v.get('vaccine')} — {v.get('scheduled_date')}.")
+        context = "\n".join(lines)
+
+    log_analytics_event_tg(user_id, "request_started", "week_advice", "miniapp", user.get("platform", "telegram"))
+    answer = await _miniapp_ask_gpt(
+        system_prompt,
+        f"Вот реальные данные пользователя за неделю:\n{context}\n\n"
+        "Дай 3–5 коротких полезных ориентиров на следующую неделю. "
+        "Не придумывай события, показатели и диагнозы. Не оценивай отсутствие записей как проблему. "
+        "Если данных мало, мягко предложи, что можно начать отмечать. "
+        "При медицинских тревожных признаках рекомендуй обратиться к врачу."
+    )
+    if ai_answer_success(answer):
+        log_analytics_event_tg(user_id, "request_completed", "week_advice", "miniapp", user.get("platform", "telegram"))
+    else:
+        log_analytics_event_tg(user_id, "request_failed", "week_advice", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
     return {"ok": True, "answer": answer}
 
 
