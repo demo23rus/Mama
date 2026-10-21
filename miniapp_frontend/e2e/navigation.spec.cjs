@@ -174,3 +174,22 @@ test('Прикорм 6+: «Что приготовить сегодня?» ис�
   await expect(page.locator('#cfBody')).toContainText('Продукты с реакцией')
   expect(api.state.unexpected).toEqual([])
 })
+
+
+test('Дневник малыша: сохраняет структурированный момент в хронологию', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/?screen=diary-tracker')
+  await page.locator('#diaryMomentsBtn').click()
+  await expect(page.locator('#momentsScreen')).toBeVisible()
+
+  await page.locator('[data-moment-kind="first_steps"]').click()
+  await page.locator('#momentDate').fill('2026-10-20')
+  await page.locator('#momentNote').fill('PLAYWRIGHT TEST: сделал три шага')
+  await page.locator('#momentSaveBtn').click()
+
+  await expect(page.locator('#momentsList')).toContainText('Первые шаги')
+  await expect(page.locator('#momentsList')).toContainText('20.10.2026')
+  await expect(page.locator('#momentsList')).toContainText('PLAYWRIGHT TEST: сделал три шага')
+  expect(api.state.moments).toHaveLength(1)
+  expect(api.state.unexpected).toEqual([])
+})
