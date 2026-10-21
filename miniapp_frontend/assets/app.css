@@ -1585,3 +1585,32 @@ svg.profile-action__icon {
   font-size: 18px;
   font-weight: 700;
 }
+
+/* ===== Прикорм 6+ → Что приготовить сегодня ===== */
+.cf-idea-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 9px;
+  padding: 12px 14px;
+  background: rgba(255,255,255,.58);
+  border: 1px solid rgba(191,120,150,.12);
+  border-radius: var(--radius-sm);
+}
+.cf-idea-card__label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .45px;
+  text-transform: uppercase;
+  color: var(--pink-strong);
+}
+.cf-idea-card__foods {
+  font-size: 14px;
+  line-height: 1.35;
+  color: var(--text);
+}
+.cf-idea-card__texture {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-soft);
+}
