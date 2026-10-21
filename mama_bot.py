@@ -178,6 +178,7 @@ def _run_db_migrations(conn):
             "date_value": "TEXT DEFAULT ''",
             "name": "TEXT DEFAULT ''",
             "created_at": "TEXT DEFAULT ''",
+            "timezone": "TEXT DEFAULT ''",
         },
         "diary": {
             "user_id": "INTEGER",
@@ -283,7 +284,8 @@ def init_db():
             mode TEXT,
             date_value TEXT,
             name TEXT,
-            created_at TEXT
+            created_at TEXT,
+            timezone TEXT DEFAULT ''
         )
     """)
     c.execute("""
@@ -485,8 +487,13 @@ def save_user(user_id, mode, date_value, name=""):
     conn = db_connect()
     c = conn.cursor()
     c.execute("""
-        INSERT OR REPLACE INTO users (user_id, mode, date_value, name, created_at)
+        INSERT INTO users (user_id, mode, date_value, name, created_at)
         VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            mode=excluded.mode,
+            date_value=excluded.date_value,
+            name=excluded.name,
+            created_at=excluded.created_at
     """, (user_id, mode, date_value, name, datetime.now().isoformat()))
     conn.commit()
     conn.close()

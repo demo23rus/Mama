@@ -601,7 +601,8 @@ def init_db():
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '', first_name TEXT DEFAULT '',
-        step TEXT DEFAULT 'idle', birth_date TEXT DEFAULT '', registered_at TEXT DEFAULT ''
+        step TEXT DEFAULT 'idle', birth_date TEXT DEFAULT '', registered_at TEXT DEFAULT '',
+        timezone TEXT DEFAULT ''
     )""")
     # Миграции старой базы выполняются без удаления пользовательских данных.
     ensure_column(conn, "users", "username", "TEXT DEFAULT ''")
@@ -610,6 +611,7 @@ def init_db():
     ensure_column(conn, "users", "birth_date", "TEXT DEFAULT ''")
     ensure_column(conn, "users", "registered_at", "TEXT DEFAULT ''")
     ensure_column(conn, "users", "pending_start", "TEXT DEFAULT ''")
+    ensure_column(conn, "users", "timezone", "TEXT DEFAULT ''")
     old_user_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
     if "name" in old_user_cols:
         conn.execute("UPDATE users SET first_name=COALESCE(NULLIF(first_name,''), name, '')")
@@ -5618,6 +5620,7 @@ MINIAPP_TG_USER_HEADERS = [
     "AI-запросы", "Тариф", "Дата окончания", "Отзыв"
 ]
 _miniapp_max_schema_ready = False
+_miniapp_tg_schema_ready = False
 
 
 def _miniapp_db(user=None):
@@ -5645,11 +5648,17 @@ def _miniapp_db(user=None):
                 created_at TEXT
             )""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_feeding_user_date ON feeding(user_id, created_at)")
+            ensure_column(conn, "users", "timezone", "TEXT DEFAULT ''")
             conn.commit()
             _miniapp_max_schema_ready = True
         return conn
     conn = sqlite3.connect(TG_DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
+    global _miniapp_tg_schema_ready
+    if not _miniapp_tg_schema_ready:
+        ensure_column(conn, "users", "timezone", "TEXT DEFAULT ''")
+        conn.commit()
+        _miniapp_tg_schema_ready = True
     return conn
 
 
@@ -5759,7 +5768,7 @@ def _miniapp_profile_row(conn, platform, user_id):
     users, что и mama_max_bot.py, но ничего в ней не меняем."""
     if platform == "max":
         row = conn.execute(
-            "SELECT user_id, first_name, birth_date, registered_at FROM users WHERE user_id=?",
+            "SELECT user_id, first_name, birth_date, registered_at, timezone FROM users WHERE user_id=?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -5777,9 +5786,10 @@ def _miniapp_profile_row(conn, platform, user_id):
             "date_value": date_value,
             "name": row["first_name"] or "",
             "created_at": row["registered_at"] or "",
+            "timezone": row["timezone"] or "",
         }
     row = conn.execute(
-        "SELECT user_id, mode, date_value, name, created_at FROM users WHERE user_id=?",
+        "SELECT user_id, mode, date_value, name, created_at, timezone FROM users WHERE user_id=?",
         (user_id,),
     ).fetchone()
     if not row:
@@ -5790,6 +5800,7 @@ def _miniapp_profile_row(conn, platform, user_id):
         "date_value": row["date_value"] or "",
         "name": row["name"] or "",
         "created_at": row["created_at"] or "",
+        "timezone": row["timezone"] or "",
     }
 
 
@@ -5882,7 +5893,33 @@ async def miniapp_profile(request: Request):
         "pregnancy_weeks": weeks,
         "child_months": months,
         "created_at": row["created_at"] or "",
+        "timezone": row.get("timezone", "") or "Europe/Moscow",
+        "timezone_configured": bool(row.get("timezone", "")),
     }
+
+
+@app.post("/api/miniapp/profile/timezone")
+async def miniapp_profile_timezone(request: Request):
+    user = _miniapp_require_user(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    timezone_name = str((body or {}).get("timezone") or "").strip()
+    if not timezone_name or len(timezone_name) > 64:
+        raise HTTPException(status_code=400, detail="invalid_timezone")
+    try:
+        ZoneInfo(timezone_name)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_timezone")
+    user_id = user.get("id")
+    with _miniapp_db(user) as conn:
+        row = conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="profile_required")
+        conn.execute("UPDATE users SET timezone=? WHERE user_id=?", (timezone_name, user_id))
+        conn.commit()
+    return {"ok": True, "timezone": timezone_name}
 
 
 # ========== MINI APP: СЕГОДНЯ ==========

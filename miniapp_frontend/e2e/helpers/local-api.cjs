@@ -15,6 +15,8 @@ async function useLocalMiniApp(page, opts = {}) {
     diary: [],
     history: [],
     growth: [],
+    timezone: 'Europe/Moscow',
+    timezoneConfigured: false,
     unexpected: [],
     calls: [],
   }
@@ -82,7 +84,24 @@ async function useLocalMiniApp(page, opts = {}) {
     if (key === 'GET /home') {
       await reply({ name: 'Автотест' })
     } else if (key === 'GET /profile') {
-      await reply({ registered: true, name: 'Автотест', mode: 'mother', child_months: 9 })
+      await reply({
+        registered: true,
+        name: 'Автотест',
+        mode: 'mother',
+        child_months: 9,
+        timezone: state.timezone,
+        timezone_configured: state.timezoneConfigured,
+      })
+    } else if (key === 'POST /profile/timezone') {
+      const body = req.postDataJSON()
+      call.body = body
+      if (!['Europe/Moscow','Asia/Krasnoyarsk','Asia/Yekaterinburg'].includes(body.timezone)) {
+        await reply({ detail: 'invalid_timezone' }, 400)
+        return
+      }
+      state.timezone = body.timezone
+      state.timezoneConfigured = true
+      await reply({ ok: true, timezone: state.timezone })
     } else if (key === 'GET /today') {
       await reply({ registered: true, mode: 'mother', child_age_label: '9 мес.', sleep_count_24h: 0 })
     } else if (key === 'GET /history/recent') {
@@ -170,7 +189,7 @@ async function useLocalMiniApp(page, opts = {}) {
     assertSafe() {
       expect(state.unexpected).toEqual([])
       // Only explicit synthetic tracker writes are permitted in tests.
-      const allowed = new Set(['/diary/add', '/sleep/log', '/feeding/log', '/symptoms/log', '/growth/log'])
+      const allowed = new Set(['/diary/add', '/sleep/log', '/feeding/log', '/symptoms/log', '/growth/log', '/profile/timezone'])
       expect(state.calls.filter((call) => call.method !== 'GET' && !allowed.has(call.path))).toEqual([])
     },
   }

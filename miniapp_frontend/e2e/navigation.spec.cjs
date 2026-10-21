@@ -46,3 +46,25 @@ test('прямая ссылка во внутренний экран восст�
   await expect(page.locator('#diaryTrackerScreen')).toBeVisible()
   api.assertSafe()
 })
+
+
+test('Профиль: часовой пояс сохраняется и повторно отображается', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/?screen=profile')
+  await expect(page.locator('#profileScreen')).toBeVisible()
+
+  await page.locator('#profileTimezoneBtn').click()
+  await expect(page.locator('#timezoneScreen')).toBeVisible()
+  await expect(page).toHaveURL(/screen=timezone/)
+
+  await page.locator('#timezoneSelect').selectOption('Asia/Krasnoyarsk')
+  await page.locator('#timezoneSaveBtn').click()
+  await expect(page.locator('#timezoneBody')).toContainText('Часовой пояс сохранён')
+  expect(api.state.timezone).toBe('Asia/Krasnoyarsk')
+
+  await page.locator('[data-back="profile"]').click()
+  await expect(page.locator('#profileScreen')).toBeVisible()
+  await expect(page.locator('#profileBody')).toContainText('Красноярск')
+
+  expect(api.state.unexpected).toEqual([])
+})
