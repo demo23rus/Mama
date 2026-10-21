@@ -762,6 +762,15 @@ def init_db():
         sent_at TEXT NOT NULL,
         UNIQUE(user_id, kind, local_date, item_key)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS baby_moments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        event_date TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_baby_moments_user_date ON baby_moments(user_id, event_date)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_diary_user_created ON diary(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_growth_user_created ON growth(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_symptoms_user_created ON symptoms(user_id, created_at)")
