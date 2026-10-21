@@ -1,5 +1,18 @@
 # PROJECT_STATUS — Мамин Помощник NGI v1
 
+## PRODUCT UPDATE — 2026-10-21
+
+**PASS — новый 7-step product cycle завершён, merged в GitHub main и присутствует в production.**
+
+- Current main: `248eb30` (после PR #12, safe startup init для `baby_moments`).
+- PR #5–#12: merged; open PR: 0 на момент фиксации.
+- Production/source parity: PASS.
+- Services: `mambot.service` active; `mama-max.service` active.
+- Shared Mini App health: PASS; public `/app/`: HTTP 200.
+- Завершено: пользовательский timezone; Центр уведомлений; timezone-aware reminders; «Моя неделя»; Home «Актуально для вас»; «Прикорм 6+ → Что приготовить сегодня?»; «Моменты малыша».
+- Новые пользовательские данные остаются platform-isolated для Telegram/MAX.
+- Полный handoff: `docs/CURRENT_HANDOFF.md`.
+
 ## STATUS
 **PASS — NGI Autonomous Development Standard v1 migration complete.**
 
@@ -44,8 +57,8 @@ Preserved exactly for this migration:
 
 ## PRODUCT STATE
 - Shared Telegram + MAX Mini App backend in mama_max_bot.py handles auth/platform routing for both platforms; mama_bot.py is the Telegram bot backend.
-- Mini App root screens: Home, Assistant, Trackers, History, Profile; frontend currently has 80 render* functions.
-- Backend exposes 50+ /api/miniapp routes covering profile/home/today, referral, feedback, pregnancy, ask-question, personal-review, support, tantrums/emotions, psycho, reset-me, kindergarten, firstdays, breastfeeding, recovery, benefits, child, sleep, feeding, complementary-foods (complementary_food_log), symptoms, diary, growth, vaccines, emergency, photo analysis.
+- Mini App root screens: Home, Assistant, Trackers, History, Profile; frontend currently has 93 render* functions.
+- Backend exposes 60+ Mini App routes covering profile/home/today/week, timezone, notifications, referral, feedback, pregnancy, ask-question, personal-review, support, tantrums/emotions, psycho, reset-me, kindergarten, firstdays, breastfeeding, recovery, benefits, child, sleep, feeding, complementary-foods, symptoms, diary, moments, growth, vaccines, emergency and photo analysis.
 - Core product experience is free; voluntary support and paid personal-review are separate, non-blocking flows.
 - Details: docs/PRODUCT_MAP.md.
 
