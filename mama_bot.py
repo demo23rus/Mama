@@ -1736,7 +1736,7 @@ def kb_emergency():
     ])
 
 # ─── КЛАВИАТУРЫ ──────────────────────────────────────────────
-MINIAPP_URL = "https://maminpomoshnik.ru/app/"
+MINIAPP_URL = "https://maminpomoshnik.ru/app/?v=20261021-tgcache17"
 
 
 def _with_owner_button(rows, user_id=None):
@@ -4923,7 +4923,7 @@ CF_CAMPAIGN_TEXT = (
 
 def cf_campaign_kb_tg():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🥣 Открыть «Прикорм 6+»", web_app=WebAppInfo(url=MINIAPP_URL + "?screen=complementary-feeding"))],
+        [InlineKeyboardButton(text="🥣 Открыть «Прикорм 6+»", web_app=WebAppInfo(url=MINIAPP_URL + "&screen=complementary-feeding"))],
         [InlineKeyboardButton(text="💬 Оставить мнение", callback_data="cf2026:feedback")],
     ])
 
