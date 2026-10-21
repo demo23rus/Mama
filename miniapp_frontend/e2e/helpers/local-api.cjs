@@ -117,6 +117,14 @@ async function useLocalMiniApp(page, opts = {}) {
       }
       state.notifications = { ...body }
       await reply({ ok: true, settings: state.notifications })
+    } else if (key === 'POST /analytics/ui') {
+      const body = req.postDataJSON()
+      call.body = body
+      if (!['week','relevant','notifications','cf_ideas','moments'].includes(body.event)) {
+        await reply({ detail: 'invalid_analytics_event' }, 400)
+        return
+      }
+      await reply({ ok: true })
     } else if (key === 'GET /today') {
       await reply(opts.today || { registered: true, mode: 'mother', child_age_label: '9 мес.', child_months: 9, sleep_count_24h: 0 })
     } else if (key === 'GET /week') {
@@ -264,7 +272,7 @@ async function useLocalMiniApp(page, opts = {}) {
     assertSafe() {
       expect(state.unexpected).toEqual([])
       // Only explicit synthetic tracker writes are permitted in tests.
-      const allowed = new Set(['/diary/add', '/sleep/log', '/feeding/log', '/symptoms/log', '/growth/log', '/profile/timezone', '/notifications', '/moments'])
+      const allowed = new Set(['/diary/add', '/sleep/log', '/feeding/log', '/symptoms/log', '/growth/log', '/profile/timezone', '/notifications', '/moments', '/analytics/ui'])
       expect(state.calls.filter((call) => call.method !== 'GET' && !allowed.has(call.path))).toEqual([])
     },
   }

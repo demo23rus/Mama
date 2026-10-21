@@ -503,6 +503,12 @@
     });
   }
 
+  function trackUiFeature(eventName) {
+    apiPost("/analytics/ui", { event: eventName }).catch(function () {
+      /* Аналитика не должна мешать пользовательскому действию. */
+    });
+  }
+
   // multipart/form-data POST (фото для /photo/analyze) — не проставляет Content-Type вручную,
   // чтобы браузер сам выставил boundary; авторизация та же, что и в apiGet/apiPost.
   function apiPostForm(path, formData) {
@@ -653,6 +659,7 @@
     var weekEntryEl = document.getElementById("weekEntry");
     if (weekEntryEl) {
       weekEntryEl.addEventListener("click", function () {
+        trackUiFeature("week");
         state.weekFrom = "home";
         state.week = { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } };
         navigate("week");
@@ -794,7 +801,10 @@
       '<span class="relevant-now__sub">' + esc(item.sub) + '</span>' +
       '</span><span class="relevant-now__arrow">→</span>';
     el.hidden = false;
-    el.onclick = item.action;
+    el.onclick = function () {
+      trackUiFeature("relevant");
+      item.action();
+    };
   }
 
 
@@ -936,6 +946,7 @@
     if (todayCfBtn) todayCfBtn.addEventListener("click", function () { openComplementaryFeeding(); });
     var todayWeekBtn = body.querySelector("#todayWeekBtn");
     if (todayWeekBtn) todayWeekBtn.addEventListener("click", function () {
+      trackUiFeature("week");
       state.weekFrom = "today";
       state.week = { loading: true, error: "", notApplicable: false, data: null, advice: { loading: false, error: "", answer: "" } };
       navigate("week");
@@ -2249,6 +2260,7 @@
         state.cf.openCategory = null;
         state.cf.openFood = null;
         state.cf.markError = "";
+        if (target === "ideas") trackUiFeature("cf_ideas");
         if ((target === "what" || target === "mine" || target === "ideas") && !state.cf.my && !state.cf.myLoading) loadCfMy();
         if ((target === "what" || target === "ideas") && !state.cf.catalog && !state.cf.catalogLoading) loadCfCatalog();
         renderComplementaryFeeding(root);
@@ -2707,6 +2719,7 @@
 
     bindBack(root);
     root.querySelector("#diaryMomentsBtn").addEventListener("click", function () {
+      trackUiFeature("moments");
       state.moments = {
         items: [], loading: true, error: "",
         kind: "first_tooth", eventDate: localIsoToday(), note: "",
@@ -3802,6 +3815,7 @@
       navigate("timezone");
     });
     root.querySelector("#profileNotificationsBtn").addEventListener("click", function () {
+      trackUiFeature("notifications");
       state.notifications.loaded = false;
       state.notifications.error = "";
       state.notifications.success = "";
