@@ -10,6 +10,26 @@
   // them apart from legacy "icon-*-3d.webp" assets and route to the right base path.
   var ICONS_EMBLEM = "assets/emblems/mama/";
 
+  var TIMEZONE_OPTIONS = [
+    ["Europe/Kaliningrad", "Калининград"],
+    ["Europe/Moscow", "Москва"],
+    ["Europe/Samara", "Самара"],
+    ["Asia/Yekaterinburg", "Екатеринбург"],
+    ["Asia/Omsk", "Омск"],
+    ["Asia/Novosibirsk", "Новосибирск"],
+    ["Asia/Krasnoyarsk", "Красноярск"],
+    ["Asia/Irkutsk", "Иркутск"],
+    ["Asia/Yakutsk", "Якутск"],
+    ["Asia/Vladivostok", "Владивосток"],
+    ["Asia/Magadan", "Магадан"],
+    ["Asia/Kamchatka", "Камчатка"],
+    ["Asia/Almaty", "Алматы"],
+    ["Asia/Bishkek", "Бишкек"],
+    ["Asia/Tashkent", "Ташкент"],
+    ["Europe/Minsk", "Минск"]
+  ];
+
+
   // Home: only quick core actions (day-to-day taps), no catalog/section links.
   var HOME_CARDS = [
     { key: "ai-question", title: "Вопрос специалисту", icon: "mama_specialist_light.webp", tone: "blue", action: { type: "ai-question" } },
@@ -251,6 +271,7 @@
     kindergarten: { loading: false, error: "", answer: "" },
     feedback: { kind: null, text: "", loading: false, error: "", success: false, successMessage: "" },
     resetMe: { confirm: false, loading: false, error: "", success: false },
+    timezone: { detected: "", saved: "", configured: false, selected: "", saving: false, error: "", success: "" },
     emergencyFrom: "assistant",
     emergency: {
       loading: false,
@@ -3230,6 +3251,11 @@
       "<span>Поддержать проект</span>" +
       '<span class="profile-action__chevron">→</span>' +
       "</button>" +
+      '<button class="profile-action" id="profileTimezoneBtn" type="button">' +
+      '<svg viewBox="0 0 24 24" class="profile-action__icon" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M4 12h16M12 4c2.2 2.2 3.4 4.9 3.4 8S14.2 17.8 12 20M12 4C9.8 6.2 8.6 8.9 8.6 12S9.8 17.8 12 20"/></svg>' +
+      "<span>Часовой пояс</span>" +
+      '<span class="profile-action__chevron">→</span>' +
+      "</button>" +
       '<button class="profile-action" id="profileFeedbackBtn" type="button">' +
       '<img class="profile-action__icon" src="' + ICONS_EMBLEM + 'mama_feedback_light.webp" alt="" loading="lazy">' +
       "<span>Обратная связь</span>" +
@@ -3250,6 +3276,9 @@
 
     root.querySelector("#profileChannelBtn").addEventListener("click", function () { openExternal(CHANNEL_URL); });
     root.querySelector("#profileDonateBtn").addEventListener("click", function () { runAction({ type: "stub", stub: "donate" }); });
+    root.querySelector("#profileTimezoneBtn").addEventListener("click", function () {
+      navigate("timezone");
+    });
     root.querySelector("#profileFeedbackBtn").addEventListener("click", function () {
       state.feedback = { kind: null, text: "", loading: false, error: "", success: false, successMessage: "" };
       navigate("feedback");
@@ -3286,6 +3315,7 @@
         '<div class="field-row"><span class="field-row__label">Режим</span><span class="field-row__value">' + esc(modeLabel) + "</span></div>" +
         extra +
         '<div class="field-row"><span class="field-row__label">Платформа</span><span class="field-row__value">' + esc(platformLabel()) + "</span></div>" +
+        '<div class="field-row"><span class="field-row__label">Часовой пояс</span><span class="field-row__value">' + esc(timezoneLabel(data.timezone || "Europe/Moscow")) + "</span></div>" +
         '<div class="field-row"><span class="field-row__label">Статус</span><span class="field-row__value">Все функции бесплатно</span></div>' +
         "</div>";
     }).catch(function (err) {
@@ -3300,6 +3330,110 @@
         var retryBtn = body.querySelector("#profileRetryBtn");
         if (retryBtn) retryBtn.addEventListener("click", function () { loadProfileBody(root); });
       }
+    });
+  }
+
+
+  function detectedTimezone() {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+    } catch (_) {
+      return "";
+    }
+  }
+
+  function timezoneLabel(name) {
+    var found = TIMEZONE_OPTIONS.find(function (item) { return item[0] === name; });
+    return found ? found[1] : (name || "Москва");
+  }
+
+  function timezoneLocalTime(name) {
+    try {
+      return new Intl.DateTimeFormat("ru-RU", { timeZone: name, hour: "2-digit", minute: "2-digit", day: "2-digit", month: "long" }).format(new Date());
+    } catch (_) {
+      return "—";
+    }
+  }
+
+  function renderTimezone(root) {
+    var tz = state.timezone;
+    root.innerHTML =
+      '<div class="screen">' +
+      backButtonHtml("profile") +
+      '<div class="profile-scene" id="timezoneScreen">' +
+      '<p class="section-heading" style="margin:0">Часовой пояс</p>' +
+      '<p class="ai-q-hint">Нужен для будущих напоминаний в ваше местное время. Сейчас расписание уведомлений ещё не меняется.</p>' +
+      '<div id="timezoneBody"><div class="state-message">Загружаем настройку…</div></div>' +
+      "</div></div>";
+    bindBack(root);
+    Promise.all([apiGet("/profile")]).then(function (items) {
+      if (state.screen !== "timezone") return;
+      var data = items[0] || {};
+      var detected = detectedTimezone();
+      state.timezone.detected = detected;
+      state.timezone.saved = data.timezone || "Europe/Moscow";
+      state.timezone.configured = !!data.timezone_configured;
+      state.timezone.selected = state.timezone.configured ? state.timezone.saved : (detected || state.timezone.saved);
+      state.timezone.error = "";
+      state.timezone.success = "";
+      renderTimezoneBody(root);
+    }).catch(function () {
+      if (state.screen !== "timezone") return;
+      var body = root.querySelector("#timezoneBody");
+      if (body) body.innerHTML = '<div class="state-message"><p class="state-message__title">Не получилось загрузить</p><p>Попробуйте открыть экран ещё раз.</p></div>';
+    });
+  }
+
+  function renderTimezoneBody(root) {
+    var body = root.querySelector("#timezoneBody");
+    if (!body) return;
+    var tz = state.timezone;
+    var options = TIMEZONE_OPTIONS.slice();
+    var known = options.some(function (item) { return item[0] === tz.selected; });
+    if (tz.selected && !known) options.unshift([tz.selected, tz.selected]);
+    var detectedLine = tz.detected
+      ? '<p class="timezone-note">Определено устройством: <b>' + esc(timezoneLabel(tz.detected)) + "</b> (" + esc(tz.detected) + ")</p>"
+      : '<p class="timezone-note">Не удалось автоматически определить зону. Выберите её вручную.</p>';
+    body.innerHTML =
+      '<div class="timezone-panel">' +
+      detectedLine +
+      '<label class="pr-field"><span class="pr-field__label">Ваш часовой пояс</span>' +
+      '<select class="pr-input timezone-select" id="timezoneSelect">' +
+      options.map(function (item) {
+        return '<option value="' + esc(item[0]) + '"' + (item[0] === tz.selected ? " selected" : "") + ">" + esc(item[1] + " — " + item[0]) + "</option>";
+      }).join("") +
+      "</select></label>" +
+      '<div class="timezone-current">Местное время: <b id="timezoneCurrent">' + esc(timezoneLocalTime(tz.selected)) + "</b></div>" +
+      (tz.configured ? '<p class="timezone-note">Сохранено: ' + esc(timezoneLabel(tz.saved)) + "</p>" : '<p class="timezone-note">Пока используется запасной часовой пояс Москва. Сохраните свой.</p>') +
+      (tz.error ? '<div class="pr-error">' + esc(tz.error) + "</div>" : "") +
+      (tz.success ? '<div class="sleep-confirm">' + esc(tz.success) + "</div>" : "") +
+      '<button class="btn-primary" id="timezoneSaveBtn" type="button"' + (tz.saving ? " disabled" : "") + ">" + (tz.saving ? "Сохраняем…" : "Сохранить") + "</button>" +
+      "</div>";
+    var select = body.querySelector("#timezoneSelect");
+    if (select) select.addEventListener("change", function () {
+      state.timezone.selected = select.value;
+      var current = body.querySelector("#timezoneCurrent");
+      if (current) current.textContent = timezoneLocalTime(select.value);
+    });
+    var save = body.querySelector("#timezoneSaveBtn");
+    if (save) save.addEventListener("click", function () {
+      state.timezone.saving = true;
+      state.timezone.error = "";
+      state.timezone.success = "";
+      renderTimezoneBody(root);
+      apiPost("/profile/timezone", { timezone: state.timezone.selected }).then(function (data) {
+        if (state.screen !== "timezone") return;
+        state.timezone.saving = false;
+        state.timezone.saved = data.timezone;
+        state.timezone.configured = true;
+        state.timezone.success = "Часовой пояс сохранён";
+        renderTimezoneBody(root);
+      }).catch(function () {
+        if (state.screen !== "timezone") return;
+        state.timezone.saving = false;
+        state.timezone.error = "Не удалось сохранить часовой пояс.";
+        renderTimezoneBody(root);
+      });
     });
   }
 
@@ -5027,6 +5161,7 @@
     else if (state.screen === "assistant") renderAssistantShell(root);
     else if (state.screen === "history") renderHistory(root);
     else if (state.screen === "profile") renderProfile(root);
+    else if (state.screen === "timezone") renderTimezone(root);
     else if (state.screen === "invite") renderInvite(root);
     else if (state.screen === "reset-me") renderResetMe(root);
     else if (state.screen === "reset-me-done") renderResetMeDone(root);

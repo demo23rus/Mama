@@ -1386,3 +1386,29 @@ svg.profile-action__icon {
 }
 
 .cf-status-btn:disabled { opacity: 0.6; cursor: default; }
+
+
+/* ===== Профиль → Часовой пояс ===== */
+.timezone-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.timezone-note {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.timezone-current {
+  background: rgba(255,255,255,.55);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.timezone-select {
+  width: 100%;
+  min-height: 44px;
+  appearance: auto;
+}
