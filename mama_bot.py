@@ -479,6 +479,23 @@ def init_db():
         user_id INTEGER NOT NULL, created_at TEXT NOT NULL,
         UNIQUE(campaign_key, platform, user_id)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS notification_settings (
+        user_id INTEGER PRIMARY KEY,
+        vaccine_3d INTEGER NOT NULL DEFAULT 0,
+        vaccine_today INTEGER NOT NULL DEFAULT 0,
+        growth_monthly INTEGER NOT NULL DEFAULT 0,
+        weekly_summary INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT ''
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS notification_delivery_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        item_key TEXT NOT NULL DEFAULT '',
+        sent_at TEXT NOT NULL,
+        UNIQUE(user_id, kind, local_date, item_key)
+    )""")
     _run_db_migrations(conn)
     conn.commit()
     conn.close()
@@ -6480,24 +6497,123 @@ async def vac_mark_done(call: CallbackQuery):
     mark_vaccination_done(vac_id, call.from_user.id)
     await call.message.answer("✅ Прививка отмечена как сделанная!", reply_markup=kb_mama_menu())
 
-async def check_vaccine_reminders():
-    conn = db_connect()
-    c = conn.cursor()
-    today = date.today()
-    reminder_date = (today + __import__('datetime').timedelta(days=3)).strftime("%d.%m.%Y")
-    c.execute("SELECT user_id, vaccine, scheduled_date FROM vaccinations WHERE scheduled_date=? AND done=0", (reminder_date,))
-    rows = c.fetchall()
-    conn.close()
-    for user_id, vaccine, sdate in rows:
+def _notification_timezone_tg(conn, user_id):
+    row = conn.execute("SELECT timezone FROM users WHERE user_id=?", (user_id,)).fetchone()
+    name = (row[0] if row and row[0] else "Europe/Moscow")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+
+def _notification_settings_tg(conn, user_id):
+    row = conn.execute(
+        "SELECT vaccine_3d, vaccine_today, growth_monthly, weekly_summary "
+        "FROM notification_settings WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        # Legacy Telegram behavior already sent the 3-day vaccine reminder.
+        return {"vaccine_3d": True, "vaccine_today": False, "growth_monthly": False, "weekly_summary": False}
+    return {
+        "vaccine_3d": bool(row[0]),
+        "vaccine_today": bool(row[1]),
+        "growth_monthly": bool(row[2]),
+        "weekly_summary": bool(row[3]),
+    }
+
+
+def _notification_parse_date(value):
+    value = (value or "").strip()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
         try:
-            await bot.send_message(user_id,
-                f"💉 Напоминание о прививке!\n\n"
-                f"Через 3 дня ({sdate}) запланирована:\n"
-                f"🔹 {vaccine}\n\n"
-                f"Не забудь записаться к педиатру заранее!"
-            )
-        except Exception as e:
-            logging.error(f"Ошибка напоминания о прививке: {e}")
+            return datetime.strptime(value, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def _notification_was_sent(conn, user_id, kind, local_date, item_key=""):
+    return conn.execute(
+        "SELECT 1 FROM notification_delivery_log WHERE user_id=? AND kind=? AND local_date=? AND item_key=?",
+        (user_id, kind, local_date, item_key),
+    ).fetchone() is not None
+
+
+def _notification_mark_sent(conn, user_id, kind, local_date, item_key=""):
+    conn.execute(
+        "INSERT OR IGNORE INTO notification_delivery_log(user_id, kind, local_date, item_key, sent_at) VALUES (?,?,?,?,?)",
+        (user_id, kind, local_date, item_key, datetime.now().isoformat()),
+    )
+    conn.commit()
+
+
+async def check_smart_notifications():
+    """Hourly dispatcher. It never diagnoses or invents schedules; it only reminds
+    about existing tracker data/preferences in the user's saved local timezone."""
+    conn = db_connect()
+    try:
+        users = conn.execute("SELECT user_id, mode FROM users").fetchall()
+        for user_id, mode in users:
+            try:
+                tz = _notification_timezone_tg(conn, user_id)
+                local_now = datetime.now(tz)
+                settings = _notification_settings_tg(conn, user_id)
+                local_date = local_now.date().isoformat()
+
+                # Vaccine reminders: 09:00 local time, only existing pending calendar rows.
+                if local_now.hour == 9 and (settings["vaccine_3d"] or settings["vaccine_today"]):
+                    vaccinations = conn.execute(
+                        "SELECT id, vaccine, scheduled_date FROM vaccinations WHERE user_id=? AND done=0",
+                        (user_id,),
+                    ).fetchall()
+                    for vac_id, vaccine, scheduled_date in vaccinations:
+                        planned = _notification_parse_date(scheduled_date)
+                        if not planned:
+                            continue
+                        delta = (planned - local_now.date()).days
+                        kind = None
+                        if delta == 3 and settings["vaccine_3d"]:
+                            kind = "vaccine_3d"
+                            text = (
+                                f"💉 Напоминание о прививке\\n\\n"
+                                f"Через 3 дня ({scheduled_date}) запланирована: {vaccine}.\\n"
+                                f"Если планы изменились, отметьте это в разделе «Прививки»."
+                            )
+                        elif delta == 0 and settings["vaccine_today"]:
+                            kind = "vaccine_today"
+                            text = (
+                                f"💉 Сегодня по календарю запланирована прививка: {vaccine}.\\n\\n"
+                                f"Откройте раздел «Прививки», чтобы проверить запись и отметить выполнение."
+                            )
+                        if kind and not _notification_was_sent(conn, user_id, kind, local_date, str(vac_id)):
+                            await bot.send_message(user_id, text)
+                            _notification_mark_sent(conn, user_id, kind, local_date, str(vac_id))
+
+                # Growth/weight reminder: first day of each month, 09:00 local, mothers only.
+                if mode != "pregnant" and settings["growth_monthly"] and local_now.hour == 9 and local_now.day == 1:
+                    item_key = local_now.strftime("%Y-%m")
+                    if not _notification_was_sent(conn, user_id, "growth_monthly", local_date, item_key):
+                        await bot.send_message(
+                            user_id,
+                            "📏 Пора обновить рост и вес малыша\\n\\nЕсли есть новый замер, добавьте его в «Трекеры → Рост и вес».",
+                        )
+                        _notification_mark_sent(conn, user_id, "growth_monthly", local_date, item_key)
+
+                # Weekly reminder: Sunday 19:00 local. Step 4 will turn this into a full report.
+                if settings["weekly_summary"] and local_now.weekday() == 6 and local_now.hour == 19:
+                    item_key = local_now.strftime("%G-W%V")
+                    if not _notification_was_sent(conn, user_id, "weekly_summary", local_date, item_key):
+                        await bot.send_message(
+                            user_id,
+                            "📊 Ваша неделя\\n\\nЗагляните в «Историю»: там собраны записи сна, питания, самочувствия, роста, прививок и дневника.",
+                        )
+                        _notification_mark_sent(conn, user_id, "weekly_summary", local_date, item_key)
+            except Exception as exc:
+                logging.error("Ошибка умного напоминания TG user_id=%s: %s", user_id, exc)
+    finally:
+        conn.close()
+
 
 # ─── ЗАПУСК ──────────────────────────────────────────────────
 async def main():
@@ -6505,8 +6621,9 @@ async def main():
     if not OWNER_ID:
         logging.warning("TG_OWNER_ID не задан: коммерческие уведомления будут отправляться в CHANNEL_REPORT_CHAT_ID")
     dp.callback_query.outer_middleware(PremiumCallbackMiddleware())
-    # Напоминания о прививках — каждый день в 9:00
-    scheduler.add_job(check_vaccine_reminders, "cron", hour=9, minute=0, id="vaccine_reminders", replace_existing=True, coalesce=True, max_instances=1)
+    # Умные напоминания проверяются каждый час; фактическая отправка идёт только
+    # в нужный локальный час пользователя и защищена delivery-log от дублей.
+    scheduler.add_job(check_smart_notifications, "cron", minute=5, id="smart_notifications", replace_existing=True, coalesce=True, max_instances=1)
     schedule_daily_human_posts()
     scheduler.add_job(schedule_daily_human_posts, "cron", hour=0, minute=7, id="channel_human_daily_planner", replace_existing=True, coalesce=True, max_instances=1)
     scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="channel_weekly_report", replace_existing=True, coalesce=True, max_instances=1)
