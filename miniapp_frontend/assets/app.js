@@ -2000,6 +2000,7 @@
 
   function cfTitleForView(view) {
     if (view === "what") return "Что давать";
+    if (view === "ideas") return "Что приготовить сегодня?";
     if (view === "mine") return "Мои продукты";
     if (view === "how") return "Как вводить";
     if (view === "safety") return "Важно и нельзя";
@@ -2225,6 +2226,7 @@
     body.innerHTML =
       progressHtml +
       cfHubEntryHtml("what", "Что давать сейчас", "Продукты по возрасту малыша") +
+      cfHubEntryHtml("ideas", "Что приготовить сегодня?", "Идеи только из уже знакомых продуктов") +
       cfHubEntryHtml("mine", "Мои продукты", c.my ? ("Попробовано " + c.my.tried_count + " из " + (c.my.total_foods || 0)) : "Что уже попробовал малыш") +
       cfHubEntryHtml("how", "Как вводить", "Спокойный план по возрасту") +
       cfHubEntryHtml("safety", "Важно и нельзя", "Безопасность и запреты");
@@ -2236,11 +2238,134 @@
         state.cf.openCategory = null;
         state.cf.openFood = null;
         state.cf.markError = "";
-        if ((target === "what" || target === "mine") && !state.cf.my && !state.cf.myLoading) loadCfMy();
-        if (target === "what" && !state.cf.catalog && !state.cf.catalogLoading) loadCfCatalog();
+        if ((target === "what" || target === "mine" || target === "ideas") && !state.cf.my && !state.cf.myLoading) loadCfMy();
+        if ((target === "what" || target === "ideas") && !state.cf.catalog && !state.cf.catalogLoading) loadCfCatalog();
         renderComplementaryFeeding(root);
       });
     });
+  }
+
+
+  function cfIdeaTextureHint(tier) {
+    if (tier === "6-7") return "Мягкое пюре или хорошо размятая консистенция — по навыкам малыша.";
+    if (tier === "8-9") return "Размятая мягкая еда; при готовности — безопасные мягкие кусочки.";
+    if (tier === "10-12") return "Мягкие кусочки и более плотная текстура — по навыкам ребёнка.";
+    return "Адаптированная семейная текстура: мягко, безопасно, без лишней соли и сахара.";
+  }
+
+  function cfIdeaSafeItems() {
+    var c = state.cf;
+    if (!c.my || !c.my.items || !c.catalog) return [];
+    var out = [];
+    c.my.items.forEach(function (it) {
+      if (it.status !== "liked" && it.status !== "tried") return;
+      var meta = cfFindFoodMeta(it.food_key);
+      if (!meta) return;
+      out.push({
+        key: it.food_key,
+        title: it.title || meta.title || it.food_key,
+        category: it.category || meta.category,
+        status: it.status
+      });
+    });
+    out.sort(function (a, b) {
+      if (a.status === b.status) return a.title.localeCompare(b.title, "ru");
+      return a.status === "liked" ? -1 : 1;
+    });
+    return out;
+  }
+
+  function cfBuildMealIdeas() {
+    var items = cfIdeaSafeItems();
+    var by = {};
+    items.forEach(function (it) {
+      if (!by[it.category]) by[it.category] = [];
+      by[it.category].push(it);
+    });
+    var ideas = [];
+    var seen = {};
+    function pick(cat, idx) {
+      var list = by[cat] || [];
+      return list[idx || 0] || null;
+    }
+    function add(title, parts) {
+      var unique = [];
+      var keys = {};
+      (parts || []).forEach(function (it) {
+        if (it && !keys[it.key]) { keys[it.key] = true; unique.push(it); }
+      });
+      if (unique.length < 2) return;
+      var signature = unique.map(function (it) { return it.key; }).sort().join("|");
+      if (seen[signature]) return;
+      seen[signature] = true;
+      ideas.push({ title: title, foods: unique });
+    }
+
+    add("Завтрак", [pick("grains", 0), pick("fruits", 0), pick("dairy", 0)]);
+    add("Обед", [pick("protein_iron", 0), pick("vegetables", 0), pick("grains", 1) || pick("fats", 0)]);
+    add("Перекус", [pick("fruits", 1) || pick("fruits", 0), pick("dairy", 0) || pick("fats", 0)]);
+
+    // Если категории ещё заполнены неравномерно — всё равно предложить простые
+    // пары только из уже знакомых продуктов.
+    var i = 0;
+    while (ideas.length < 3 && i + 1 < items.length) {
+      add("Простой вариант " + (ideas.length + 1), [items[i], items[i + 1]]);
+      i += 2;
+    }
+    return { items: items, ideas: ideas.slice(0, 3) };
+  }
+
+  function renderCfIdeas(root, body) {
+    var c = state.cf;
+    if (c.myLoading || c.catalogLoading || !c.my || !c.catalog) {
+      if (c.myError || c.catalogError) {
+        body.innerHTML =
+          '<div class="pr-error">' + esc(c.myError || c.catalogError) + "</div>" +
+          '<button class="btn-primary" id="cfIdeasRetry" type="button">Попробовать ещё раз</button>';
+        var retry = body.querySelector("#cfIdeasRetry");
+        if (retry) retry.addEventListener("click", function () {
+          if (!c.catalog) loadCfCatalog();
+          if (!c.my) loadCfMy();
+        });
+      } else {
+        body.innerHTML = '<div class="state-message">Собираем знакомые продукты…</div>';
+      }
+      return;
+    }
+
+    var built = cfBuildMealIdeas();
+    var excluded = c.my.items.filter(function (it) {
+      return it.status === "reaction" || it.status === "disliked";
+    }).length;
+
+    if (built.items.length < 2 || !built.ideas.length) {
+      body.innerHTML =
+        '<div class="state-message"><p class="state-message__title">Нужно ещё немного отметок</p>' +
+        '<p>Отметьте хотя бы два продукта как «Пробовали» или «Понравилось». Тогда здесь появятся сочетания только из знакомой еды.</p></div>' +
+        '<button class="btn-primary" id="cfIdeasMineBtn" type="button">Открыть «Мои продукты»</button>';
+      body.querySelector("#cfIdeasMineBtn").addEventListener("click", function () {
+        state.cf.view = "mine";
+        renderComplementaryFeeding(root);
+      });
+      return;
+    }
+
+    var html =
+      '<div class="today-note"><b>Только знакомые продукты</b><br>' +
+      'Мы используем только то, что отмечено как «Пробовали» или «Понравилось». ' +
+      (excluded ? "Продукты с реакцией или отметкой «не понравилось» исключены." : "Продукты с реакцией сюда не попадут.") +
+      "</div>" +
+      built.ideas.map(function (idea) {
+        return '<div class="cf-idea-card">' +
+          '<span class="cf-idea-card__label">' + esc(idea.title) + '</span>' +
+          '<b class="cf-idea-card__foods">' + esc(idea.foods.map(function (f) { return f.title; }).join(" + ")) + '</b>' +
+          '<span class="cf-idea-card__texture">' + esc(cfIdeaTextureHint(c.ageTier || (c.catalog && c.catalog.default_age_tier) || "6-7")) + '</span>' +
+          '</div>';
+      }).join("") +
+      '<div class="pr-safety-banner">Всегда учитывайте безопасную форму и размер кусочков, кормите ребёнка сидя и под наблюдением взрослого. Если на продукт раньше была реакция — не используйте его в этих сочетаниях.</div>' +
+      '<p class="pr-note">' + esc(CF_DISCLAIMER) + "</p>";
+
+    body.innerHTML = html;
   }
 
   function renderCfWhat(root, body) {
@@ -2366,6 +2491,7 @@
     if (!body) return;
     var view = state.cf.view;
     if (view === "what") { renderCfWhat(root, body); return; }
+    if (view === "ideas") { renderCfIdeas(root, body); return; }
     if (view === "mine") { renderCfMine(root, body); return; }
     if (view === "how") { renderCfHow(body); return; }
     if (view === "safety") { renderCfSafety(body); return; }

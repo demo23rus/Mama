@@ -190,6 +190,34 @@ async function useLocalMiniApp(page, opts = {}) {
         created_at: new Date().toISOString(),
       })
       await reply({ ok: true })
+    } else if (key === 'GET /complementary-foods') {
+      await reply({
+        ok: true,
+        age_tiers: ['6-7','8-9','10-12','12+'],
+        default_age_tier: '8-9',
+        total_foods: 30,
+        allergen_note: 'PLAYWRIGHT TEST allergen note',
+        disclaimer: 'PLAYWRIGHT TEST disclaimer',
+        categories: [
+          { key: 'vegetables', title: 'Овощи', example: '', foods: [{ key: 'kabachok', title: 'Кабачок', min_tier: '6-7', allergen: null }] },
+          { key: 'fruits', title: 'Фрукты', example: '', foods: [{ key: 'grusha', title: 'Груша', min_tier: '6-7', allergen: null }] },
+          { key: 'grains', title: 'Каши', example: '', foods: [{ key: 'grechka', title: 'Гречневая каша', min_tier: '6-7', allergen: null }] },
+          { key: 'protein_iron', title: 'Белок', example: '', foods: [{ key: 'indeyka', title: 'Индейка', min_tier: '6-7', allergen: null }] },
+          { key: 'dairy', title: 'Кисломолочные', example: '', foods: [{ key: 'yogurt', title: 'Йогурт', min_tier: '8-9', allergen: 'dairy' }] },
+          { key: 'fats', title: 'Жиры', example: '', foods: [{ key: 'avokado', title: 'Авокадо', min_tier: '6-7', allergen: null }] },
+        ],
+      })
+    } else if (key === 'GET /complementary-foods/my') {
+      await reply({
+        ok: true, tried_count: 5, liked_count: 3, total_foods: 30,
+        items: [
+          { food_key: 'kabachok', title: 'Кабачок', category: 'vegetables', status: 'liked', first_tried_at: '2026-10-10' },
+          { food_key: 'indeyka', title: 'Индейка', category: 'protein_iron', status: 'liked', first_tried_at: '2026-10-11' },
+          { food_key: 'grechka', title: 'Гречневая каша', category: 'grains', status: 'tried', first_tried_at: '2026-10-12' },
+          { food_key: 'grusha', title: 'Груша', category: 'fruits', status: 'liked', first_tried_at: '2026-10-13' },
+          { food_key: 'yogurt', title: 'Йогурт', category: 'dairy', status: 'reaction', first_tried_at: '2026-10-14', reaction_text: 'PLAYWRIGHT TEST reaction' },
+        ],
+      })
     } else if (key === 'GET /growth/list') {
       await reply({ items: state.growth })
     } else if (key === 'POST /growth/log') {

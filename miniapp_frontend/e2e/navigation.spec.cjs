@@ -157,3 +157,20 @@ test('Главная: «Актуально для вас» поднимает П
   expect(await page.locator('.shortcut-grid [data-action-card="complementary-feeding"]').count()).toBe(0)
   api.assertSafe()
 })
+
+
+test('Прикорм 6+: «Что приготовить сегодня?» использует только знакомые продукты', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/?screen=feeding-tracker')
+  await page.locator('#cfEntryBtn').click()
+  await expect(page.locator('#cfScreen')).toBeVisible()
+
+  await page.locator('[data-cf-nav="ideas"]').click()
+  await expect(page.locator('#cfScreen')).toContainText('Что приготовить сегодня?')
+  await expect(page.locator('.cf-idea-card').first()).toBeVisible()
+  await expect(page.locator('#cfBody')).toContainText('Кабачок')
+  await expect(page.locator('#cfBody')).toContainText('Индейка')
+  await expect(page.locator('#cfBody')).not.toContainText('Йогурт')
+  await expect(page.locator('#cfBody')).toContainText('Продукты с реакцией')
+  expect(api.state.unexpected).toEqual([])
+})
