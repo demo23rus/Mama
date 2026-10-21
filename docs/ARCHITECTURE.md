@@ -14,20 +14,21 @@
 - Frontend webroot в продакшене: `/var/www/mama-miniapp`.
 - Зеркало в репозитории: `miniapp_frontend/` (assets + `index.html`).
 - Корневые экраны: Home, Assistant, Trackers, History, Profile.
-- Текущий frontend содержит 80 `render*`-функций экранов/состояний.
-- Backend Mini App экспонирует 50+ маршрутов `/api/miniapp/...`
+- Текущий frontend содержит 93 `render*`-функции экранов/состояний.
+- Backend Mini App экспонирует 59 маршрутов `/api/miniapp/...`
   (полный список областей — [PRODUCT_MAP.md](PRODUCT_MAP.md)).
 
-## Router / NGI v1
+## Текущий coding route
 
-- Существующий adapter `/usr/local/bin/bot-flow` переиспользован как NGI
-  Router; второй Router не создавался.
-- Project profile: `/root/bot_flow_profiles/mama.profile`.
-- Режим контекста: `coordinator_narrow_preflight`
-  (`broad_repository_scan_by_default=false`).
-- Worker chain: Claude Code (implementation) → Codex (independent
-  review/repair). Kimi Code установлен, но не входит в automatic chain
-  (см. [.ngi/decisions.md](../.ngi/decisions.md) D003).
+Приоритет имеет верхний раздел `AGENTS.md` от 2026-10-19:
+
+`ChatGPT coordinator → Desktop Commander → iMac-Dimka.local → Aider 0.86.2 + local Qwen2.5-Coder 7B → focused tests/Playwright → independent coordinator review → GitHub → controlled deploy`.
+
+- `origin/main` — стартовая точка каждого isolated worktree.
+- Платный API/cloud fallback автоматически не включается.
+- Если iMac/DC/GitHub/local model недоступны — работа BLOCKED, без скрытой замены исполнителя.
+- Старые Router/Hermes/GPU/Claude/Codex/Kimi записи сохранены как историческая конфигурация и не имеют приоритета над актуальным `AGENTS.md`.
+- Narrow scope, protected areas и controlled deploy остаются обязательными.
 
 ## Deploy / Services
 

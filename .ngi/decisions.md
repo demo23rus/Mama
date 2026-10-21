@@ -54,3 +54,10 @@ Owner explicitly decided НЕ ротировать MAX_TOKEN/YooKassa credential
 
 ## Owner GPU routing decision — 2026-10-11
 Default coding execution: Hermes / ngi-gpu / qwen3.8-27b in an isolated worktree from origin/main. Complex work may use python3 /root/ngi-ai-studio-controller/gpu_worker.py --worktree <registered worktree under /root/ngi_worker_worktrees/> --prompt-file <narrow task>. No automatic Codex/Claude/Kimi calls or cloud-only legacy BotFlow. Independent coordinator review and focused tests remain required. Existing product protections, Git and controlled deploy contracts remain. This owner-authorized migration supersedes earlier execution-chain and BotFlow-default requirements only. Previous configs are retained in .ngi/*.before-gpu.yaml and Git history for rollback.
+
+## D010 — Current local iMac coding route
+Дата: 2026-10-19
+
+Для новых технических изменений «Мамин Помощник» актуальный маршрут задаётся верхним разделом `AGENTS.md`: ChatGPT coordinator → Desktop Commander → `iMac-Dimka.local` → Aider 0.86.2 + local Qwen2.5-Coder 7B → focused tests/Playwright → independent coordinator review → GitHub → controlled deploy.
+
+Эта запись имеет приоритет над историческими Claude/Codex/Kimi/Hermes/GPU automatic-chain решениями. Платный API/cloud fallback автоматически не используется. Если iMac/DC/GitHub/local model недоступны — BLOCKED. Product protections, narrow scope и source-of-truth `origin/main` остаются без изменений.
