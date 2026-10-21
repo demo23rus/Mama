@@ -4,28 +4,29 @@
 
 ## ACTIVE
 
-- Поддержание документации и текущего состояния проекта в соответствии с
-  реальным кодом и production (docs-only maintenance после этого
-  documentation JOB). Новые продуктовые фичи сюда не добавляются без
-  отдельного owner-approved JOB.
+- Продолжать улучшения небольшими законченными STEP: один scope → focused tests → PR/CI → merge → production check.
+- Текущий 7-step цикл от 2026-10-21 завершён. Канонический handoff: `docs/CURRENT_HANDOFF.md`.
 
 ## NEXT
 
-- Нет активных NEXT-пунктов по security: ротация credentials и перевод на
-  env-based конфигурацию отложены owner decision (см. DEFERRED).
+- Сначала проверить live UX и агрегированное использование новых функций: «Моя неделя», «Актуально для вас», Центр уведомлений, Прикорм 6+, «Моменты малыша».
+- После этого выбрать **одну** следующую доработку по реальной пользе/retention. Не запускать широкий рефакторинг.
 
 ## DONE-CLOSED
 
-- Telegram/MAX бот + shared Mini App production baseline реконциллированы
-  в GitHub (`demo23rus/Mama`, branch `main`).
-- NGI Autonomous Development Standard v1 migration (Router reuse, narrow
-  technical preflight, worker chain, controlled deploy, health/parity
-  checks) — PASS.
-- Общий Mini App backend (Telegram + MAX) с раздельными DB namespaces,
-  трекеры, ассистент, дневник, персональный разбор и добровольная
-  поддержка — текущий принятый функциональный baseline.
-- Экономичный Router context с coordinator narrow technical preflight.
-- Spec Kit pilot process установлен в control repo: Feature / Bug / Assessment workflows, automatic mode routing; runtime/production не менялись.
+- Telegram/MAX bot + shared Mini App production baseline реконциллированы в GitHub `main`.
+- NGI Autonomous Development Standard v1 migration и controlled deploy/health — PASS.
+- Playwright isolated mobile coverage: Chromium + WebKit CI.
+- **2026-10-21 product cycle — PASS:**
+  - PR #5 — пользовательский часовой пояс;
+  - PR #6 — Центр уведомлений;
+  - PR #7 — реальные timezone-aware reminders;
+  - PR #8 — «Моя неделя»;
+  - PR #9 — Home «Актуально для вас»;
+  - PR #10 — Прикорм 6+: идеи еды только из знакомых продуктов;
+  - PR #11 — «Моменты малыша»;
+  - PR #12 — safe schema init для `baby_moments`.
+- Spec Kit pilot process установлен; runtime/production flow не заменяет.
 
 ## DEFERRED
 
