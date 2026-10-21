@@ -644,7 +644,7 @@
       '<span class="today-banner__cta">Что важно сегодня →</span>' +
       "</button>" +
       '<button class="week-entry" id="weekEntry" type="button">' +
-      '<span><b>Моя неделя</b><small>Сводка за последние 7 дней</small></span>' +
+      '<span><b>Моя неделя</b><small>Новое · Сводка за последние 7 дней</small></span>' +
       '<span class="week-entry__arrow">→</span>' +
       "</button>" +
       '<button class="relevant-now" id="relevantNow" type="button" hidden></button>' +
