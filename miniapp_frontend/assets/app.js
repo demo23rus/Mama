@@ -272,6 +272,7 @@
     feedback: { kind: null, text: "", loading: false, error: "", success: false, successMessage: "" },
     resetMe: { confirm: false, loading: false, error: "", success: false },
     timezone: { detected: "", saved: "", configured: false, selected: "", saving: false, error: "", success: "" },
+    notifications: { loaded: false, loading: false, saving: false, error: "", success: "", timezone: "", timezoneConfigured: false, settings: { vaccine_3d: false, vaccine_today: false, growth_monthly: false, weekly_summary: false } },
     emergencyFrom: "assistant",
     emergency: {
       loading: false,
@@ -3256,6 +3257,11 @@
       "<span>Часовой пояс</span>" +
       '<span class="profile-action__chevron">→</span>' +
       "</button>" +
+      '<button class="profile-action" id="profileNotificationsBtn" type="button">' +
+      '<svg viewBox="0 0 24 24" class="profile-action__icon" aria-hidden="true"><path d="M6 9a6 6 0 0 1 12 0v4l2 3H4l2-3V9Z"/><path d="M9.5 19h5"/></svg>' +
+      "<span>Уведомления</span>" +
+      '<span class="profile-action__chevron">→</span>' +
+      "</button>" +
       '<button class="profile-action" id="profileFeedbackBtn" type="button">' +
       '<img class="profile-action__icon" src="' + ICONS_EMBLEM + 'mama_feedback_light.webp" alt="" loading="lazy">' +
       "<span>Обратная связь</span>" +
@@ -3278,6 +3284,12 @@
     root.querySelector("#profileDonateBtn").addEventListener("click", function () { runAction({ type: "stub", stub: "donate" }); });
     root.querySelector("#profileTimezoneBtn").addEventListener("click", function () {
       navigate("timezone");
+    });
+    root.querySelector("#profileNotificationsBtn").addEventListener("click", function () {
+      state.notifications.loaded = false;
+      state.notifications.error = "";
+      state.notifications.success = "";
+      navigate("notifications");
     });
     root.querySelector("#profileFeedbackBtn").addEventListener("click", function () {
       state.feedback = { kind: null, text: "", loading: false, error: "", success: false, successMessage: "" };
@@ -3433,6 +3445,107 @@
         state.timezone.saving = false;
         state.timezone.error = "Не удалось сохранить часовой пояс.";
         renderTimezoneBody(root);
+      });
+    });
+  }
+
+
+  function renderNotifications(root) {
+    var n = state.notifications;
+    root.innerHTML =
+      '<div class="screen">' +
+      backButtonHtml("profile") +
+      '<div class="profile-scene" id="notificationsScreen">' +
+      '<p class="section-heading" style="margin:0">Уведомления</p>' +
+      '<p class="ai-q-hint">Выберите, какие напоминания будут полезны. Отправка будет учитывать сохранённый часовой пояс.</p>' +
+      '<div id="notificationsBody"><div class="state-message">Загружаем настройки…</div></div>' +
+      "</div></div>";
+    bindBack(root);
+    loadNotifications(root);
+  }
+
+  function loadNotifications(root) {
+    var n = state.notifications;
+    n.loading = true;
+    apiGet("/notifications").then(function (data) {
+      if (state.screen !== "notifications") return;
+      n.loading = false;
+      n.loaded = true;
+      n.timezone = data.timezone || "Europe/Moscow";
+      n.timezoneConfigured = !!data.timezone_configured;
+      n.settings = Object.assign({}, n.settings, data.settings || {});
+      n.error = "";
+      renderNotificationsBody(root);
+    }).catch(function () {
+      if (state.screen !== "notifications") return;
+      n.loading = false;
+      n.error = "Не получилось загрузить настройки.";
+      renderNotificationsBody(root);
+    });
+  }
+
+  function notificationToggleRow(key, title, text) {
+    var checked = state.notifications.settings[key] ? " checked" : "";
+    return '<label class="notification-row">' +
+      '<span class="notification-row__copy"><b>' + esc(title) + '</b><span>' + esc(text) + '</span></span>' +
+      '<input class="notification-toggle" type="checkbox" data-notification-key="' + esc(key) + '"' + checked + '>' +
+      '<span class="notification-switch" aria-hidden="true"></span>' +
+      "</label>";
+  }
+
+  function renderNotificationsBody(root) {
+    var body = root.querySelector("#notificationsBody");
+    if (!body) return;
+    var n = state.notifications;
+    if (!n.loaded && n.loading) {
+      body.innerHTML = '<div class="state-message">Загружаем настройки…</div>';
+      return;
+    }
+    if (!n.loaded && n.error) {
+      body.innerHTML = '<div class="state-message"><p class="state-message__title">Не получилось загрузить</p><p>' + esc(n.error) + '</p></div>' +
+        '<button class="btn-primary" id="notificationsRetryBtn" type="button">Попробовать ещё раз</button>';
+      var retry = body.querySelector("#notificationsRetryBtn");
+      if (retry) retry.addEventListener("click", function () { loadNotifications(root); });
+      return;
+    }
+    body.innerHTML =
+      '<div class="notification-timezone">' +
+      '<span>Часовой пояс</span><b>' + esc(timezoneLabel(n.timezone)) + '</b>' +
+      (n.timezoneConfigured ? "" : '<small>Сейчас используется Москва как запасной вариант. Изменить можно в Профиле.</small>') +
+      '</div>' +
+      '<div class="notification-list">' +
+      notificationToggleRow("vaccine_3d", "Прививка за 3 дня", "Напомнить заранее о запланированной прививке.") +
+      notificationToggleRow("vaccine_today", "Прививка сегодня", "Напомнить утром в день запланированной прививки.") +
+      notificationToggleRow("growth_monthly", "Рост и вес", "Раз в месяц напомнить внести новый замер.") +
+      notificationToggleRow("weekly_summary", "Моя неделя", "Раз в неделю напомнить посмотреть сводку малыша.") +
+      "</div>" +
+      (n.error ? '<div class="pr-error">' + esc(n.error) + '</div>' : "") +
+      (n.success ? '<div class="sleep-confirm">' + esc(n.success) + '</div>' : "") +
+      '<button class="btn-primary" id="notificationsSaveBtn" type="button"' + (n.saving ? " disabled" : "") + '>' + (n.saving ? "Сохраняем…" : "Сохранить настройки") + "</button>";
+
+    body.querySelectorAll("[data-notification-key]").forEach(function (input) {
+      input.addEventListener("change", function () {
+        n.settings[input.getAttribute("data-notification-key")] = !!input.checked;
+        n.success = "";
+      });
+    });
+    var save = body.querySelector("#notificationsSaveBtn");
+    if (save) save.addEventListener("click", function () {
+      n.saving = true;
+      n.error = "";
+      n.success = "";
+      renderNotificationsBody(root);
+      apiPost("/notifications", n.settings).then(function (data) {
+        if (state.screen !== "notifications") return;
+        n.saving = false;
+        n.settings = Object.assign({}, n.settings, data.settings || {});
+        n.success = "Настройки уведомлений сохранены";
+        renderNotificationsBody(root);
+      }).catch(function () {
+        if (state.screen !== "notifications") return;
+        n.saving = false;
+        n.error = "Не получилось сохранить настройки.";
+        renderNotificationsBody(root);
       });
     });
   }
@@ -5162,6 +5275,7 @@
     else if (state.screen === "history") renderHistory(root);
     else if (state.screen === "profile") renderProfile(root);
     else if (state.screen === "timezone") renderTimezone(root);
+    else if (state.screen === "notifications") renderNotifications(root);
     else if (state.screen === "invite") renderInvite(root);
     else if (state.screen === "reset-me") renderResetMe(root);
     else if (state.screen === "reset-me-done") renderResetMeDone(root);

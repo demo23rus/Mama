@@ -68,3 +68,22 @@ test('Профиль: часовой пояс сохраняется и повт
 
   expect(api.state.unexpected).toEqual([])
 })
+
+
+test('Профиль: центр уведомлений сохраняет выбранные настройки', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/?screen=profile')
+  await page.locator('#profileNotificationsBtn').click()
+  await expect(page.locator('#notificationsScreen')).toBeVisible()
+
+  await page.locator('[data-notification-key="vaccine_today"]').check({ force: true })
+  await page.locator('[data-notification-key="growth_monthly"]').check({ force: true })
+  await page.locator('#notificationsSaveBtn').click()
+  await expect(page.locator('#notificationsBody')).toContainText('Настройки уведомлений сохранены')
+
+  expect(api.state.notifications.vaccine_3d).toBe(true)
+  expect(api.state.notifications.vaccine_today).toBe(true)
+  expect(api.state.notifications.growth_monthly).toBe(true)
+  expect(api.state.notifications.weekly_summary).toBe(false)
+  expect(api.state.unexpected).toEqual([])
+})
