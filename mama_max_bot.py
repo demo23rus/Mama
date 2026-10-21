@@ -8845,6 +8845,8 @@ async def miniapp_moments_add(request: Request):
             )
             moment_id = cur.lastrowid
             conn.commit()
+    except HTTPException:
+        raise
     except Exception:
         logging.exception("miniapp_moments_add db error")
         raise HTTPException(status_code=500, detail="db_error")
