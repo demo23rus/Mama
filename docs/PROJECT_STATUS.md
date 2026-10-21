@@ -2,15 +2,16 @@
 
 ## PRODUCT UPDATE — 2026-10-21
 
-**PASS — новый 7-step product cycle завершён, merged в GitHub main и присутствует в production.**
+**PASS — 8-step product/retention cycle завершён, merged в GitHub main и присутствует в production.**
 
-- Current main: `248eb30` (после PR #12, safe startup init для `baby_moments`).
-- PR #5–#12: merged; open PR: 0 на момент фиксации.
+- Latest product-code baseline: PR #14 merge commit `82333cb`; последующий docs-sync не меняет runtime.
+- PR #5–#14: product steps + handoff merged; open product PR: 0 на момент финального handoff.
 - Production/source parity: PASS.
 - Services: `mambot.service` active; `mama-max.service` active.
 - Shared Mini App health: PASS; public `/app/`: HTTP 200.
-- Завершено: пользовательский timezone; Центр уведомлений; timezone-aware reminders; «Моя неделя»; Home «Актуально для вас»; «Прикорм 6+ → Что приготовить сегодня?»; «Моменты малыша».
-- Новые пользовательские данные остаются platform-isolated для Telegram/MAX.
+- Завершено: user timezone; Центр уведомлений; timezone-aware reminders; «Моя неделя»; Home «Актуально для вас»; «Прикорм 6+ → Что приготовить сегодня?»; «Моменты малыша»; safe allowlisted UX analytics новых функций.
+- UX analytics фиксирует только `ui_feature_opened` для allowlist `week/relevant/notifications/cf_ideas/moments`; пользовательский текст, medical/diary content и profile details не передаются.
+- Telegram/MAX user data остаются platform-isolated.
 - Полный handoff: `docs/CURRENT_HANDOFF.md`.
 
 ## STATUS
@@ -42,11 +43,17 @@ GitHub main is reconciled to the accepted production backend + Mini App source. 
 - Установка docs/process-only: runtime, production, services, DB и deploy state не изменялись.
 - Usage: `docs/SPECKIT_PROJECT_USAGE_2026-10-06.md`; constitution: `.specify/memory/constitution.md`.
 
-## WORKER CHAIN
-Preserved exactly for this migration:
-1. Claude Code — implementation.
-2. Codex — independent review / repair.
-3. Kimi Code is installed but remains optional/not automatic; if enabled later, the same narrow-preflight rules are mandatory.
+## CURRENT EXECUTION ROUTE
+Current priority is defined by the top section of `AGENTS.md` (2026-10-19):
+1. ChatGPT coordinator.
+2. Desktop Commander.
+3. `iMac-Dimka.local`.
+4. Aider 0.86.2 + local Qwen2.5-Coder 7B.
+5. Focused tests / Playwright as needed.
+6. Independent coordinator review.
+7. GitHub PR/CI → controlled deploy.
+
+No automatic paid/cloud fallback. Historical Claude/Codex/Kimi/Hermes/GPU chain records remain for history and rollback only; see D010.
 
 ## CONTROLLED DEPLOY / HEALTH
 - Controlled script: ops/deploy_mama.sh.
@@ -58,7 +65,7 @@ Preserved exactly for this migration:
 ## PRODUCT STATE
 - Shared Telegram + MAX Mini App backend in mama_max_bot.py handles auth/platform routing for both platforms; mama_bot.py is the Telegram bot backend.
 - Mini App root screens: Home, Assistant, Trackers, History, Profile; frontend currently has 93 render* functions.
-- Backend exposes 60+ Mini App routes covering profile/home/today/week, timezone, notifications, referral, feedback, pregnancy, ask-question, personal-review, support, tantrums/emotions, psycho, reset-me, kindergarten, firstdays, breastfeeding, recovery, benefits, child, sleep, feeding, complementary-foods, symptoms, diary, moments, growth, vaccines, emergency and photo analysis.
+- Backend exposes 59 Mini App routes covering profile/home/today/week, timezone, notifications, referral, feedback, pregnancy, ask-question, personal-review, support, tantrums/emotions, psycho, reset-me, kindergarten, firstdays, breastfeeding, recovery, benefits, child, sleep, feeding, complementary-foods, symptoms, diary, moments, growth, vaccines, emergency, safe UI analytics and photo analysis.
 - Core product experience is free; voluntary support and paid personal-review are separate, non-blocking flows.
 - Details: docs/PRODUCT_MAP.md.
 
@@ -68,7 +75,7 @@ Preserved exactly for this migration:
 - Details: docs/ARCHITECTURE.md.
 
 ## DATA
-- Telegram and MAX use separate production SQLite DB files: /root/mama.db (29 tables) and /root/mama_max.db (33 tables, superset of Telegram schema groups plus channel_poll_votes, command_locks, limits, max_user_chats, reviews).
+- Telegram and MAX use separate production SQLite DB files: `/root/mama.db` (32 user tables) and `/root/mama_max.db` (36 user tables). Current-cycle schema groups include `notification_settings`, `notification_delivery_log`, and `baby_moments`; `analytics_events` is reused for allowlisted UX-open events.
 - Only table names are documented, never row/user data.
 - Details: docs/DATA_MODEL.md.
 
@@ -87,7 +94,10 @@ Preserved exactly for this migration:
 - None active. Public repo + hard-coded MAX_TOKEN/YooKassa credentials remain a documented ACCEPTED/DEFERRED security risk (owner decision, see .ngi/decisions.md D009), not an active blocker. See ROADMAP.md DEFERRED and docs/SECURITY.md.
 
 ## NEXT
-- No active NEXT item for security: credential rotation and env-based config migration are deferred by owner decision until a future, separately owner-approved security JOB is initiated.
+- First next product action: inspect only aggregated `ui_feature_opened` counts by allowlisted feature/platform (`week`, `relevant`, `notifications`, `cf_ideas`, `moments`).
+- Do not inspect user text, diary/medical content or individual personal rows for retention decisions.
+- Choose one small follow-up only after the aggregate signal is sufficient; otherwise state that the sample is insufficient.
+- Credential rotation/env migration remains deferred by owner decision and is not an active NEXT item.
 
 ## CHANGED INFRASTRUCTURE
 - .ngi/project.yaml, rules.md, decisions.md, workers.yaml
@@ -100,7 +110,7 @@ Preserved exactly for this migration:
 Payments/YooKassa, subscriptions, scheduler/watchdog/fail-safe, channel/autoposting, DB schemas/data and real client-message campaigns were not changed.
 
 ## MIGRATION RESULT
-GitHub main source of truth: PASS. Existing Router reused: PASS. Narrow technical preflight: PASS. Current worker chain preserved: PASS. Focused Router tests: PASS. Real isolated-worktree proof: PASS. Fast-forward promotion: PASS. Source parity/health/public smoke: PASS. Owner result: PASS.
+The 2026-10-01 NGI v1 migration remains PASS as a historical infrastructure milestone. GitHub main source of truth, narrow technical scope, isolated worktrees, focused checks and controlled deploy remain active invariants. The later execution route was superseded by D010 / the top section of `AGENTS.md`; old worker-chain statements are not current execution instructions.
 
 ## DOCUMENTATION CONSOLIDATION (this JOB)
 README.md, docs/ARCHITECTURE.md, docs/PRODUCT_MAP.md, docs/DATA_MODEL.md and docs/SECURITY.md were added; ROADMAP.md restructured into ACTIVE/NEXT/DONE-CLOSED/DEFERRED/PROCESS; this file extended with PRODUCT STATE/PLATFORM/DATA/SECURITY/OPERATIONS/CURRENT BLOCKERS/NEXT. No product code, Router, deploy script, services, DB or production files were changed.

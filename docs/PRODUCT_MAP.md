@@ -8,6 +8,7 @@
 - «Моя неделя»: агрегированная 7-дневная сводка + AI-ориентиры только по кнопке.
 - «Прикорм 6+»: «Что приготовить сегодня?» — до трёх сочетаний только из уже знакомых продуктов; реакции/не понравилось исключаются.
 - «Дневник малыша»: отдельная хронология «Моменты малыша».
+- Safe UX analytics: allowlisted feature-open events для `week`, `relevant`, `notifications`, `cf_ideas`, `moments`; без пользовательских текстов/medical content.
 - Telegram/MAX: platform-aware auth и отдельные DB namespaces сохраняются.
 
 ## Основные экраны
@@ -23,15 +24,15 @@ Frontend на сегодня содержит 93 `render*`-функции экр
 
 ## Backend API (`/api/miniapp/...`)
 
-Backend (`mama_max_bot.py`) экспонирует 60+ маршрутов, сгруппированных по
+Backend (`mama_max_bot.py`) экспонирует 59 маршрутов, сгруппированных по
 продуктовым областям:
 
-- Профиль и общее: profile, home/today, referral, feedback, support,
-  reset-me.
+- Профиль и общее: profile, home/today/week, timezone, notifications,
+  referral, feedback, support, reset-me, safe UI analytics.
 - Ассистент: ask-question, psycho, tantrums/emotions.
 - Беременность и первые дни: pregnancy, firstdays, breastfeeding, recovery.
 - Трекеры ребёнка: child, sleep, feeding, complementary-foods (6+ месяцев,
-  `complementary_food_log`), growth, vaccines, symptoms, diary.
+  `complementary_food_log`), growth, vaccines, symptoms, diary, moments.
 - Экстренные ситуации: emergency.
 - Детский сад: kindergarten.
 - Прочее: benefits, photo analysis, personal-review.

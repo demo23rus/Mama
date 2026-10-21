@@ -5,12 +5,14 @@
 ## ACTIVE
 
 - Продолжать улучшения небольшими законченными STEP: один scope → focused tests → PR/CI → merge → production check.
-- Текущий 7-step цикл от 2026-10-21 завершён. Канонический handoff: `docs/CURRENT_HANDOFF.md`.
+- Текущий 8-step product/retention цикл от 2026-10-21 завершён. Канонический handoff: `docs/CURRENT_HANDOFF.md`.
 
 ## NEXT
 
-- Сначала проверить live UX и агрегированное использование новых функций: «Моя неделя», «Актуально для вас», Центр уведомлений, Прикорм 6+, «Моменты малыша».
-- После этого выбрать **одну** следующую доработку по реальной пользе/retention. Не запускать широкий рефакторинг.
+- Сначала проверить только безопасную агрегированную аналитику `ui_feature_opened` по feature/platform для `week`, `relevant`, `notifications`, `cf_ideas`, `moments`.
+- Не читать пользовательские тексты, diary/medical content и индивидуальные персональные строки.
+- После достаточного сигнала выбрать **одну** следующую доработку по реальной пользе/retention. Если выборка мала — так и зафиксировать, не выдумывать вывод.
+- Не запускать широкий рефакторинг.
 
 ## DONE-CLOSED
 
@@ -25,7 +27,9 @@
   - PR #9 — Home «Актуально для вас»;
   - PR #10 — Прикорм 6+: идеи еды только из знакомых продуктов;
   - PR #11 — «Моменты малыша»;
-  - PR #12 — safe schema init для `baby_moments`.
+  - PR #12 — safe schema init для `baby_moments`;
+  - PR #14 — safe allowlisted UX analytics новых функций (`ui_feature_opened`).
+- PR #13 — handoff/docs snapshot перед STEP 8; текущий `docs/CURRENT_HANDOFF.md` его заменяет.
 - Spec Kit pilot process установлен; runtime/production flow не заменяет.
 
 ## DEFERRED
@@ -50,10 +54,8 @@
 - сложный баг с неизвестной причиной → SpecKit Bug;
 - спорная идея «делать или нет» → SpecKit Assessment.
 
-Spec Kit — pilot planning/decision layer; он не заменяет Router и не применяется к мелким задачам. Подробно: `docs/SPECKIT_PROJECT_USAGE_2026-10-06.md`.
+Spec Kit — pilot planning/decision layer; он не применяется к мелким задачам. Подробно: `docs/SPECKIT_PROJECT_USAGE_2026-10-06.md`.
 
-Каждый implementation JOB после планирования: coordinator preflight → Worker Router →
-focused tests → independent review → fast-forward promotion → controlled
-deploy/health → PASS/BLOCKED.
+Текущий execution route задаётся верхним разделом `AGENTS.md`: ChatGPT coordinator → Desktop Commander → `iMac-Dimka.local` → Aider + local Qwen2.5-Coder 7B → focused tests/Playwright → independent coordinator review → GitHub PR/CI → controlled deploy/health → PASS/BLOCKED.
 
 Исторические BotFlow reports и backup-файлы не являются roadmap.

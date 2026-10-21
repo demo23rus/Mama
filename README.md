@@ -6,9 +6,11 @@ Telegram- и MAX-бот для родителей с общим Mini App: тре
 
 ## Статус
 
-NGI Autonomous Development Standard v1 migration: **PASS**. GitHub main
-(`demo23rus/Mama`, branch `main`) — единственный source of truth. Подробный
-статус: [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
+GitHub main (`demo23rus/Mama`, branch `main`) — единственный source of truth.
+NGI migration: **PASS**. Product/retention cycle 2026-10-21 (timezone,
+уведомления, reminders, «Моя неделя», «Актуально для вас», Прикорм 6+,
+«Моменты малыша», safe UX analytics): **PASS** и находится в production.
+Подробный статус: [docs/PROJECT_STATUS.md](docs/PROJECT_STATUS.md).
 
 **Spec Kit pilot:** для больших функций, сложных багов и оценки спорных идей установлен GitHub Spec Kit; мелкие задачи по-прежнему идут обычным JOB. Владелец пишет обычным языком, режим выбирается автоматически. Runtime/production установкой не менялись. См. [docs/SPECKIT_PROJECT_USAGE_2026-10-06.md](docs/SPECKIT_PROJECT_USAGE_2026-10-06.md).
 
@@ -45,8 +47,10 @@ D009) — это не активный блокер. Подробности: [do
 
 ## Правила работы
 
-Любое изменение продукта или инфраструктуры проходит через coordinator
-narrow technical preflight и NGI worker chain (Claude Code implementation →
-Codex independent review/repair). Прямое редактирование production файлов
+Любое изменение продукта или инфраструктуры начинается от `origin/main` в
+изолированном worktree и проходит narrow scope + focused checks. Актуальный
+coding route задаёт верхний раздел `AGENTS.md`: ChatGPT coordinator → Desktop
+Commander → `iMac-Dimka.local` → Aider + local Qwen2.5-Coder 7B → review →
+GitHub → controlled deploy. Прямое редактирование production файлов
 (`/root/mama_bot.py`, `/root/mama_max_bot.py`, `/var/www/mama-miniapp`)
-запрещено — только controlled deploy. Подробно: [.ngi/rules.md](.ngi/rules.md).
+запрещено.
