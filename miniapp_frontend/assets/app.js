@@ -184,6 +184,17 @@
     { key: "vaccines", label: "Прививки" }
   ];
 
+
+  var BABY_MOMENT_TYPES = [
+    { key: "first_tooth", label: "Первый зуб" },
+    { key: "first_word", label: "Первое слово" },
+    { key: "sat", label: "Сел самостоятельно" },
+    { key: "first_steps", label: "Первые шаги" },
+    { key: "kindergarten", label: "Первый день в садике" },
+    { key: "birthday", label: "День рождения" },
+    { key: "other", label: "Другой момент" }
+  ];
+
   var PERSONAL_REVIEW_PRICE = 690;
 
   // ===== Поддержка мамы: хаб разделов (cat_mom в mama_bot.py) =====
@@ -2688,12 +2699,21 @@
       '<img class="ai-q-icon" src="' + ICONS_EMBLEM + 'mama_baby_diary_light.webp" alt="" loading="lazy">' +
       '<p class="section-heading" style="margin:0 0 2px;text-align:center">Дневник малыша</p>' +
       '<p class="ai-q-hint">Что произошло сегодня? Первый зуб, новое слово, первый шаг, важное событие 💕</p>' +
+      '<button class="vac-btn diary-moments-entry" id="diaryMomentsBtn" type="button">Моменты малыша →</button>' +
       '<div id="diarySaveBody"></div>' +
       '<p class="section-heading" style="margin:6px 0 0">Последние записи</p>' +
       '<div id="diaryEntries" class="history-list"><div class="state-message">Загружаем записи…</div></div>' +
       "</div></div>";
 
     bindBack(root);
+    root.querySelector("#diaryMomentsBtn").addEventListener("click", function () {
+      state.moments = {
+        items: [], loading: true, error: "",
+        kind: "first_tooth", eventDate: localIsoToday(), note: "",
+        saving: false, saveError: "", saveMessage: ""
+      };
+      navigate("moments");
+    });
     renderDiarySaveBody(root, root.querySelector("#diarySaveBody"));
     loadDiaryEntries(root);
   }
@@ -2788,6 +2808,144 @@
       return;
     }
     el.innerHTML = d.entries.slice(0, 10).map(historyItemHtml).join("");
+  }
+
+
+  function localIsoToday() {
+    var d = new Date();
+    var mm = String(d.getMonth() + 1).padStart(2, "0");
+    var dd = String(d.getDate()).padStart(2, "0");
+    return d.getFullYear() + "-" + mm + "-" + dd;
+  }
+
+  function momentTypeLabel(key) {
+    var found = BABY_MOMENT_TYPES.find(function (item) { return item.key === key; });
+    return found ? found.label : "Другой момент";
+  }
+
+  function formatIsoDateRu(value) {
+    var parts = String(value || "").split("-");
+    return parts.length === 3 ? parts[2] + "." + parts[1] + "." + parts[0] : value;
+  }
+
+  function renderMoments(root) {
+    root.innerHTML =
+      '<div class="screen">' +
+      backButtonHtml("diary-tracker") +
+      '<div class="ai-q-scene" id="momentsScreen">' +
+      '<p class="section-heading" style="margin:0 0 2px;text-align:center">Моменты малыша</p>' +
+      '<p class="ai-q-hint">Сохраняйте важные события отдельной хронологией — дату и короткую заметку.</p>' +
+      '<div id="momentsForm"></div>' +
+      '<p class="section-heading" style="margin:8px 0 0">Хронология</p>' +
+      '<div id="momentsList"><div class="state-message">Загружаем моменты…</div></div>' +
+      "</div></div>";
+    bindBack(root);
+    if (!state.moments.eventDate) state.moments.eventDate = localIsoToday();
+    renderMomentsForm(root);
+    loadMoments(root);
+  }
+
+  function renderMomentsForm(root) {
+    var host = root.querySelector("#momentsForm");
+    if (!host) return;
+    var m = state.moments;
+    host.innerHTML =
+      '<div class="moment-type-grid">' +
+      BABY_MOMENT_TYPES.map(function (type) {
+        return '<button class="moment-type' + (m.kind === type.key ? " is-active" : "") + '" type="button" data-moment-kind="' + esc(type.key) + '">' + esc(type.label) + '</button>';
+      }).join("") +
+      '</div>' +
+      '<label class="pr-field"><span class="pr-field__label">Дата</span>' +
+      '<input class="pr-input" id="momentDate" type="date" max="' + esc(localIsoToday()) + '" value="' + esc(m.eventDate || localIsoToday()) + '"' + (m.saving ? " disabled" : "") + '></label>' +
+      '<label class="pr-field"><span class="pr-field__label">Заметка (необязательно)</span>' +
+      '<textarea class="pr-textarea" id="momentNote" rows="3" maxlength="500" placeholder="Например: сказал «мама» утром за завтраком"' + (m.saving ? " disabled" : "") + '>' + esc(m.note || "") + '</textarea></label>' +
+      (m.saveError ? '<div class="pr-error">' + esc(m.saveError) + '</div>' : '') +
+      (m.saveMessage ? '<p class="sleep-confirm">' + esc(m.saveMessage) + '</p>' : '') +
+      '<button class="btn-primary" id="momentSaveBtn" type="button"' + (m.saving ? " disabled" : "") + '>' + (m.saving ? "Сохраняем…" : "Сохранить момент") + '</button>';
+
+    host.querySelectorAll("[data-moment-kind]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        m.kind = btn.getAttribute("data-moment-kind");
+        m.saveError = "";
+        m.saveMessage = "";
+        renderMomentsForm(root);
+      });
+    });
+    var dateInput = host.querySelector("#momentDate");
+    var noteInput = host.querySelector("#momentNote");
+    dateInput.addEventListener("input", function () { m.eventDate = dateInput.value; });
+    noteInput.addEventListener("input", function () { m.note = noteInput.value; });
+    host.querySelector("#momentSaveBtn").addEventListener("click", function () { saveMoment(root); });
+  }
+
+  function saveMoment(root) {
+    var m = state.moments;
+    if (!m.eventDate) {
+      m.saveError = "Выберите дату момента.";
+      renderMomentsForm(root);
+      return;
+    }
+    m.saving = true;
+    m.saveError = "";
+    m.saveMessage = "";
+    renderMomentsForm(root);
+    apiPost("/moments", { kind: m.kind, event_date: m.eventDate, note: (m.note || "").trim() }).then(function () {
+      if (state.screen !== "moments") return;
+      m.saving = false;
+      m.note = "";
+      m.saveMessage = "Момент сохранён";
+      renderMomentsForm(root);
+      loadMoments(root);
+    }).catch(function (err) {
+      if (state.screen !== "moments") return;
+      m.saving = false;
+      m.saveError = (err && err.code === 400)
+        ? "Проверьте дату и данные момента."
+        : "Не получилось сохранить момент. Попробуйте позже.";
+      renderMomentsForm(root);
+    });
+  }
+
+  function loadMoments(root) {
+    state.moments.loading = true;
+    state.moments.error = "";
+    renderMomentsList(root);
+    apiGet("/moments").then(function (data) {
+      if (state.screen !== "moments") return;
+      state.moments.loading = false;
+      state.moments.items = (data && data.items) || [];
+      renderMomentsList(root);
+    }).catch(function () {
+      if (state.screen !== "moments") return;
+      state.moments.loading = false;
+      state.moments.error = "Не получилось загрузить хронологию.";
+      renderMomentsList(root);
+    });
+  }
+
+  function renderMomentsList(root) {
+    var host = root.querySelector("#momentsList");
+    if (!host) return;
+    var m = state.moments;
+    if (m.loading) {
+      host.innerHTML = '<div class="state-message">Загружаем моменты…</div>';
+      return;
+    }
+    if (m.error) {
+      host.innerHTML = '<div class="state-message"><p class="state-message__title">Не получилось загрузить</p><p>' + esc(m.error) + '</p></div>';
+      return;
+    }
+    if (!m.items.length) {
+      host.innerHTML = '<div class="state-message">Пока нет сохранённых моментов.</div>';
+      return;
+    }
+    host.innerHTML = m.items.map(function (item) {
+      return '<div class="moment-row">' +
+        '<span class="moment-row__date">' + esc(formatIsoDateRu(item.event_date)) + '</span>' +
+        '<div class="moment-row__copy"><b>' + esc(item.kind_label || momentTypeLabel(item.kind)) + '</b>' +
+        (item.note ? '<span>' + esc(item.note) + '</span>' : '') +
+        '</div></div>';
+    }).join("");
   }
 
   // ===== Рост и вес (реальный трекер: growth_add/growth_height/growth_weight/growth_analyze из Telegram) =====
@@ -5660,6 +5818,7 @@
     else if (state.screen === "symptoms-tracker") renderSymptomsTracker(root);
     else if (state.screen === "growth-tracker") renderGrowthTracker(root);
     else if (state.screen === "diary-tracker") renderDiaryTracker(root);
+    else if (state.screen === "moments") renderMoments(root);
     else if (state.screen === "vaccines-tracker") renderVaccinesTracker(root);
     else if (state.screen === "complementary-feeding") renderComplementaryFeeding(root);
     else if (state.screen === "pr-form") renderPersonalReviewForm(root);

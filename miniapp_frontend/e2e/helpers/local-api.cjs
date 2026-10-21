@@ -15,6 +15,7 @@ async function useLocalMiniApp(page, opts = {}) {
     diary: [],
     history: [],
     growth: [],
+    moments: [],
     timezone: 'Europe/Moscow',
     timezoneConfigured: false,
     notifications: { vaccine_3d: true, vaccine_today: false, growth_monthly: false, weekly_summary: false },
@@ -218,6 +219,26 @@ async function useLocalMiniApp(page, opts = {}) {
           { food_key: 'yogurt', title: 'Йогурт', category: 'dairy', status: 'reaction', first_tried_at: '2026-10-14', reaction_text: 'PLAYWRIGHT TEST reaction' },
         ],
       })
+    } else if (key === 'GET /moments') {
+      await reply({ ok: true, items: state.moments })
+    } else if (key === 'POST /moments') {
+      const body = req.postDataJSON()
+      call.body = body
+      const labels = {
+        first_tooth: 'Первый зуб', first_word: 'Первое слово', sat: 'Сел самостоятельно',
+        first_steps: 'Первые шаги', kindergarten: 'Первый день в садике',
+        birthday: 'День рождения', other: 'Другой важный момент',
+      }
+      if (!labels[body.kind] || !/^\d{4}-\d{2}-\d{2}$/.test(body.event_date || '')) {
+        await reply({ detail: 'invalid_moment' }, 400)
+        return
+      }
+      const item = {
+        id: state.moments.length + 1, kind: body.kind, kind_label: labels[body.kind],
+        event_date: body.event_date, note: String(body.note || ''), created_at: new Date().toISOString(),
+      }
+      state.moments.unshift(item)
+      await reply({ ok: true, item })
     } else if (key === 'GET /growth/list') {
       await reply({ items: state.growth })
     } else if (key === 'POST /growth/log') {
@@ -243,7 +264,7 @@ async function useLocalMiniApp(page, opts = {}) {
     assertSafe() {
       expect(state.unexpected).toEqual([])
       // Only explicit synthetic tracker writes are permitted in tests.
-      const allowed = new Set(['/diary/add', '/sleep/log', '/feeding/log', '/symptoms/log', '/growth/log', '/profile/timezone', '/notifications'])
+      const allowed = new Set(['/diary/add', '/sleep/log', '/feeding/log', '/symptoms/log', '/growth/log', '/profile/timezone', '/notifications', '/moments'])
       expect(state.calls.filter((call) => call.method !== 'GET' && !allowed.has(call.path))).toEqual([])
     },
   }

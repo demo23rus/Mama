@@ -5802,6 +5802,15 @@ def _miniapp_db(user=None):
                 sent_at TEXT NOT NULL,
                 UNIQUE(user_id, kind, local_date, item_key)
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS baby_moments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_baby_moments_user_date ON baby_moments(user_id, event_date)")
             conn.commit()
             _miniapp_max_schema_ready = True
         return conn
@@ -5827,6 +5836,15 @@ def _miniapp_db(user=None):
             sent_at TEXT NOT NULL,
             UNIQUE(user_id, kind, local_date, item_key)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS baby_moments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_baby_moments_user_date ON baby_moments(user_id, event_date)")
         conn.commit()
         _miniapp_tg_schema_ready = True
     return conn
@@ -8748,6 +8766,100 @@ async def miniapp_symptoms_analyze(request: Request):
     else:
         log_analytics_event_tg(user_id, "request_failed", "symptoms_analyze", "miniapp_ai_answer_invalid", user.get("platform", "telegram"))
     return {"ok": True, "answer": answer}
+
+
+
+# ========== MINI APP: МОМЕНТЫ МАЛЫША ==========
+MINIAPP_MOMENT_KINDS = {
+    "first_tooth": "Первый зуб",
+    "first_word": "Первое слово",
+    "sat": "Сел самостоятельно",
+    "first_steps": "Первые шаги",
+    "kindergarten": "Первый день в садике",
+    "birthday": "День рождения",
+    "other": "Другой важный момент",
+}
+MINIAPP_MOMENT_NOTE_MAX_LEN = 500
+MINIAPP_MOMENT_LIST_LIMIT = 50
+
+
+@app.get("/api/miniapp/moments")
+async def miniapp_moments_list(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    items = []
+    try:
+        with _miniapp_db(user) as conn:
+            for row in conn.execute(
+                "SELECT id, kind, event_date, note, created_at FROM baby_moments "
+                "WHERE user_id=? ORDER BY event_date DESC, id DESC LIMIT ?",
+                (user_id, MINIAPP_MOMENT_LIST_LIMIT),
+            ):
+                kind = row["kind"] or "other"
+                items.append({
+                    "id": row["id"],
+                    "kind": kind,
+                    "kind_label": MINIAPP_MOMENT_KINDS.get(kind, MINIAPP_MOMENT_KINDS["other"]),
+                    "event_date": row["event_date"] or "",
+                    "note": row["note"] or "",
+                    "created_at": row["created_at"] or "",
+                })
+    except Exception:
+        logging.exception("miniapp_moments_list db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    return {"ok": True, "items": items}
+
+
+@app.post("/api/miniapp/moments")
+async def miniapp_moments_add(request: Request):
+    user = _miniapp_require_user(request)
+    user_id = user.get("id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    kind = str((body or {}).get("kind") or "").strip()
+    event_date = str((body or {}).get("event_date") or "").strip()
+    note = str((body or {}).get("note") or "").strip()
+    if kind not in MINIAPP_MOMENT_KINDS:
+        raise HTTPException(status_code=400, detail="invalid_kind")
+    try:
+        parsed_date = datetime.strptime(event_date, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_event_date")
+    if len(note) > MINIAPP_MOMENT_NOTE_MAX_LEN:
+        raise HTTPException(status_code=400, detail="note_too_long")
+    created_at = datetime.now().isoformat()
+    try:
+        with _miniapp_db(user) as conn:
+            profile = _miniapp_profile_row(conn, user.get("platform", "telegram"), user_id)
+            try:
+                user_tz = ZoneInfo((profile or {}).get("timezone") or "Europe/Moscow")
+            except Exception:
+                user_tz = ZoneInfo("Europe/Moscow")
+            if parsed_date > datetime.now(user_tz).date():
+                raise HTTPException(status_code=400, detail="future_event_date")
+            cur = conn.execute(
+                "INSERT INTO baby_moments(user_id, kind, event_date, note, created_at) VALUES (?,?,?,?,?)",
+                (user_id, kind, event_date, note, created_at),
+            )
+            moment_id = cur.lastrowid
+            conn.commit()
+    except Exception:
+        logging.exception("miniapp_moments_add db error")
+        raise HTTPException(status_code=500, detail="db_error")
+    log_analytics_event_tg(user_id, "request_completed", "baby_moment_add", "miniapp", user.get("platform", "telegram"))
+    return {
+        "ok": True,
+        "item": {
+            "id": moment_id,
+            "kind": kind,
+            "kind_label": MINIAPP_MOMENT_KINDS[kind],
+            "event_date": event_date,
+            "note": note,
+            "created_at": created_at,
+        },
+    }
 
 
 # ========== MINI APP: ДНЕВНИК МАЛЫША ==========
