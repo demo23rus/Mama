@@ -9277,6 +9277,39 @@ def log_analytics_event_tg(user_id, event_name, source="", details="", platform=
         logging.error("log_analytics_event_tg error")
 
 
+
+# ========== MINI APP: БЕЗОПАСНАЯ UX-АНАЛИТИКА ==========
+# Только allowlisted факт открытия новой функции. Никаких текстов пользователя,
+# медицинских данных, содержимого дневника или деталей профиля.
+MINIAPP_UI_ANALYTICS_EVENTS = {
+    "week",
+    "relevant",
+    "notifications",
+    "cf_ideas",
+    "moments",
+}
+
+
+@app.post("/api/miniapp/analytics/ui")
+async def miniapp_analytics_ui(request: Request):
+    user = _miniapp_require_user(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    event = str((body or {}).get("event") or "").strip()
+    if event not in MINIAPP_UI_ANALYTICS_EVENTS:
+        raise HTTPException(status_code=400, detail="invalid_analytics_event")
+    log_analytics_event_tg(
+        user.get("id"),
+        "ui_feature_opened",
+        event,
+        "",
+        user.get("platform", "telegram"),
+    )
+    return {"ok": True}
+
+
 # ========== MINI APP: ФОТОАНАЛИЗ ==========
 # Перенос существующего Telegram-сценария photo_menu/photo_analysis/photo_uzi/photo_med_preg/
 # photo_skin/photo_stool/photo_food/photo_package/handle_photo из mama_bot.py 1:1: та же

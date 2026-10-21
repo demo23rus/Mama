@@ -193,3 +193,20 @@ test('Дневник малыша: сохраняет структурирова
   expect(api.state.moments).toHaveLength(1)
   expect(api.state.unexpected).toEqual([])
 })
+
+
+test('Новые функции пишут только allowlisted UX-события без пользовательского текста', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/')
+
+  await page.locator('#weekEntry').click()
+  await expect(page.locator('#weekScreen')).toBeVisible()
+  await page.locator('[data-back="home"]').click()
+
+  const calls = api.state.calls.filter((call) => call.path === '/analytics/ui')
+  expect(calls.some((call) => call.body && call.body.event === 'week')).toBe(true)
+  for (const call of calls) {
+    expect(Object.keys(call.body || {}).sort()).toEqual(['event'])
+  }
+  api.assertSafe()
+})
