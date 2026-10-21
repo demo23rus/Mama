@@ -745,6 +745,23 @@ def init_db():
         user_id INTEGER NOT NULL, status TEXT NOT NULL, error_code TEXT DEFAULT '', ts TEXT NOT NULL,
         UNIQUE(broadcast_key, platform, user_id)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS notification_settings (
+        user_id INTEGER PRIMARY KEY,
+        vaccine_3d INTEGER NOT NULL DEFAULT 0,
+        vaccine_today INTEGER NOT NULL DEFAULT 0,
+        growth_monthly INTEGER NOT NULL DEFAULT 0,
+        weekly_summary INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT ''
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS notification_delivery_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        item_key TEXT NOT NULL DEFAULT '',
+        sent_at TEXT NOT NULL,
+        UNIQUE(user_id, kind, local_date, item_key)
+    )""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_diary_user_created ON diary(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_growth_user_created ON growth(user_id, created_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_symptoms_user_created ON symptoms(user_id, created_at)")
@@ -4852,10 +4869,129 @@ async def channel_weekly_editorial_report():
     await send_message(OWNER_ID, report_text)
 
 
+def _notification_timezone_max(conn, user_id):
+    row = conn.execute("SELECT timezone FROM users WHERE user_id=?", (user_id,)).fetchone()
+    name = (row[0] if row and row[0] else "Europe/Moscow")
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("Europe/Moscow")
+
+
+def _notification_settings_max(conn, user_id):
+    row = conn.execute(
+        "SELECT vaccine_3d, vaccine_today, growth_monthly, weekly_summary FROM notification_settings WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return {"vaccine_3d": False, "vaccine_today": False, "growth_monthly": False, "weekly_summary": False}
+    return {
+        "vaccine_3d": bool(row[0]),
+        "vaccine_today": bool(row[1]),
+        "growth_monthly": bool(row[2]),
+        "weekly_summary": bool(row[3]),
+    }
+
+
+def _notification_parse_date_max(value):
+    value = (value or "").strip()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except Exception:
+            pass
+    return None
+
+
+def _notification_was_sent_max(conn, user_id, kind, local_date, item_key=""):
+    return conn.execute(
+        "SELECT 1 FROM notification_delivery_log WHERE user_id=? AND kind=? AND local_date=? AND item_key=?",
+        (user_id, kind, local_date, item_key),
+    ).fetchone() is not None
+
+
+def _notification_mark_sent_max(conn, user_id, kind, local_date, item_key=""):
+    conn.execute(
+        "INSERT OR IGNORE INTO notification_delivery_log(user_id, kind, local_date, item_key, sent_at) VALUES (?,?,?,?,?)",
+        (user_id, kind, local_date, item_key, datetime.now().isoformat()),
+    )
+    conn.commit()
+
+
+async def check_smart_notifications_max():
+    """MAX counterpart of Telegram smart reminders. No saved chat_id = no proactive send."""
+    conn = db_connect()
+    try:
+        users = conn.execute("SELECT user_id, birth_date FROM users").fetchall()
+        for user_id, birth_date in users:
+            try:
+                chat_id = get_saved_max_chat_id(user_id)
+                if not chat_id:
+                    continue
+                local_now = datetime.now(_notification_timezone_max(conn, user_id))
+                settings = _notification_settings_max(conn, user_id)
+                local_date = local_now.date().isoformat()
+
+                if local_now.hour == 9 and (settings["vaccine_3d"] or settings["vaccine_today"]):
+                    vaccinations = conn.execute(
+                        "SELECT id, vaccine, scheduled_date FROM vaccinations WHERE user_id=? AND done=0",
+                        (user_id,),
+                    ).fetchall()
+                    for vac_id, vaccine, scheduled_date in vaccinations:
+                        planned = _notification_parse_date_max(scheduled_date)
+                        if not planned:
+                            continue
+                        delta = (planned - local_now.date()).days
+                        kind = None
+                        if delta == 3 and settings["vaccine_3d"]:
+                            kind = "vaccine_3d"
+                            text = (
+                                f"💉 Напоминание о прививке\\n\\n"
+                                f"Через 3 дня ({scheduled_date}) запланирована: {vaccine}.\\n"
+                                f"Если планы изменились, отметьте это в разделе «Прививки»."
+                            )
+                        elif delta == 0 and settings["vaccine_today"]:
+                            kind = "vaccine_today"
+                            text = (
+                                f"💉 Сегодня по календарю запланирована прививка: {vaccine}.\\n\\n"
+                                f"Откройте раздел «Прививки», чтобы проверить запись и отметить выполнение."
+                            )
+                        if kind and not _notification_was_sent_max(conn, user_id, kind, local_date, str(vac_id)):
+                            result = await send_message(chat_id, text)
+                            if result:
+                                _notification_mark_sent_max(conn, user_id, kind, local_date, str(vac_id))
+
+                is_pregnant = str(birth_date or "").startswith("pdr:")
+                if not is_pregnant and settings["growth_monthly"] and local_now.hour == 9 and local_now.day == 1:
+                    item_key = local_now.strftime("%Y-%m")
+                    if not _notification_was_sent_max(conn, user_id, "growth_monthly", local_date, item_key):
+                        result = await send_message(
+                            chat_id,
+                            "📏 Пора обновить рост и вес малыша\\n\\nЕсли есть новый замер, добавьте его в «Трекеры → Рост и вес».",
+                        )
+                        if result:
+                            _notification_mark_sent_max(conn, user_id, "growth_monthly", local_date, item_key)
+
+                if settings["weekly_summary"] and local_now.weekday() == 6 and local_now.hour == 19:
+                    item_key = local_now.strftime("%G-W%V")
+                    if not _notification_was_sent_max(conn, user_id, "weekly_summary", local_date, item_key):
+                        result = await send_message(
+                            chat_id,
+                            "📊 Ваша неделя\\n\\nЗагляните в «Историю»: там собраны записи сна, питания, самочувствия, роста, прививок и дневника.",
+                        )
+                        if result:
+                            _notification_mark_sent_max(conn, user_id, "weekly_summary", local_date, item_key)
+            except Exception as exc:
+                logging.error("Ошибка умного напоминания MAX user_id=%s: %s", user_id, exc)
+    finally:
+        conn.close()
+
+
 async def channel_posting_loop():
     schedule_daily_max_posts()
     _max_channel_scheduler.add_job(schedule_daily_max_posts, "cron", hour=0, minute=12, id="mama_max_channel_daily_planner", replace_existing=True, coalesce=True, max_instances=1)
     _max_channel_scheduler.add_job(channel_weekly_editorial_report, "cron", day_of_week="sun", hour=21, minute=0, id="mama_channel_weekly_report", replace_existing=True, coalesce=True, misfire_grace_time=60, max_instances=1)
+    _max_channel_scheduler.add_job(check_smart_notifications_max, "cron", minute=7, id="mama_smart_notifications", replace_existing=True, coalesce=True, max_instances=1)
     _max_channel_scheduler.start()
     while True:
         await asyncio.sleep(3600)
@@ -5657,6 +5793,15 @@ def _miniapp_db(user=None):
                 weekly_summary INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT ''
             )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS notification_delivery_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                local_date TEXT NOT NULL,
+                item_key TEXT NOT NULL DEFAULT '',
+                sent_at TEXT NOT NULL,
+                UNIQUE(user_id, kind, local_date, item_key)
+            )""")
             conn.commit()
             _miniapp_max_schema_ready = True
         return conn
@@ -5672,6 +5817,15 @@ def _miniapp_db(user=None):
             growth_monthly INTEGER NOT NULL DEFAULT 0,
             weekly_summary INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL DEFAULT ''
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS notification_delivery_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            local_date TEXT NOT NULL,
+            item_key TEXT NOT NULL DEFAULT '',
+            sent_at TEXT NOT NULL,
+            UNIQUE(user_id, kind, local_date, item_key)
         )""")
         conn.commit()
         _miniapp_tg_schema_ready = True
@@ -8629,8 +8783,8 @@ async def miniapp_growth_analyze(request: Request):
 # Тот же стандартный календарь РФ (список и месяцы) и та же логика, что в
 # tracker_vaccines/vaccines_create/vaccines_done/vac_done_{id}/vaccines_info из mama_bot.py
 # (Telegram) — тексты и prompt скопированы дословно. Читает/пишет исключительно mama.db,
-# существующую таблицу vaccinations, без миграций. Планировщик напоминаний (check_vaccine_reminders)
-# не затрагивается.
+# существующую таблицу vaccinations. Умные напоминания читают тот же календарь,
+# но не меняют сами записи прививок.
 MINIAPP_VACCINE_SCHEDULE = [
     (0, "БЦЖ (туберкулёз)"),
     (0, "Гепатит B — 1-я доза"),
