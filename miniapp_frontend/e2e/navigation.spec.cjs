@@ -87,3 +87,34 @@ test('Профиль: центр уведомлений сохраняет вы�
   expect(api.state.notifications.weekly_summary).toBe(false)
   expect(api.state.unexpected).toEqual([])
 })
+
+
+test('Сегодня: «Моя неделя» показывает сводку и AI-ориентиры по кнопке', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/?screen=today')
+  await expect(page.locator('#todayScreen')).toBeVisible()
+  await page.locator('#todayWeekBtn').click()
+  await expect(page.locator('#weekScreen')).toBeVisible()
+  await expect(page.locator('#weekBody')).toContainText('15.10.2026')
+  await expect(page.locator('#weekBody')).toContainText('Активных дней')
+  await expect(page.locator('#weekBody')).toContainText('АКДС')
+
+  await page.locator('#weekAdviceBtn').click()
+  await expect(page.locator('#weekAdviceBody')).toContainText('PLAYWRIGHT TEST: недельный вывод')
+  expect(api.state.unexpected).toEqual([])
+})
+
+test('Главная: «Моя неделя» открывает сводку и AI-вывод только по кнопке', async ({ page }) => {
+  const api = await useLocalMiniApp(page, { platform: 'telegram' })
+  await page.goto('/')
+  await page.locator('#weekEntry').click()
+  await expect(page.locator('#weekScreen')).toBeVisible()
+  await expect(page.locator('#weekBody')).toContainText('15.10.2026 — 21.10.2026')
+  await expect(page.locator('#weekBody')).toContainText('Брокколи')
+
+  expect(api.state.calls.filter((call) => call.path === '/week/advice')).toHaveLength(0)
+  await page.locator('#weekAdviceBtn').click()
+  await expect(page.locator('#weekAdviceBody')).toContainText('PLAYWRIGHT TEST: недельный вывод')
+  expect(api.state.calls.filter((call) => call.path === '/week/advice')).toHaveLength(1)
+  api.assertSafe()
+})

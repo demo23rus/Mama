@@ -118,6 +118,18 @@ async function useLocalMiniApp(page, opts = {}) {
       await reply({ ok: true, settings: state.notifications })
     } else if (key === 'GET /today') {
       await reply({ registered: true, mode: 'mother', child_age_label: '9 мес.', sleep_count_24h: 0 })
+    } else if (key === 'GET /week') {
+      await reply({
+        registered: true, mode: 'mother', child_age_label: '9 мес.',
+        period_start: '15.10.2026', period_end: '21.10.2026',
+        activity_days: 4, sleep_count: 7, feeding_count: 6, symptoms_count: 1,
+        diary_count: 2, new_foods_count: 2, last_food: 'Брокколи',
+        last_growth: { height: 72, weight: 9.1 },
+        last_diary: { entry: 'PLAYWRIGHT TEST: хорошая неделя' },
+        nearest_vaccine: { vaccine: 'АКДС', scheduled_date: '25.10.2026' },
+      })
+    } else if (key === 'GET /week/advice') {
+      await reply({ ok: true, answer: 'PLAYWRIGHT TEST: недельный вывод' })
     } else if (key === 'GET /history/recent') {
       await reply({ items: state.history })
     } else if (key === 'GET /diary/list') {

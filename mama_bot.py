@@ -6606,7 +6606,7 @@ async def check_smart_notifications():
                     if not _notification_was_sent(conn, user_id, "weekly_summary", local_date, item_key):
                         await bot.send_message(
                             user_id,
-                            "📊 Ваша неделя\\n\\nЗагляните в «Историю»: там собраны записи сна, питания, самочувствия, роста, прививок и дневника.",
+                            "📊 Ваша неделя готова\\n\\nОткройте «Мамин Помощник» → «Моя неделя», чтобы посмотреть сводку за последние 7 дней.",
                         )
                         _notification_mark_sent(conn, user_id, "weekly_summary", local_date, item_key)
             except Exception as exc:
