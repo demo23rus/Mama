@@ -118,3 +118,42 @@ test('Главная: «Моя неделя» открывает сводку и
   expect(api.state.calls.filter((call) => call.path === '/week/advice')).toHaveLength(1)
   api.assertSafe()
 })
+
+
+test('Главная: «Актуально для вас» приоритетно показывает ближайшую прививку', async ({ page }) => {
+  const future = new Date()
+  future.setDate(future.getDate() + 3)
+  const dd = String(future.getDate()).padStart(2, '0')
+  const mm = String(future.getMonth() + 1).padStart(2, '0')
+  const yyyy = future.getFullYear()
+  const api = await useLocalMiniApp(page, {
+    platform: 'telegram',
+    today: {
+      registered: true, mode: 'mother', child_age_label: '9 мес.', child_months: 9,
+      sleep_count_24h: 0,
+      nearest_vaccine: { vaccine: 'АКДС', scheduled_date: dd + '.' + mm + '.' + yyyy },
+    },
+  })
+  await page.goto('/')
+  await expect(page.locator('#relevantNow')).toBeVisible()
+  await expect(page.locator('#relevantNow')).toContainText('Прививка через 3 дн.')
+  await expect(page.locator('#relevantNow')).toContainText('АКДС')
+  await page.locator('#relevantNow').click()
+  await expect(page.locator('#vaccinesTrackerScreen')).toBeVisible()
+  api.assertSafe()
+})
+
+test('Главная: «Актуально для вас» поднимает Прикорм 6+ без нового ярлыка', async ({ page }) => {
+  const api = await useLocalMiniApp(page, {
+    platform: 'telegram',
+    today: {
+      registered: true, mode: 'mother', child_age_label: '7 мес.', child_months: 7,
+      sleep_count_24h: 0,
+    },
+  })
+  await page.goto('/')
+  await expect(page.locator('#relevantNow')).toBeVisible()
+  await expect(page.locator('#relevantNow')).toContainText('Прикорм 6+')
+  expect(await page.locator('.shortcut-grid [data-action-card="complementary-feeding"]').count()).toBe(0)
+  api.assertSafe()
+})
